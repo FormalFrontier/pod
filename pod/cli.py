@@ -597,6 +597,26 @@ def _gh_rate_limit_wait() -> int:
     return 0
 
 
+def _clear_gh_cache():
+    """Clear the gh CLI HTTP cache to avoid stale rate-limit headers.
+
+    After rate limit exhaustion, gh caches introspection query responses
+    (with X-Gh-Cache-Ttl: 24h) that carry X-Ratelimit-Remaining: 0.
+    Even after the rate limit resets, gh reads the cached headers and
+    refuses to make requests. Clearing the cache forces fresh requests.
+    """
+    import pathlib
+    cache_dir = pathlib.Path.home() / ".cache" / "gh"
+    if not cache_dir.is_dir():
+        return
+    for f in cache_dir.rglob("*"):
+        if f.is_file() and not f.name.endswith(".zip"):
+            try:
+                f.unlink()
+            except OSError:
+                pass
+
+
 def get_queue_depth(config: dict) -> int:
     """Get number of unclaimed issues."""
     try:
@@ -1521,6 +1541,7 @@ def agent_process_main(config: dict, agent_id: str | None = None,
                     wait = rl_wait + 30
                     log(f"Agent {short_id}: GH rate limit low, sleeping {wait}s until reset")
                     time.sleep(wait)
+                    _clear_gh_cache()
                 else:
                     log(f"Agent {short_id}: dispatch returned None (waiting)")
                     time.sleep(quota_retry)
