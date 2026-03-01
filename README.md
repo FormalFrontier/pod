@@ -9,6 +9,8 @@ autonomous Claude sessions, coordinating via GitHub issues, labels, and PRs.
 # Install
 uv tool install git+https://github.com/kim-em/pod.git
 
+# For development: uv pip install -e .
+
 # Bootstrap a project
 cd your-project
 pod init

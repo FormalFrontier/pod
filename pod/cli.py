@@ -571,6 +571,24 @@ def coordination(config: dict, *args, env_extra: dict | None = None,
     )
 
 
+def _gh_rate_limit_wait() -> int:
+    """Seconds until GH GraphQL rate limit resets, or 0 if plenty remaining.
+
+    Uses the REST API (separate bucket) to check the GraphQL limit.
+    Returns 0 on error or if remaining >= 100.
+    """
+    try:
+        r = subprocess.run(
+            ["gh", "api", "rate_limit", "--jq",
+             '.resources.graphql | if .remaining < 100 then (.reset - now | ceil) else 0 end'],
+            capture_output=True, text=True, timeout=10, cwd=str(PROJECT_DIR))
+        if r.returncode == 0:
+            return max(0, int(float(r.stdout.strip())))
+    except Exception:
+        pass
+    return 0
+
+
 def get_queue_depth(config: dict) -> int:
     """Get number of unclaimed issues."""
     try:
@@ -1449,15 +1467,16 @@ def agent_process_main(config: dict, agent_id: str | None = None,
         if state.finishing:
             break
 
-        # --- Housekeeping ---
-        try:
-            coordination(config, "check-blocked")
-        except Exception:
-            pass
-        try:
-            check_dead_claimed_issues(config)
-        except Exception:
-            pass
+        # --- Housekeeping (every 5th iteration to conserve GH API calls) ---
+        if iteration % 5 == 1:
+            try:
+                coordination(config, "check-blocked")
+            except Exception:
+                pass
+            try:
+                check_dead_claimed_issues(config)
+            except Exception:
+                pass
 
         # --- Dispatch (sets state.lock_held atomically if lock acquired) ---
         # If this agent was spawned to resume a specific session, skip dispatch.
@@ -1477,10 +1496,18 @@ def agent_process_main(config: dict, agent_id: str | None = None,
             state.write()
             chosen_type = dispatch(config, state)
             if chosen_type is None:
-                log(f"Agent {short_id}: dispatch returned None (waiting)")
                 state.status = "waiting_dispatch"
                 state.write()
-                time.sleep(quota_retry)
+                # If GH rate limit is exhausted, sleep until reset instead
+                # of burning more calls every 60s
+                rl_wait = _gh_rate_limit_wait()
+                if rl_wait > 0:
+                    wait = rl_wait + 30
+                    log(f"Agent {short_id}: GH rate limit low, sleeping {wait}s until reset")
+                    time.sleep(wait)
+                else:
+                    log(f"Agent {short_id}: dispatch returned None (waiting)")
+                    time.sleep(quota_retry)
                 continue
 
             wt_config = worker_types.get(chosen_type, {})
@@ -1739,6 +1766,8 @@ def _tui_main(stdscr, config: dict):
     items_fetch_time = 0.0
     cached_blocked_deps: dict[int, list[int]] = {}
     blocked_deps_fetch_time = 0.0
+    cached_lock_status: str | None = None  # "locked" or "unlocked"
+    lock_fetch_time = 0.0
     CACHE_SECS = 30  # Refresh interval for GitHub API data
 
     pricing = cfg_get(config, "pricing", default={})
@@ -1804,13 +1833,31 @@ def _tui_main(stdscr, config: dict):
                 blocked_deps_fetch_time = now
             except Exception:
                 pass
+        # Lock status: check agent state first (cheap), fall back to API
+        if now - lock_fetch_time > CACHE_SECS:
+            # If any running agent holds a lock, it's locked (no API call needed)
+            agent_holds_lock = any(a.lock_held for a in agents
+                                  if a.status not in ("stopped", "dead"))
+            if agent_holds_lock:
+                cached_lock_status = "locked"
+                lock_fetch_time = now
+            else:
+                try:
+                    r = coordination(config, "lock-status")
+                    cached_lock_status = r.stdout.strip()
+                    lock_fetch_time = now
+                except Exception:
+                    pass
 
         all_time = historical_cost + session_cost
         session_info = f"${session_cost:.2f} this session, {session_runs} run{'s' if session_runs != 1 else ''}"
+        lock_indicator = ""
+        if cached_lock_status == "locked":
+            lock_indicator = " | LOCK"
         if cached_queue is not None:
-            header = f" pod -- {running} agent{'s' if running != 1 else ''} running | queue: {cached_queue} | ${all_time:.2f} total ({session_info})"
+            header = f" pod -- {running} agent{'s' if running != 1 else ''} running | queue: {cached_queue}{lock_indicator} | ${all_time:.2f} total ({session_info})"
         else:
-            header = f" pod -- {running} agent{'s' if running != 1 else ''} running | ${all_time:.2f} total ({session_info})"
+            header = f" pod -- {running} agent{'s' if running != 1 else ''} running{lock_indicator} | ${all_time:.2f} total ({session_info})"
 
         _addstr(stdscr, 0, 0, header[:width], curses.color_pair(4) | curses.A_BOLD)
         _addstr(stdscr, 1, 0, "─" * min(width, 80), curses.color_pair(4))
@@ -2000,7 +2047,7 @@ def _tui_main(stdscr, config: dict):
                 footer_text = " No agent selected"
                 input_mode = ""
         else:
-            footer_text = " [a]dd  [f]inish  [k]ill  [o]pen  [!]force  [q]uit  [Q]uit all  ↑↓/1-9"
+            footer_text = " [a]dd  [f]inish  [k]ill  [o]pen  [!]force  [L]ock  [q]uit  [Q]uit all  ↑↓/1-9"
 
         if footer_row2 < height:
             _addstr(stdscr, footer_row2, 0, footer_text[:width], curses.A_DIM)
@@ -2127,6 +2174,25 @@ def _tui_main(stdscr, config: dict):
                 except (OSError, json.JSONDecodeError) as e:
                     message = f"Failed to toggle force: {e}"
                 message_time = time.time()
+        elif ch == ord("l") or ch == ord("L"):
+            # Toggle planner lock
+            try:
+                if cached_lock_status == "locked":
+                    coordination(config, "force-unlock-planner")
+                    cached_lock_status = "unlocked"
+                    lock_fetch_time = time.time()
+                    message = "Planner lock released"
+                else:
+                    r = coordination(config, "lock-planner")
+                    if r.returncode == 0:
+                        cached_lock_status = "locked"
+                        lock_fetch_time = time.time()
+                        message = "Planner lock acquired"
+                    else:
+                        message = "Failed to acquire planner lock"
+            except Exception as e:
+                message = f"Lock toggle failed: {e}"
+            message_time = time.time()
         elif ch == curses.KEY_UP:
             if selected_section == "agents":
                 if selected_idx > 0:
