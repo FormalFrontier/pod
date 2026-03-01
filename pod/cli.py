@@ -272,14 +272,22 @@ def _save_claim_history(history: dict):
 
 
 def record_claim(issue: int, session_uuid: str, short_id: str):
-    """Record that our session claimed this issue. Preserves restart_count."""
+    """Record that our session claimed this issue. Preserves restart_count.
+
+    Skips entries that were already released (max restarts reached) to avoid
+    a feedback loop where a resumed session re-adds a released claim with
+    restart_count=0, triggering infinite restart spawning.
+    """
     with _claim_history_filelock():
         history = load_claim_history()
         key = str(issue)
+        existing = history.get(key, {})
+        if existing.get("released"):
+            return  # Don't re-add a released claim
         history[key] = {
             "session_uuid": session_uuid,
             "short_id": short_id,
-            "restart_count": history.get(key, {}).get("restart_count", 0),
+            "restart_count": existing.get("restart_count", 0),
         }
         _save_claim_history(history)
 
@@ -1133,6 +1141,8 @@ def check_dead_claimed_issues(config: dict):
             session_uuid = info.get("session_uuid", "")
             if not session_uuid or session_uuid in live_uuids:
                 continue  # Still running or malformed entry
+            if info.get("released"):
+                continue  # Already released, don't restart
 
             restart_count = info.get("restart_count", 0)
             short_id = info.get("short_id", "")
@@ -1143,7 +1153,10 @@ def check_dead_claimed_issues(config: dict):
                 changed = True
             else:
                 to_release.append((issue_str, session_uuid, restart_count))
-                del history[issue_str]
+                # Mark as released rather than deleting, so record_claim
+                # won't re-add it with restart_count=0 (which would cause
+                # an infinite restart loop).
+                info["released"] = True
                 changed = True
 
         if changed:
@@ -1153,7 +1166,9 @@ def check_dead_claimed_issues(config: dict):
     for short_id, session_uuid, issue_str, new_count in to_restart:
         log(f"Dead session {session_uuid} claimed #{issue_str}, "
             f"restarting (attempt {new_count}/{max_restarts})")
-        spawn_agent(config, agent_id=short_id, resume_uuid=session_uuid)
+        # Use a fresh agent_id — reusing the old short_id causes all restart
+        # agents to share one state file, making old processes invisible.
+        spawn_agent(config, resume_uuid=session_uuid)
 
     failed_releases: list[tuple[str, str, int]] = []
     for issue_str, session_uuid, restart_count in to_release:
@@ -1166,7 +1181,8 @@ def check_dead_claimed_issues(config: dict):
         with _claim_history_filelock():
             history = load_claim_history()
             for issue_str, session_uuid, restart_count in failed_releases:
-                if issue_str not in history:
+                existing = history.get(issue_str, {})
+                if not existing or existing.get("released"):
                     history[issue_str] = {
                         "session_uuid": session_uuid,
                         "short_id": "",
