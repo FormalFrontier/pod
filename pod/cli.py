@@ -1657,6 +1657,25 @@ def agent_process_main(config: dict, agent_id: str | None = None,
             f"duration={human_duration(elapsed)} {tok} "
             f"git:{state.git_start}..{git_end}")
 
+        # --- Clear uncompleted claims so check_dead_claimed_issues doesn't
+        #     mistake our finished session for a dead one and spawn a new agent.
+        #     Without this, every session that ends without a PR leaves a stale
+        #     claim entry pointing to our old session UUID; the next housekeeping
+        #     cycle from any agent sees that UUID as dead and forks a new agent,
+        #     causing unbounded agent proliferation.
+        if state.claimed_issue > 0 and state.pr_number == 0:
+            try:
+                coordination(
+                    config, "skip", str(state.claimed_issue),
+                    f"Session ended without PR (session {state.uuid})",
+                    env_extra={"POD_SESSION_ID": state.uuid},
+                    cwd=wt_dir,
+                )
+            except Exception:
+                pass
+            clear_claim(state.claimed_issue)
+            log(f"Agent {short_id}: cleared claim on #{state.claimed_issue} (session ended without PR)")
+
         # --- Circuit breaker: sessions that exit too quickly are broken ---
         if elapsed < 15 and state.tokens_in == 0 and state.tokens_out == 0:
             rapid_failures = getattr(state, '_rapid_failures', 0) + 1
