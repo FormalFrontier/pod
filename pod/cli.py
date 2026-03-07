@@ -1960,8 +1960,11 @@ def _tui_main(stdscr, config: dict):
             # Tokens
             tok = token_summary(agent, pricing)
 
-            # Activity text
-            activity = agent.last_text or agent.status
+            # Activity text: for non-running states show status, not stale last_text
+            if agent.status in ("running", "finishing"):
+                activity = agent.last_text or agent.status
+            else:
+                activity = agent.status
             # Thinking detection: if JSONL is stale but process is alive
             if (agent.last_activity > 0 and
                     time.time() - agent.last_activity > 10 and
@@ -2352,7 +2355,10 @@ def cmd_list(config: dict, args):
 
         elapsed = human_duration(time.time() - a.session_start) if a.session_start > 0 else ""
         tok = token_summary(a, pricing)
-        activity = a.last_text or a.status
+        if a.status in ("running", "finishing"):
+            activity = a.last_text or a.status
+        else:
+            activity = a.status
 
         print(fmt.format(i + 1, a.short_id, mode[:16], elapsed, tok, activity[:40]))
 
