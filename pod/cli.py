@@ -2496,6 +2496,47 @@ def _populate_claude_config():
     shutil.copytree(str(src), str(dst))
 
 
+REQUIRED_LABELS = {
+    "agent-plan": "1D76DB",
+    "claimed": "FBCA04",
+    "blocked": "B60205",
+    "has-pr": "5319E7",
+    "replan": "D93F0B",
+    "coordination": "0E8A16",
+}
+
+
+def _ensure_github_labels():
+    """Create any missing GitHub labels required by pod."""
+    try:
+        r = subprocess.run(
+            ["gh", "label", "list", "--limit", "100", "--json", "name", "--jq", ".[].name"],
+            capture_output=True, text=True, timeout=15,
+            cwd=str(PROJECT_DIR),
+        )
+        if r.returncode != 0:
+            print("  warning: could not list labels (gh CLI issue)")
+            return
+        existing = set(r.stdout.strip().splitlines())
+        created = []
+        for label, color in REQUIRED_LABELS.items():
+            if label not in existing:
+                cr = subprocess.run(
+                    ["gh", "label", "create", label, "--color", color,
+                     "--description", "pod coordination"],
+                    capture_output=True, text=True, timeout=15,
+                    cwd=str(PROJECT_DIR),
+                )
+                if cr.returncode == 0:
+                    created.append(label)
+        if created:
+            print(f"  created GitHub labels: {', '.join(created)}")
+        else:
+            print("  GitHub labels already exist")
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        print("  warning: could not ensure GitHub labels (gh CLI not available)")
+
+
 def cmd_init(args):
     """Bootstrap .pod/ in the current git repo."""
     # Verify we're in a git repo
@@ -2527,6 +2568,10 @@ def cmd_init(args):
     ISOLATED_CONFIG_DIR = pod_dir / "claude-config"
     _populate_claude_config()
     print(f"  populated {ISOLATED_CONFIG_DIR.relative_to(git_root)}/")
+
+    # Ensure required GitHub labels exist
+    _ensure_github_labels()
+
     print("pod init complete.")
 
 
