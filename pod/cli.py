@@ -2537,6 +2537,23 @@ def _ensure_github_labels():
         print("  warning: could not ensure GitHub labels (gh CLI not available)")
 
 
+def _ensure_repo_merge_settings():
+    """Enable auto-merge and squash merge on the GitHub repo (best effort)."""
+    try:
+        r = subprocess.run(
+            ["gh", "repo", "edit", "--enable-auto-merge", "--enable-squash-merge"],
+            capture_output=True, text=True, timeout=15,
+            cwd=str(PROJECT_DIR),
+        )
+        if r.returncode == 0:
+            print("  enabled auto-merge and squash merge on GitHub repo")
+        else:
+            print("  warning: could not enable auto-merge/squash-merge "
+                  "(may need admin access — enable manually in repo Settings → General)")
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        print("  warning: could not configure repo merge settings (gh CLI not available)")
+
+
 def cmd_init(args):
     """Bootstrap .pod/ in the current git repo."""
     # Verify we're in a git repo
@@ -2571,6 +2588,9 @@ def cmd_init(args):
 
     # Ensure required GitHub labels exist
     _ensure_github_labels()
+
+    # GitHub repo merge settings (required for coordination create-pr auto-merge to work)
+    _ensure_repo_merge_settings()
 
     print("pod init complete.")
 
