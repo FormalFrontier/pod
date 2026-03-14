@@ -83,6 +83,32 @@ die() { echo "error: $*" >&2; exit 1; }
 gh auth status --hostname github.com >/dev/null 2>&1 || \
     die "gh CLI not authenticated — run 'gh auth login' first"
 
+# Ensure required labels exist (idempotent).
+# Runs once per repo per shell session (cached via /tmp flag file).
+_ensure_labels_flag="/tmp/pod-labels-ensured-${REPO_SLUG}"
+_ensure_labels() {
+    [[ -f "$_ensure_labels_flag" ]] && return
+    local -A required_labels=(
+        [agent-plan]="1D76DB"
+        [claimed]="FBCA04"
+        [blocked]="B60205"
+        [has-pr]="5319E7"
+        [replan]="D93F0B"
+        [coordination]="0E8A16"
+    )
+    local existing
+    existing="$(gh label list --repo "$REPO" --limit 100 --json name --jq '.[].name')"
+    for label in "${!required_labels[@]}"; do
+        if ! echo "$existing" | grep -qx "$label"; then
+            gh label create "$label" --repo "$REPO" \
+                --color "${required_labels[$label]}" \
+                --description "pod coordination" 2>/dev/null || true
+        fi
+    done
+    touch "$_ensure_labels_flag"
+}
+_ensure_labels
+
 # Helper: get unclaimed issues as JSON array
 # Optional arg: extra label to filter by (e.g. "feature", "review")
 _unclaimed_issues() {
