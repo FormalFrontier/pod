@@ -7,7 +7,8 @@ Usage:
     pod                  # Interactive TUI
     pod init             # Bootstrap .pod/ in current git repo
     pod update           # Re-populate agent config from package
-    pod add [N]          # Launch N new agents (default 1)
+    pod add [N]          # Launch N new agents (default 1); updates target
+    pod target N         # Set target agent count (auto-spawn/cap enforced)
     pod list             # Show running agents
     pod finish [ID|all]  # Signal agent(s) to finish after current work
     pod kill [ID|all]    # Kill agent(s) immediately (unclaims issues)
@@ -78,6 +79,7 @@ CONFIG_PATH = POD_DIR / "config.toml"
 LOG_PATH = POD_DIR / "pod.log"
 CLAIM_HISTORY_PATH = POD_DIR / "claim-history.json"
 ISOLATED_CONFIG_DIR = POD_DIR / "claude-config"
+TARGET_FILE = POD_DIR / "target"  # Target agent count (int, one per line)
 
 # ---------------------------------------------------------------------------
 # Default configuration (written on first run)
@@ -386,6 +388,19 @@ def read_all_agents() -> list[AgentState]:
         except (json.JSONDecodeError, OSError):
             continue
     return agents
+
+
+def read_target() -> int | None:
+    """Read target agent count from .pod/target, or None if not set."""
+    try:
+        return int(TARGET_FILE.read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def write_target(n: int):
+    """Write target agent count to .pod/target."""
+    TARGET_FILE.write_text(str(max(0, n)))
 
 
 # ---------------------------------------------------------------------------
@@ -1183,7 +1198,25 @@ def check_dead_claimed_issues(config: dict):
             _save_claim_history(history)
     # Lock released before any fork or subprocess call
 
-    for short_id, session_uuid, issue_str, new_count in to_restart:
+    # Deduplicate: if one session claimed N issues, only restart it once.
+    seen_uuids: set[str] = set()
+    deduped_restart = []
+    for entry in to_restart:
+        _, session_uuid, _, _ = entry
+        if session_uuid not in seen_uuids:
+            seen_uuids.add(session_uuid)
+            deduped_restart.append(entry)
+
+    # Respect target_agents: don't spawn more agents than the target.
+    target = read_target()
+    if target is not None:
+        current_count = len([a for a in agents if a.status not in ("dead", "stopped")])
+        slots = max(0, target - current_count)
+        if len(deduped_restart) > slots:
+            log(f"Capping restarts at {slots} (target={target}, running={current_count})")
+            deduped_restart = deduped_restart[:slots]
+
+    for short_id, session_uuid, issue_str, new_count in deduped_restart:
         log(f"Dead session {session_uuid} claimed #{issue_str}, "
             f"restarting (attempt {new_count}/{max_restarts})")
         # Use a fresh agent_id — reusing the old short_id causes all restart
@@ -1826,6 +1859,36 @@ def _tui_main(stdscr, config: dict):
     lock_fetch_time = 0.0
     CACHE_SECS = 30  # Refresh interval for GitHub API data
 
+    # Background fetch infrastructure: all GH/coordination calls run in daemon
+    # threads so the TUI never blocks on network I/O.
+    _bg_data: dict = {"queue": None, "items": None, "blocked_deps": None, "lock_status": None}
+    _bg_active: set = set()
+    _bg_mutex = threading.Lock()
+
+    def _bg_run(key, fn, *args):
+        try:
+            result = fn(*args)
+            with _bg_mutex:
+                _bg_data[key] = result
+        except Exception:
+            pass
+        finally:
+            with _bg_mutex:
+                _bg_active.discard(key)
+
+    def _bg_fetch(key, fn, *args):
+        with _bg_mutex:
+            if key in _bg_active:
+                return
+            _bg_active.add(key)
+        threading.Thread(target=_bg_run, args=(key, fn) + args, daemon=True).start()
+
+    def _get_lock_status_str():
+        r = coordination(config, "lock-status")
+        return r.stdout.strip()
+
+    last_auto_spawn_time = 0.0  # Timestamp of last TUI-initiated auto-spawn
+
     pricing = cfg_get(config, "pricing", default={})
 
     # Compute all-time historical cost once at startup
@@ -1869,51 +1932,59 @@ def _tui_main(stdscr, config: dict):
         session_runs = sum(1 for sid in session_agent_costs if sid not in baseline_costs)
         running = sum(1 for a in agents if a.status not in ("stopped", "dead"))
 
-        # Cache GitHub data to avoid API calls every second
+        # Kick off background refreshes (non-blocking) and read latest results.
         now = time.time()
         if cached_queue is None or now - queue_fetch_time > CACHE_SECS:
-            try:
-                cached_queue = get_queue_depth(config)
-                queue_fetch_time = now
-            except Exception:
-                pass
+            _bg_fetch("queue", get_queue_depth, config)
+            queue_fetch_time = now
         if now - items_fetch_time > CACHE_SECS:
-            try:
-                cached_items = fetch_issues_and_prs()
-                items_fetch_time = now
-            except Exception:
-                pass
+            _bg_fetch("items", fetch_issues_and_prs)
+            items_fetch_time = now
         if now - blocked_deps_fetch_time > CACHE_SECS:
-            try:
-                cached_blocked_deps = fetch_blocked_deps()
-                blocked_deps_fetch_time = now
-            except Exception:
-                pass
-        # Lock status: check agent state first (cheap), fall back to API
+            _bg_fetch("blocked_deps", fetch_blocked_deps)
+            blocked_deps_fetch_time = now
+        # Lock status: check agent state first (cheap), fall back to background API
         if now - lock_fetch_time > CACHE_SECS:
-            # If any running agent holds a lock, it's locked (no API call needed)
+            lock_fetch_time = now
             agent_holds_lock = any(a.lock_held for a in agents
                                   if a.status not in ("stopped", "dead"))
             if agent_holds_lock:
-                cached_lock_status = "locked"
-                lock_fetch_time = now
+                with _bg_mutex:
+                    _bg_data["lock_status"] = "locked"
             else:
-                try:
-                    r = coordination(config, "lock-status")
-                    cached_lock_status = r.stdout.strip()
-                    lock_fetch_time = now
-                except Exception:
-                    pass
+                _bg_fetch("lock_status", _get_lock_status_str)
+        # Apply any completed background results to cached display values
+        with _bg_mutex:
+            if _bg_data["queue"] is not None:
+                cached_queue = _bg_data["queue"]
+            if _bg_data["items"] is not None:
+                cached_items = _bg_data["items"]
+            if _bg_data["blocked_deps"] is not None:
+                cached_blocked_deps = _bg_data["blocked_deps"]
+            if _bg_data["lock_status"] is not None:
+                cached_lock_status = _bg_data["lock_status"]
+
+        # Auto-spawn agents to maintain target (only if no agents are finishing).
+        target = read_target()
+        if target is not None and running < target and now - last_auto_spawn_time > 5.0:
+            finishing_count = sum(1 for a in agents if a.status == "finishing")
+            if finishing_count == 0:
+                n_to_spawn = target - running
+                for _ in range(n_to_spawn):
+                    spawn_agent(config)
+                last_auto_spawn_time = now
 
         all_time = historical_cost + session_cost
         session_info = f"${session_cost:.2f} this session, {session_runs} run{'s' if session_runs != 1 else ''}"
         lock_indicator = ""
         if cached_lock_status == "locked":
             lock_indicator = " | LOCK"
+        agent_str = f"{running}/{target}" if target is not None else str(running)
+        agent_word = "agent" if (target or running) == 1 else "agents"
         if cached_queue is not None:
-            header = f" pod -- {running} agent{'s' if running != 1 else ''} running | queue: {cached_queue}{lock_indicator} | ${all_time:.2f} total ({session_info})"
+            header = f" pod -- {agent_str} {agent_word} running | queue: {cached_queue}{lock_indicator} | ${all_time:.2f} total ({session_info})"
         else:
-            header = f" pod -- {running} agent{'s' if running != 1 else ''} running{lock_indicator} | ${all_time:.2f} total ({session_info})"
+            header = f" pod -- {agent_str} {agent_word} running{lock_indicator} | ${all_time:.2f} total ({session_info})"
 
         _addstr(stdscr, 0, 0, header[:width], curses.color_pair(4) | curses.A_BOLD)
         _addstr(stdscr, 1, 0, "─" * min(width, 80), curses.color_pair(4))
@@ -2146,6 +2217,7 @@ def _tui_main(stdscr, config: dict):
             break
         elif ch == ord("Q"):
             # Quit all: finish all agents, then wait
+            write_target(0)  # Don't auto-respawn after quitting all
             for a in agents:
                 if a.pid > 0 and a.status not in ("stopped", "dead") and _pid_is_valid(a.pid, a.pid_start_time):
                     try:
@@ -2165,6 +2237,8 @@ def _tui_main(stdscr, config: dict):
             break
         elif ch == ord("a") or ch == ord("A"):
             spawn_agent(config)
+            cur_target = read_target()
+            write_target((cur_target or running) + 1)
             message = "Launched 1 agent"
             message_time = time.time()
         elif ch == ord("f") or ch == ord("F"):
@@ -2364,12 +2438,16 @@ def cmd_list(config: dict, args):
 
 
 def cmd_add(config: dict, args):
-    """Launch new agents."""
+    """Launch new agents and update the target count."""
     n = args.count if args.count else 1
     for _ in range(n):
         pid = spawn_agent(config)
         say(f"Launched agent (PID {pid})")
-    print(f"Launched {n} agent{'s' if n != 1 else ''}.")
+    alive = len([a for a in read_all_agents() if a.status not in ("stopped", "dead")])
+    cur_target = read_target()
+    new_target = max(alive, (cur_target or 0) + n)
+    write_target(new_target)
+    print(f"Launched {n} agent{'s' if n != 1 else ''}. Target: {new_target}.")
 
 
 def cmd_finish(config: dict, args):
@@ -2385,6 +2463,7 @@ def cmd_finish(config: dict, args):
             print(f"No running agent matching '{args.target}'")
             return
 
+    signaled = 0
     for a in targets:
         if not _pid_is_valid(a.pid, a.pid_start_time):
             print(f"Agent {a.short_id} not running (PID {a.pid})")
@@ -2392,8 +2471,14 @@ def cmd_finish(config: dict, args):
         try:
             os.kill(a.pid, signal.SIGUSR1)
             print(f"Finish signal sent to {a.short_id} (PID {a.pid})")
+            signaled += 1
         except (ProcessLookupError, OSError):
             print(f"Agent {a.short_id} not running (PID {a.pid})")
+
+    # Decrement target so auto-spawn doesn't immediately refill the pool.
+    cur_target = read_target()
+    if cur_target is not None and signaled > 0:
+        write_target(max(0, cur_target - signaled))
 
 
 def cmd_kill(config: dict, args):
@@ -2409,9 +2494,16 @@ def cmd_kill(config: dict, args):
             print(f"No running agent matching '{args.target}'")
             return
 
+    killed = 0
     for a in targets:
         _kill_agent(config, a)
         print(f"Killed {a.short_id} (PID {a.pid})")
+        killed += 1
+
+    # Decrement target so auto-spawn doesn't immediately refill the pool.
+    cur_target = read_target()
+    if cur_target is not None and killed > 0:
+        write_target(max(0, cur_target - killed))
 
 
 def cmd_status(config: dict, args):
@@ -2653,6 +2745,9 @@ def main():
     p_add.add_argument("count", type=int, nargs="?", default=1,
                         help="Number of agents to launch (default: 1)")
 
+    p_target = sub.add_parser("target", help="Set target agent count")
+    p_target.add_argument("count", type=int, help="Target number of agents")
+
     p_finish = sub.add_parser("finish", help="Signal agent to finish current work")
     p_finish.add_argument("target", help="Agent ID prefix or 'all'")
 
@@ -2691,6 +2786,9 @@ def main():
         cmd_list(config, args)
     elif args.command == "add":
         cmd_add(config, args)
+    elif args.command == "target":
+        write_target(args.count)
+        print(f"Target set to {args.count} agents.")
     elif args.command == "finish":
         cmd_finish(config, args)
     elif args.command == "kill":
