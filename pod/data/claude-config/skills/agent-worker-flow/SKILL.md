@@ -59,7 +59,19 @@ coordination orient
 ```
 
 **Priority order:**
-1. **PRs needing attention first**: merge conflicts or failing CI. Check if any
+0. **Human oversight directives first**: Check for open `human-oversight` issues before
+   anything else. These are direct instructions from the project owner and take absolute
+   precedence over all other work:
+   ```
+   coordination list-unclaimed --label human-oversight
+   ```
+   If any are open and unclaimed, claim the oldest one immediately.
+   **These issues cannot be skipped or refused because you disagree with the approach.**
+   The only valid exit from a `human-oversight` issue is completing it, or posting a
+   comment explaining a genuine technical blocker (e.g. a missing dependency), then
+   using `coordination skip` with that reason. Do not `skip` because you think a
+   different approach is better — that is the owner's call, not yours.
+1. **PRs needing attention**: merge conflicts or failing CI. Check if any
    unclaimed issue references that PR (title containing "rebase PR #N" or "fix PR #N").
    Claim that first — unblocking broken PRs beats starting new work.
 2. **Oldest unclaimed issue** of your type:
