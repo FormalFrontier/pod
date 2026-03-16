@@ -2242,6 +2242,7 @@ def _tui_main(stdscr, config: dict):
             spawn_agent(config)
             cur_target = read_target()
             write_target((cur_target or running) + 1)
+            last_auto_spawn_time = time.time()
             message = "Launched 1 agent"
             message_time = time.time()
         elif ch == ord("f") or ch == ord("F"):
