@@ -31,7 +31,6 @@ import os
 import random
 import re
 import signal
-import importlib.resources
 import shutil
 import subprocess
 import sys
@@ -69,7 +68,7 @@ def _find_project_dir() -> Path:
 
 def _data_dir() -> Path:
     """Locate bundled data files from the installed package."""
-    return Path(str(importlib.resources.files("pod.data")))
+    return Path(__file__).parent / "data"
 
 
 PROJECT_DIR = _find_project_dir()
@@ -1888,6 +1887,8 @@ def _tui_main(stdscr, config: dict):
         return r.stdout.strip()
 
     last_auto_spawn_time = 0.0  # Timestamp of last TUI-initiated auto-spawn
+    auto_spawn_failures = 0     # Consecutive auto-spawns where agents died instantly
+    auto_spawn_paused = False   # True when crash-loop detected
 
     pricing = cfg_get(config, "pricing", default={})
 
@@ -1969,10 +1970,24 @@ def _tui_main(stdscr, config: dict):
         if target is not None and running < target and now - last_auto_spawn_time > 5.0:
             finishing_count = sum(1 for a in agents if a.status == "finishing")
             if finishing_count == 0:
-                n_to_spawn = target - running
-                for _ in range(n_to_spawn):
-                    spawn_agent(config)
-                last_auto_spawn_time = now
+                if auto_spawn_paused:
+                    pass  # Crash-loop detected; suppress auto-spawn (user can press 'a')
+                else:
+                    # Detect crash-loop: if we spawned recently and all agents are already gone,
+                    # they died instantly.
+                    if last_auto_spawn_time > 0 and running == 0:
+                        auto_spawn_failures += 1
+                    else:
+                        auto_spawn_failures = 0
+                    if auto_spawn_failures >= 3:
+                        log("Auto-spawn crash-loop detected (3 consecutive rapid deaths). "
+                            "Pausing auto-spawn. Press 'a' to retry.")
+                        auto_spawn_paused = True
+                    else:
+                        n_to_spawn = target - running
+                        for _ in range(n_to_spawn):
+                            spawn_agent(config)
+                        last_auto_spawn_time = now
 
         all_time = historical_cost + session_cost
         session_info = f"${session_cost:.2f} this session, {session_runs} run{'s' if session_runs != 1 else ''}"
@@ -2243,6 +2258,8 @@ def _tui_main(stdscr, config: dict):
             cur_target = read_target()
             write_target((cur_target or running) + 1)
             last_auto_spawn_time = time.time()
+            auto_spawn_failures = 0
+            auto_spawn_paused = False
             message = "Launched 1 agent"
             message_time = time.time()
         elif ch == ord("f") or ch == ord("F"):
