@@ -93,7 +93,7 @@ _ensure_labels() {
     local existing
     existing="$(gh label list --repo "$REPO" --limit 100 --json name --jq '.[].name')"
     local label color
-    for pair in agent-plan:1D76DB claimed:FBCA04 blocked:B60205 has-pr:5319E7 replan:D93F0B coordination:0E8A16 human-oversight:CC317C return-to-human:E4A400; do
+    for pair in agent-plan:1D76DB claimed:FBCA04 blocked:B60205 has-pr:5319E7 replan:D93F0B coordination:0E8A16 human-oversight:CC317C; do
         label="${pair%%:*}"
         color="${pair##*:}"
         if ! echo "$existing" | grep -qx "$label"; then
@@ -725,12 +725,12 @@ cmd_check_blocked() {
 
 # --- human-oversight ---
 # Called by a planner when it determines there is no work left to plan and the
-# project is complete. Adds the label "return-to-human" to the sentinel issue.
+# project is complete. Adds the label "human-oversight" to the sentinel issue.
 # The pod TUI monitors this label and responds by setting the agent target to 0
 # and gracefully finishing all running agents, returning control to the operator.
 cmd_human_oversight() {
     _resolve_planner_lock_issue
-    gh issue edit "$PLANNER_LOCK_ISSUE" --repo "$REPO" --add-label return-to-human
+    gh issue edit "$PLANNER_LOCK_ISSUE" --repo "$REPO" --add-label human-oversight
     echo "Human-oversight signal sent (label added to sentinel issue #$PLANNER_LOCK_ISSUE)"
 }
 
@@ -743,7 +743,7 @@ cmd_check_human_oversight() {
     local labels
     labels="$(gh issue view "$PLANNER_LOCK_ISSUE" --repo "$REPO" --json labels \
         --jq '[.labels[].name] | join(",")')"
-    if echo "$labels" | grep -qw 'return-to-human'; then
+    if echo "$labels" | grep -qw 'human-oversight'; then
         echo "true"
         return 0
     else

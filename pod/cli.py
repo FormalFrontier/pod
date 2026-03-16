@@ -2240,7 +2240,7 @@ def _tui_main(stdscr, config: dict):
         if cached_return_to_human:
             banner_row = msg_row + 1 if msg_active else msg_row
             if banner_row < height:
-                banner = " *** HUMAN OVERSIGHT: planner signals no work remains — target=0, agents finishing ***"
+                banner = " *** human-oversight signalled: no work remains — target=0, agents finishing ***"
                 _addstr(stdscr, banner_row, 0, banner[:width], curses.color_pair(2) | curses.A_BOLD)
 
         stdscr.refresh()

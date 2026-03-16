@@ -122,6 +122,17 @@ For each issue, write the plan body to `plans/<UUID-prefix>-N.md`, then post:
 coordination plan --label <feature|review|summarize|meditate> "title" < plans/<UUID-prefix>-N.md
 ```
 
+**If you created zero new issues** and the unclaimed queue is empty (no work
+for agents to do), signal that control should return to the human:
+```
+coordination human-oversight
+```
+This adds the `human-oversight` label to the sentinel issue. The pod TUI
+detects it, sets the agent target to 0, and gracefully finishes all running
+agents. Do this only when the project is genuinely complete or stalled with
+no actionable next steps — not simply because you happened not to create
+issues this pass.
+
 Then exit. Do NOT execute any code changes.
 
 **Note**: The planner lock is managed by `pod` — do NOT call
