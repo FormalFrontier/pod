@@ -310,15 +310,16 @@ cmd_create_pr() {
         fi
     fi
 
-    # Push branch
-    git push -u origin "$BRANCH"
+    # Push branch (force-with-lease: local branch is always a fresh rebase from origin/main,
+    # so overwriting a stale remote agent/* branch is always safe)
+    git push --force-with-lease -u origin "$BRANCH"
 
     # Check if PR already exists for this branch
     local existing_pr
     existing_pr="$(gh pr list --repo "$REPO" --head "$BRANCH" --json number --jq '.[0].number // empty')"
     if [[ -n "$existing_pr" ]]; then
         echo "PR #$existing_pr already exists for branch $BRANCH. Enabling auto-merge."
-        gh pr merge "$existing_pr" --repo "$REPO" --auto --squash || \
+        gh pr merge "$existing_pr" --repo "$REPO" --auto --squash --delete-branch || \
             echo "warning: auto-merge not available (branch protection may not be set up)"
         if [[ "$partial" == true ]]; then
             # Partial: add replan BEFORE removing claimed to prevent race window
@@ -351,7 +352,7 @@ EOF
     local pr_num
     pr_num="$(gh pr list --repo "$REPO" --head "$BRANCH" --json number --jq '.[0].number')"
     if [[ -n "$pr_num" ]]; then
-        gh pr merge "$pr_num" --repo "$REPO" --auto --squash || \
+        gh pr merge "$pr_num" --repo "$REPO" --auto --squash --delete-branch || \
             echo "warning: auto-merge not available (branch protection may not be set up)"
     fi
 
