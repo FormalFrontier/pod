@@ -2206,6 +2206,9 @@ def _tui_main(stdscr, config: dict):
                     _kill_agent(config, agent)
                     message = f"Killed agent {agent.short_id}"
                     message_time = time.time()
+                    cur_target = read_target()
+                    if cur_target is not None and cur_target > 0:
+                        write_target(cur_target - 1)
             else:
                 message = "Kill cancelled"
                 message_time = time.time()
@@ -2248,6 +2251,9 @@ def _tui_main(stdscr, config: dict):
                     try:
                         os.kill(agent.pid, signal.SIGUSR1)
                         message = f"Finish signal sent to {agent.short_id}"
+                        cur_target = read_target()
+                        if cur_target is not None and cur_target > 0:
+                            write_target(cur_target - 1)
                     except (ProcessLookupError, OSError):
                         message = f"Agent {agent.short_id} not running"
                 else:
