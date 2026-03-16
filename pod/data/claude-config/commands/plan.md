@@ -122,16 +122,31 @@ For each issue, write the plan body to `plans/<UUID-prefix>-N.md`, then post:
 coordination plan --label <feature|review|summarize|meditate> "title" < plans/<UUID-prefix>-N.md
 ```
 
-**If you created zero new issues** and the unclaimed queue is empty (no work
-for agents to do), signal that control should return to the human:
+**If you created zero new issues** and all of the following are true, signal
+that control should return to the human:
+- No unclaimed issues in the queue
+- No claimed issues (no workers currently active)
+- No open PRs needing attention (failing CI, merge conflicts)
+
 ```
 coordination human-oversight
 ```
-This adds the `human-oversight` label to the sentinel issue. The pod TUI
+
+Verify with:
+```bash
+# All three must show zero / empty
+coordination queue-depth
+gh issue list --label claimed --state open --json number --jq 'length'
+gh pr list --state open --json number,mergeable,statusCheckRollup \
+  --jq '[.[] | select(.mergeable == "CONFLICTING" or (.statusCheckRollup | any(.conclusion == "FAILURE")))] | length'
+```
+
+This adds the `return-to-human` label to the sentinel issue. The pod TUI
 detects it, sets the agent target to 0, and gracefully finishes all running
-agents. Do this only when the project is genuinely complete or stalled with
-no actionable next steps — not simply because you happened not to create
-issues this pass.
+agents. The human can clear this signal and resume via the `[r]` key in the
+TUI. Do this only when the project is genuinely complete or stalled with no
+actionable next steps — not simply because you happened not to create issues
+this pass.
 
 Then exit. Do NOT execute any code changes.
 

@@ -649,6 +649,14 @@ def get_return_to_human(config: dict) -> bool:
         return False
 
 
+def clear_return_to_human(config: dict) -> None:
+    """Remove the return-to-human signal from the sentinel issue."""
+    try:
+        coordination(config, "clear-human-oversight")
+    except subprocess.TimeoutExpired:
+        pass
+
+
 @dataclasses.dataclass
 class GHItem:
     """An issue or PR for TUI display."""
@@ -1865,9 +1873,19 @@ def _tui_main(stdscr, config: dict):
     blocked_deps_fetch_time = 0.0
     cached_lock_status: str | None = None  # "locked" or "unlocked"
     lock_fetch_time = 0.0
-    cached_return_to_human = False
+    # Check for pre-existing human-oversight signal synchronously at startup.
+    # If it was already set before this TUI session, we honour it (target=0, banner)
+    # but do NOT send SIGUSR1 — the human restarted pod intentionally.
+    try:
+        cached_return_to_human = get_return_to_human(config)
+    except Exception:
+        cached_return_to_human = False
     return_to_human_fetch_time = 0.0
-    _acted_on_return_to_human = False  # True once TUI has reacted (set target=0, sent finish)
+    # _acted_on_return_to_human: True once this session has already sent SIGUSR1.
+    # Set True at startup when signal was pre-existing so we skip the SIGUSR1 burst.
+    _acted_on_return_to_human = cached_return_to_human
+    if cached_return_to_human:
+        write_target(0)
     CACHE_SECS = 30  # Refresh interval for GitHub API data
 
     # Background fetch infrastructure: all GH/coordination calls run in daemon
@@ -2226,6 +2244,8 @@ def _tui_main(stdscr, config: dict):
                 input_mode = ""
         else:
             footer_text = " [a]dd  [f]inish  [k]ill  [o]pen  [!]force  [L]ock  [q]uit  [Q]uit all  ↑↓/1-9"
+            if cached_return_to_human:
+                footer_text = " [r]esume work  " + footer_text.lstrip()
 
         if footer_row2 < height:
             _addstr(stdscr, footer_row2, 0, footer_text[:width], curses.A_DIM)
@@ -2370,6 +2390,17 @@ def _tui_main(stdscr, config: dict):
                     message = f"Force quota {label} for {agent.short_id}"
                 except (OSError, json.JSONDecodeError) as e:
                     message = f"Failed to toggle force: {e}"
+                message_time = time.time()
+        elif ch == ord("r") or ch == ord("R"):
+            # Clear human-oversight signal and resume normal operation
+            if cached_return_to_human:
+                try:
+                    clear_return_to_human(config)
+                    cached_return_to_human = False
+                    _acted_on_return_to_human = False
+                    message = "Human-oversight signal cleared. Adjust target with [a]/[+] to resume."
+                except Exception as e:
+                    message = f"Failed to clear signal: {e}"
                 message_time = time.time()
         elif ch == ord("l") or ch == ord("L"):
             # Toggle planner lock
