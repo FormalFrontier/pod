@@ -640,6 +640,23 @@ def get_queue_depth(config: dict) -> int:
         return 0
 
 
+def get_return_to_human(config: dict) -> bool:
+    """Check whether a planner has signalled human-oversight on the sentinel issue."""
+    try:
+        r = coordination(config, "check-human-oversight")
+        return r.stdout.strip() == "true"
+    except subprocess.TimeoutExpired:
+        return False
+
+
+def clear_return_to_human(config: dict) -> None:
+    """Remove the return-to-human signal from the sentinel issue."""
+    try:
+        coordination(config, "clear-human-oversight")
+    except subprocess.TimeoutExpired:
+        pass
+
+
 @dataclasses.dataclass
 class GHItem:
     """An issue or PR for TUI display."""
@@ -1856,11 +1873,25 @@ def _tui_main(stdscr, config: dict):
     blocked_deps_fetch_time = 0.0
     cached_lock_status: str | None = None  # "locked" or "unlocked"
     lock_fetch_time = 0.0
+    # Check for pre-existing human-oversight signal synchronously at startup.
+    # If it was already set before this TUI session, we honour it (target=0, banner)
+    # but do NOT send SIGUSR1 — the human restarted pod intentionally.
+    try:
+        cached_return_to_human = get_return_to_human(config)
+    except Exception:
+        cached_return_to_human = False
+    return_to_human_fetch_time = 0.0
+    # _acted_on_return_to_human: True once this session has already sent SIGUSR1.
+    # Set True at startup when signal was pre-existing so we skip the SIGUSR1 burst.
+    _acted_on_return_to_human = cached_return_to_human
+    if cached_return_to_human:
+        write_target(0)
     CACHE_SECS = 30  # Refresh interval for GitHub API data
 
     # Background fetch infrastructure: all GH/coordination calls run in daemon
     # threads so the TUI never blocks on network I/O.
-    _bg_data: dict = {"queue": None, "items": None, "blocked_deps": None, "lock_status": None}
+    _bg_data: dict = {"queue": None, "items": None, "blocked_deps": None, "lock_status": None,
+                      "return_to_human": None}
     _bg_active: set = set()
     _bg_mutex = threading.Lock()
 
@@ -1944,6 +1975,10 @@ def _tui_main(stdscr, config: dict):
         if now - blocked_deps_fetch_time > CACHE_SECS:
             _bg_fetch("blocked_deps", fetch_blocked_deps)
             blocked_deps_fetch_time = now
+        # Human-oversight signal: planner labels sentinel issue when no work remains.
+        if not _acted_on_return_to_human and now - return_to_human_fetch_time > CACHE_SECS:
+            _bg_fetch("return_to_human", get_return_to_human, config)
+            return_to_human_fetch_time = now
         # Lock status: check agent state first (cheap), fall back to background API
         if now - lock_fetch_time > CACHE_SECS:
             lock_fetch_time = now
@@ -1964,6 +1999,22 @@ def _tui_main(stdscr, config: dict):
                 cached_blocked_deps = _bg_data["blocked_deps"]
             if _bg_data["lock_status"] is not None:
                 cached_lock_status = _bg_data["lock_status"]
+            if _bg_data["return_to_human"] is not None:
+                cached_return_to_human = _bg_data["return_to_human"]
+
+        # React to human-oversight signal: set target=0 and gracefully finish all agents.
+        # Only act once per TUI session (idempotent).
+        if cached_return_to_human and not _acted_on_return_to_human:
+            _acted_on_return_to_human = True
+            write_target(0)
+            for a in agents:
+                if a.pid > 0 and a.status not in ("stopped", "dead") and _pid_is_valid(a.pid, a.pid_start_time):
+                    try:
+                        os.kill(a.pid, signal.SIGUSR1)
+                    except (ProcessLookupError, OSError):
+                        pass
+            message = "Planner signalled: no work remains. Target set to 0; agents finishing."
+            message_time = now
 
         # Auto-spawn agents to maintain target (only if no agents are finishing).
         target = read_target()
@@ -2085,7 +2136,7 @@ def _tui_main(stdscr, config: dict):
         # --- Issues/PRs panel ---
         # Row budget: 3 top (header+sep+colhdr) + rendered agents + 3 bottom (sep+help+msg)
         agents_end = 3 + agents_rendered
-        footer_fixed = 3  # separator + help + message
+        footer_fixed = 4 if cached_return_to_human else 3  # separator + help + message [+ banner]
         avail_for_items = height - agents_end - footer_fixed
         # Need: 1 blank + 1 separator + 1 header + at least 1 item row = 4
         items_shown = 0
@@ -2193,15 +2244,24 @@ def _tui_main(stdscr, config: dict):
                 input_mode = ""
         else:
             footer_text = " [a]dd  [f]inish  [k]ill  [o]pen  [!]force  [L]ock  [q]uit  [Q]uit all  ↑↓/1-9"
+            if cached_return_to_human:
+                footer_text = " [r]esume work  " + footer_text.lstrip()
 
         if footer_row2 < height:
             _addstr(stdscr, footer_row2, 0, footer_text[:width], curses.A_DIM)
 
         # --- Message line ---
-        if message and time.time() - message_time < 3:
-            msg_row = footer_row2 + 1
-            if msg_row < height:
-                _addstr(stdscr, msg_row, 0, f" {message}"[:width], curses.A_BOLD)
+        msg_active = bool(message and time.time() - message_time < 3)
+        msg_row = footer_row2 + 1
+        if msg_active and msg_row < height:
+            _addstr(stdscr, msg_row, 0, f" {message}"[:width], curses.A_BOLD)
+
+        # --- Human-oversight banner (persistent) ---
+        if cached_return_to_human:
+            banner_row = msg_row + 1 if msg_active else msg_row
+            if banner_row < height:
+                banner = " *** human-oversight signalled: no work remains — target=0, agents finishing ***"
+                _addstr(stdscr, banner_row, 0, banner[:width], curses.color_pair(2) | curses.A_BOLD)
 
         stdscr.refresh()
 
@@ -2330,6 +2390,17 @@ def _tui_main(stdscr, config: dict):
                     message = f"Force quota {label} for {agent.short_id}"
                 except (OSError, json.JSONDecodeError) as e:
                     message = f"Failed to toggle force: {e}"
+                message_time = time.time()
+        elif ch == ord("r") or ch == ord("R"):
+            # Clear human-oversight signal and resume normal operation
+            if cached_return_to_human:
+                try:
+                    clear_return_to_human(config)
+                    cached_return_to_human = False
+                    _acted_on_return_to_human = False
+                    message = "Human-oversight signal cleared. Adjust target with [a]/[+] to resume."
+                except Exception as e:
+                    message = f"Failed to clear signal: {e}"
                 message_time = time.time()
         elif ch == ord("l") or ch == ord("L"):
             # Toggle planner lock

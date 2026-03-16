@@ -19,6 +19,9 @@
 #   coordination release-stale-claims [SECS]  — release claimed issues with no activity for SECS seconds (default 14400 = 4h)
 #   coordination lock-planner                 — acquire advisory planner lock (20min TTL)
 #   coordination unlock-planner               — release planner lock early
+#   coordination human-oversight              — planner signals no work remains; TUI sets target=0 and finishes agents
+#   coordination check-human-oversight        — check if return-to-human signal is set on sentinel (exits 0 if set)
+#   coordination clear-human-oversight        — remove return-to-human signal (e.g. to resume work after completion)
 
 set -euo pipefail
 
@@ -91,7 +94,7 @@ _ensure_labels() {
     local existing
     existing="$(gh label list --repo "$REPO" --limit 100 --json name --jq '.[].name')"
     local label color
-    for pair in agent-plan:1D76DB claimed:FBCA04 blocked:B60205 has-pr:5319E7 replan:D93F0B coordination:0E8A16 human-oversight:CC317C; do
+    for pair in agent-plan:1D76DB claimed:FBCA04 blocked:B60205 has-pr:5319E7 replan:D93F0B coordination:0E8A16 human-oversight:CC317C return-to-human:E4A400; do
         label="${pair%%:*}"
         color="${pair##*:}"
         if ! echo "$existing" | grep -qx "$label"; then
@@ -721,6 +724,46 @@ cmd_check_blocked() {
     done
 }
 
+# --- human-oversight ---
+# Called by a planner when it determines there is no work left to plan and the
+# project is complete. Adds the label "human-oversight" to the sentinel issue.
+# The pod TUI monitors this label and responds by setting the agent target to 0
+# and gracefully finishing all running agents, returning control to the operator.
+cmd_human_oversight() {
+    _resolve_planner_lock_issue
+    gh issue edit "$PLANNER_LOCK_ISSUE" --repo "$REPO" --add-label return-to-human
+    echo "Human-oversight signal sent (label added to sentinel issue #$PLANNER_LOCK_ISSUE)"
+}
+
+# --- check-human-oversight ---
+# Read-only: check whether the return-to-human signal has been set on the sentinel issue.
+# Prints "true" and exits 0 if the signal is set; prints "false" and exits 1 otherwise.
+# Used by the pod TUI to poll for the signal.
+cmd_check_human_oversight() {
+    _resolve_planner_lock_issue
+    local labels
+    labels="$(gh issue view "$PLANNER_LOCK_ISSUE" --repo "$REPO" --json labels \
+        --jq '[.labels[].name] | join(",")')"
+    if echo "$labels" | grep -qw 'return-to-human'; then
+        echo "true"
+        return 0
+    else
+        echo "false"
+        return 1
+    fi
+}
+
+# --- clear-human-oversight ---
+# Remove the return-to-human signal from the sentinel issue.
+# Use this to resume pod operation after inspecting a completed project, or when
+# the signal was set in error. The TUI also exposes this via the 'r' keypress.
+cmd_clear_human_oversight() {
+    _resolve_planner_lock_issue
+    gh issue edit "$PLANNER_LOCK_ISSUE" --repo "$REPO" --remove-label return-to-human \
+        2>/dev/null || true
+    echo "Human-oversight signal cleared (label removed from sentinel issue #$PLANNER_LOCK_ISSUE)"
+}
+
 # --- dispatch ---
 case "${1:-}" in
     orient)          cmd_orient ;;
@@ -739,6 +782,9 @@ case "${1:-}" in
     unlock-planner)         cmd_unlock_planner ;;
     lock-status)            cmd_lock_status ;;
     force-unlock-planner)   cmd_force_unlock_planner ;;
+    human-oversight)        cmd_human_oversight ;;
+    check-human-oversight)  cmd_check_human_oversight ;;
+    clear-human-oversight)  cmd_clear_human_oversight ;;
     *)               die "unknown command: ${1:-}
-Usage: coordination {orient|plan [--label L]|create-pr|claim-fix|close-pr|list-unclaimed [--label L]|queue-depth [L]|claim|skip|add-dep|check-blocked|release-stale-claims|lock-planner|unlock-planner|lock-status|force-unlock-planner}" ;;
+Usage: coordination {orient|plan [--label L]|create-pr|claim-fix|close-pr|list-unclaimed [--label L]|queue-depth [L]|claim|skip|add-dep|check-blocked|release-stale-claims|lock-planner|unlock-planner|lock-status|force-unlock-planner|human-oversight|check-human-oversight|clear-human-oversight}" ;;
 esac
