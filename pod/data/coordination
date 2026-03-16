@@ -91,7 +91,7 @@ _ensure_labels() {
     local existing
     existing="$(gh label list --repo "$REPO" --limit 100 --json name --jq '.[].name')"
     local label color
-    for pair in agent-plan:1D76DB claimed:FBCA04 blocked:B60205 has-pr:5319E7 replan:D93F0B coordination:0E8A16; do
+    for pair in agent-plan:1D76DB claimed:FBCA04 blocked:B60205 has-pr:5319E7 replan:D93F0B coordination:0E8A16 human-oversight:CC317C; do
         label="${pair%%:*}"
         color="${pair##*:}"
         if ! echo "$existing" | grep -qx "$label"; then
@@ -118,6 +118,12 @@ _unclaimed_issues() {
 
 # --- orient ---
 cmd_orient() {
+    echo "=== HUMAN OVERSIGHT DIRECTIVES (highest priority) ==="
+    gh issue list --repo "$REPO" --label human-oversight --state open --limit 50 \
+        --json number,title,labels,createdAt \
+        --jq '.[] | select(.labels | all(.name != "has-pr")) | "#\(.number) \(.title) (\(.createdAt[:16]))"'
+
+    echo ""
     echo "=== Unclaimed work items ==="
     _unclaimed_issues | jq -r '.[] | "#\(.number) \(.title) (\(.createdAt[:16]))"'
 

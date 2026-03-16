@@ -11,6 +11,22 @@ items as GitHub issues, then exit. You do NOT execute any code changes.
 4. Read the project's roadmap document to understand current phase
 5. Record quality metrics as described in the project's CLAUDE.md
 
+## Step 1b: Check for human oversight directives
+
+Before creating any new work, check for open `human-oversight` issues:
+```
+gh issue list --label human-oversight --state open --json number,title,labels \
+    --jq '.[] | select(.labels | all(.name != "has-pr")) | "#\(.number) \(.title)"'
+```
+
+These are direct instructions from the project owner. Treat them as highest priority:
+- **Do not create issues that overlap with or supersede a `human-oversight` issue**
+- **Do not close `human-oversight` issues** — only the owner closes them
+- **Do not add `replan` to `human-oversight` issues** — they stay open until done
+- If a `human-oversight` issue is already claimed, continue to Step 2 (workers are on it)
+- If unclaimed, prioritise creating any supporting infrastructure issues first, then exit
+  — the next worker will claim the directive itself
+
 ## Step 2: Understand existing plans
 
 Read the **full body** of every open `agent-plan` issue:
