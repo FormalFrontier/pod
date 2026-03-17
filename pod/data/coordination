@@ -109,14 +109,23 @@ _ensure_labels
 
 # Helper: get unclaimed issues as JSON array
 # Optional arg: extra label to filter by (e.g. "feature", "review")
+# Always includes human-oversight issues (even without agent-plan) when no extra label is given.
 _unclaimed_issues() {
     local extra_label="${1:-}"
-    local -a label_args=("--label" "agent-plan")
-    [[ -n "$extra_label" ]] && label_args+=("--label" "$extra_label")
-    gh issue list --repo "$REPO" "${label_args[@]}" --state open --limit 50 \
-        --json number,title,labels,createdAt \
-        --jq '[.[] | select(.labels | all(.name != "claimed") and all(.name != "blocked") and all(.name != "has-pr") and all(.name != "replan"))] |
-              sort_by(.createdAt)'
+    local filter='[.[] | select(.labels | all(.name != "claimed") and all(.name != "blocked") and all(.name != "has-pr") and all(.name != "replan"))] | sort_by(.createdAt)'
+    if [[ -n "$extra_label" ]]; then
+        gh issue list --repo "$REPO" --label agent-plan --label "$extra_label" --state open --limit 50 \
+            --json number,title,labels,createdAt \
+            --jq "$filter"
+    else
+        # Merge agent-plan issues with human-oversight issues, deduplicate by number
+        {
+            gh issue list --repo "$REPO" --label agent-plan --state open --limit 50 \
+                --json number,title,labels,createdAt
+            gh issue list --repo "$REPO" --label human-oversight --state open --limit 50 \
+                --json number,title,labels,createdAt
+        } | jq -s "add | unique_by(.number) | $filter"
+    fi
 }
 
 # --- orient ---
