@@ -122,6 +122,19 @@ For each issue, write the plan body to `plans/<UUID-prefix>-N.md`, then post:
 coordination plan --label <feature|review|summarize|meditate> "title" < plans/<UUID-prefix>-N.md
 ```
 
+**If you created zero new issues** but open issues still exist (claimed,
+unclaimed, blocked, or with open PRs), signal that the planning queue is
+saturated and the project is winding down:
+
+```
+coordination nothing-to-plan
+```
+
+This decrements `min_queue` by 1 (so planning is re-triggered less eagerly)
+and decrements the target agent count by 1 (graceful pool wind-down). Use
+this when all remaining work is already in-flight or blocked, and you simply
+have nothing new to add right now.
+
 **If you created zero new issues** and all of the following are true, signal
 that control should return to the human:
 - No unclaimed issues in the queue

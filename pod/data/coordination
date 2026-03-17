@@ -22,6 +22,7 @@
 #   coordination human-oversight              — planner signals no work remains; TUI sets target=0 and finishes agents
 #   coordination check-human-oversight        — check if return-to-human signal is set on sentinel (exits 0 if set)
 #   coordination clear-human-oversight        — remove return-to-human signal (e.g. to resume work after completion)
+#   coordination nothing-to-plan              — planner signals queue saturated; decrements min_queue and target by 1
 
 set -euo pipefail
 
@@ -773,6 +774,43 @@ cmd_clear_human_oversight() {
     echo "Human-oversight signal cleared (label removed from sentinel issue #$PLANNER_LOCK_ISSUE)"
 }
 
+# --- nothing-to-plan ---
+# Called by the planner when it has reviewed the queue and cannot find any new
+# work to create, but open issues still exist (so the project is NOT done yet).
+# Decrements min_queue by 1 (less aggressive re-triggering of planning) and
+# decrements the target agent count by 1 (graceful pool wind-down).
+# Both values are stored in .pod/ files read by the pod TUI / dispatch loop.
+cmd_nothing_to_plan() {
+    # Locate the main repo root (works from both the main repo and any worktree).
+    local main_root
+    main_root="$(cd "$(git rev-parse --git-common-dir)/.." && pwd -P)"
+    local pod_dir="$main_root/.pod"
+
+    if [[ ! -d "$pod_dir" ]]; then
+        echo "error: .pod/ not found at $pod_dir (not in a pod-managed repo?)" >&2
+        return 1
+    fi
+
+    # Increment the cumulative min_queue decrement counter.
+    local decrement_file="$pod_dir/min-queue-decrement"
+    local current_decrement
+    current_decrement="$(cat "$decrement_file" 2>/dev/null || echo 0)"
+    local new_decrement=$(( current_decrement + 1 ))
+    printf '%d' "$new_decrement" > "$decrement_file"
+
+    # Decrement the target agent count (if the target file exists).
+    local target_file="$pod_dir/target"
+    if [[ -f "$target_file" ]]; then
+        local current_target
+        current_target="$(cat "$target_file" 2>/dev/null || echo 1)"
+        local new_target=$(( current_target > 0 ? current_target - 1 : 0 ))
+        printf '%d' "$new_target" > "$target_file"
+        echo "nothing-to-plan: min_queue decrement=$new_decrement, target=$new_target"
+    else
+        echo "nothing-to-plan: min_queue decrement=$new_decrement (no target file)"
+    fi
+}
+
 # --- dispatch ---
 case "${1:-}" in
     orient)          cmd_orient ;;
@@ -794,6 +832,7 @@ case "${1:-}" in
     human-oversight)        cmd_human_oversight ;;
     check-human-oversight)  cmd_check_human_oversight ;;
     clear-human-oversight)  cmd_clear_human_oversight ;;
+    nothing-to-plan)        cmd_nothing_to_plan ;;
     *)               die "unknown command: ${1:-}
-Usage: coordination {orient|plan [--label L]|create-pr|claim-fix|close-pr|list-unclaimed [--label L]|queue-depth [L]|claim|skip|add-dep|check-blocked|release-stale-claims|lock-planner|unlock-planner|lock-status|force-unlock-planner|human-oversight|check-human-oversight|clear-human-oversight}" ;;
+Usage: coordination {orient|plan [--label L]|create-pr|claim-fix|close-pr|list-unclaimed [--label L]|queue-depth [L]|claim|skip|add-dep|check-blocked|release-stale-claims|lock-planner|unlock-planner|lock-status|force-unlock-planner|human-oversight|check-human-oversight|clear-human-oversight|nothing-to-plan}" ;;
 esac

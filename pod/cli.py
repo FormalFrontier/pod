@@ -79,6 +79,7 @@ LOG_PATH = POD_DIR / "pod.log"
 CLAIM_HISTORY_PATH = POD_DIR / "claim-history.json"
 ISOLATED_CONFIG_DIR = POD_DIR / "claude-config"
 TARGET_FILE = POD_DIR / "target"  # Target agent count (int, one per line)
+MIN_QUEUE_DECREMENT_FILE = POD_DIR / "min-queue-decrement"  # Cumulative nothing-to-plan decrements
 
 # ---------------------------------------------------------------------------
 # Default configuration (written on first run)
@@ -400,6 +401,18 @@ def read_target() -> int | None:
 def write_target(n: int):
     """Write target agent count to .pod/target."""
     TARGET_FILE.write_text(str(max(0, n)))
+
+
+def read_min_queue_decrement() -> int:
+    """Read cumulative min_queue decrement from .pod/min-queue-decrement.
+
+    Incremented by `coordination nothing-to-plan` each time a planner finds
+    the queue saturated but work is still in progress.
+    """
+    try:
+        return int(MIN_QUEUE_DECREMENT_FILE.read_text().strip())
+    except (OSError, ValueError):
+        return 0
 
 
 # ---------------------------------------------------------------------------
@@ -908,7 +921,8 @@ def dispatch_queue_balance(config: dict, queue_depth: int,
                            worker_types: dict,
                            state: AgentState | None = None) -> str | None:
     """Low queue → locked types (queue-filling), high queue → unlocked types (queue-draining)."""
-    min_queue = cfg_get(config, "dispatch", "min_queue", default=3)
+    config_min_queue = cfg_get(config, "dispatch", "min_queue", default=3)
+    min_queue = max(0, config_min_queue - read_min_queue_decrement())
 
     # Separate types into queue-filling (have locks) and queue-draining (no locks)
     filling = {k: v for k, v in worker_types.items() if v.get("lock")}
