@@ -670,28 +670,33 @@ class GHItem:
 
 
 def fetch_issues_and_prs() -> list[GHItem]:
-    """Fetch issues (agent-plan label, all states) and recent PRs from GitHub."""
+    """Fetch issues (agent-plan or human-oversight label, all states) and recent PRs from GitHub."""
     items: list[GHItem] = []
+    seen_open: set[int] = set()
     cwd = str(PROJECT_DIR)
 
     issue_json = "--json=number,title,labels,state,createdAt,updatedAt,closedAt"
     # All open issues (there should never be thousands of open ones)
-    try:
-        r = subprocess.run(
-            ["gh", "issue", "list", "--label", "agent-plan", "--state", "open",
-             "--limit", "500", issue_json],
-            capture_output=True, text=True, timeout=30, cwd=cwd,
-        )
-        if r.returncode == 0:
-            for iss in json.loads(r.stdout):
-                labels = [l["name"] for l in iss.get("labels", [])]
-                ts = iss.get("updatedAt") or iss.get("createdAt", "")
-                items.append(GHItem(
-                    kind="issue", number=iss["number"], title=iss["title"],
-                    labels=labels, ci_status="", state="open", timestamp=ts,
-                ))
-    except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError):
-        pass
+    for label in ("agent-plan", "human-oversight"):
+        try:
+            r = subprocess.run(
+                ["gh", "issue", "list", "--label", label, "--state", "open",
+                 "--limit", "500", issue_json],
+                capture_output=True, text=True, timeout=30, cwd=cwd,
+            )
+            if r.returncode == 0:
+                for iss in json.loads(r.stdout):
+                    if iss["number"] in seen_open:
+                        continue
+                    seen_open.add(iss["number"])
+                    labels = [l["name"] for l in iss.get("labels", [])]
+                    ts = iss.get("updatedAt") or iss.get("createdAt", "")
+                    items.append(GHItem(
+                        kind="issue", number=iss["number"], title=iss["title"],
+                        labels=labels, ci_status="", state="open", timestamp=ts,
+                    ))
+        except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError):
+            pass
     # Recent closed issues (just enough for context; display logic drops these first anyway)
     try:
         r = subprocess.run(
