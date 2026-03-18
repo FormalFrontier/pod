@@ -26,10 +26,36 @@
 
 set -euo pipefail
 
-REPO="$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null)" \
-    || { echo "error: cannot detect GitHub repo (is gh authenticated?)" >&2; exit 1; }
+# Cache REPO and BASE_BRANCH in /tmp to avoid 2 GraphQL calls per invocation.
+# Keyed by the git toplevel directory so multiple repos don't collide.
+# Uses atomic writes (mktemp+mv) and validates cached values look sane.
+_git_toplevel="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+_cache_key="$(echo "$_git_toplevel" | tr '/' '-')"
+_repo_cache="/tmp/pod-repo-cache${_cache_key}"
+_base_branch_cache="/tmp/pod-base-branch-cache${_cache_key}"
+
+_cached_repo=""
+_cached_base=""
+if [[ -f "$_repo_cache" && -f "$_base_branch_cache" ]]; then
+    _cached_repo="$(cat "$_repo_cache" 2>/dev/null)"
+    _cached_base="$(cat "$_base_branch_cache" 2>/dev/null)"
+fi
+
+# Validate: REPO must look like "owner/name", BASE_BRANCH must be non-empty
+if [[ "$_cached_repo" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ && -n "$_cached_base" ]]; then
+    REPO="$_cached_repo"
+    BASE_BRANCH="$_cached_base"
+else
+    REPO="$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null)" \
+        || { echo "error: cannot detect GitHub repo (is gh authenticated?)" >&2; exit 1; }
+    BASE_BRANCH="$(gh repo view --json defaultBranchRef -q .defaultBranchRef.name 2>/dev/null || echo master)"
+    # Atomic writes: write to temp file then rename
+    _tmp="$(mktemp /tmp/pod-cache.XXXXXX)"
+    echo "$REPO" > "$_tmp" && mv -f "$_tmp" "$_repo_cache"
+    _tmp="$(mktemp /tmp/pod-cache.XXXXXX)"
+    echo "$BASE_BRANCH" > "$_tmp" && mv -f "$_tmp" "$_base_branch_cache"
+fi
 REPO_SLUG="${REPO//\//-}"  # e.g. "owner-repo"
-BASE_BRANCH="$(gh repo view --json defaultBranchRef -q .defaultBranchRef.name 2>/dev/null || echo master)"
 SESSION_ID="${POD_SESSION_ID:-unknown}"
 BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo detached)"
 PLANNER_LOCK_TTL=1200   # lock expires after 20 minutes (seconds)

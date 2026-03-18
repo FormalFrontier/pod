@@ -644,12 +644,25 @@ def _clear_gh_cache():
                 pass
 
 
+_queue_depth_cache: tuple[float, int] = (0.0, 0)  # (timestamp, depth)
+_QUEUE_DEPTH_TTL = 30  # seconds — avoid redundant calls within same dispatch cycle
+
+
 def get_queue_depth(config: dict) -> int:
-    """Get number of unclaimed issues."""
+    """Get number of unclaimed issues (cached for 30s to reduce API calls)."""
+    global _queue_depth_cache
+    now = time.time()
+    if now - _queue_depth_cache[0] < _QUEUE_DEPTH_TTL:
+        return _queue_depth_cache[1]
     try:
         r = coordination(config, "queue-depth")
-        return int(r.stdout.strip())
+        depth = int(r.stdout.strip())
+        _queue_depth_cache = (now, depth)
+        return depth
     except (ValueError, subprocess.TimeoutExpired):
+        # On failure, return last known good value (don't cache failure as 0)
+        if _queue_depth_cache[0] > 0:
+            return _queue_depth_cache[1]
         return 0
 
 
@@ -1061,8 +1074,15 @@ def dispatch(config: dict, state: AgentState | None = None) -> str | None:
 # Dead claim recovery
 # ---------------------------------------------------------------------------
 
+_cached_base_branch: str = ""
+_cached_repo_name: str = ""
+
+
 def _get_base_branch() -> str:
-    """Auto-detect the default branch (e.g. 'main' or 'master')."""
+    """Auto-detect the default branch (e.g. 'main' or 'master'). Cached after first call."""
+    global _cached_base_branch
+    if _cached_base_branch:
+        return _cached_base_branch
     try:
         r = subprocess.run(
             ["gh", "repo", "view", "--json", "defaultBranchRef", "-q",
@@ -1070,21 +1090,26 @@ def _get_base_branch() -> str:
             capture_output=True, text=True, timeout=15, cwd=str(PROJECT_DIR),
         )
         if r.returncode == 0 and r.stdout.strip():
-            return r.stdout.strip()
+            _cached_base_branch = r.stdout.strip()
+            return _cached_base_branch
     except Exception:
         pass
     return "master"
 
 
 def _get_repo() -> str:
-    """Auto-detect GitHub repo (owner/name) from the current git remote."""
+    """Auto-detect GitHub repo (owner/name) from the current git remote. Cached after first call."""
+    global _cached_repo_name
+    if _cached_repo_name:
+        return _cached_repo_name
     try:
         r = subprocess.run(
             ["gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"],
             capture_output=True, text=True, timeout=15, cwd=str(PROJECT_DIR),
         )
         if r.returncode == 0 and r.stdout.strip():
-            return r.stdout.strip()
+            _cached_repo_name = r.stdout.strip()
+            return _cached_repo_name
     except Exception:
         pass
     # Fallback: parse git remote
@@ -1546,6 +1571,9 @@ def agent_process_main(config: dict, agent_id: str | None = None,
     log(f"Agent {short_id} started (PID {os.getpid()})")
 
     iteration = 0
+    consecutive_wait = 0  # Consecutive dispatch-returned-None iterations (for backoff)
+    last_housekeeping = 0.0  # Wall-clock time of last housekeeping run
+    HOUSEKEEPING_INTERVAL = 600  # seconds between housekeeping runs (check-blocked, dead claims)
     while not state.finishing:
         iteration += 1
         state.loop_iteration = iteration
@@ -1571,8 +1599,10 @@ def agent_process_main(config: dict, agent_id: str | None = None,
         if state.finishing:
             break
 
-        # --- Housekeeping (every 5th iteration to conserve GH API calls) ---
-        if iteration % 5 == 1:
+        # --- Housekeeping (time-based, every 10 minutes to conserve GH API calls) ---
+        now_hk = time.time()
+        if now_hk - last_housekeeping > HOUSEKEEPING_INTERVAL:
+            last_housekeeping = now_hk
             try:
                 coordination(config, "check-blocked")
             except Exception:
@@ -1602,6 +1632,7 @@ def agent_process_main(config: dict, agent_id: str | None = None,
             if chosen_type is None:
                 state.status = "waiting_dispatch"
                 state.write()
+                consecutive_wait += 1
                 # If GH rate limit is exhausted, sleep until reset instead
                 # of burning more calls every 60s
                 rl_wait = _gh_rate_limit_wait()
@@ -1611,10 +1642,13 @@ def agent_process_main(config: dict, agent_id: str | None = None,
                     time.sleep(wait)
                     _clear_gh_cache()
                 else:
-                    log(f"Agent {short_id}: dispatch returned None (waiting)")
-                    time.sleep(quota_retry)
+                    # Linear backoff: 60s, 120s, 180s, ..., capped at 300s
+                    wait = min(quota_retry * consecutive_wait, 300)
+                    log(f"Agent {short_id}: dispatch returned None (waiting {wait}s, attempt {consecutive_wait})")
+                    time.sleep(wait)
                 continue
 
+            consecutive_wait = 0  # Reset backoff on successful dispatch
             wt_config = worker_types.get(chosen_type, {})
             prompt = wt_config.get("prompt", f"/{chosen_type}")
             lock_name = wt_config.get("lock", "")
@@ -1905,7 +1939,8 @@ def _tui_main(stdscr, config: dict):
     _acted_on_return_to_human = cached_return_to_human
     if cached_return_to_human:
         write_target(0)
-    CACHE_SECS = 30  # Refresh interval for GitHub API data
+    CACHE_SECS = 60           # Refresh interval for primary GitHub API data (queue, items)
+    CACHE_SECS_SLOW = 120     # Refresh interval for less-critical data (blocked deps, lock, oversight)
 
     # Background fetch infrastructure: all GH/coordination calls run in daemon
     # threads so the TUI never blocks on network I/O.
@@ -1991,7 +2026,7 @@ def _tui_main(stdscr, config: dict):
         if now - items_fetch_time > CACHE_SECS:
             _bg_fetch("items", fetch_issues_and_prs)
             items_fetch_time = now
-        if now - blocked_deps_fetch_time > CACHE_SECS:
+        if now - blocked_deps_fetch_time > CACHE_SECS_SLOW:
             _bg_fetch("blocked_deps", fetch_blocked_deps)
             blocked_deps_fetch_time = now
         # Human-oversight signal: planner labels sentinel issue when no work remains.
@@ -1999,7 +2034,7 @@ def _tui_main(stdscr, config: dict):
             _bg_fetch("return_to_human", get_return_to_human, config)
             return_to_human_fetch_time = now
         # Lock status: check agent state first (cheap), fall back to background API
-        if now - lock_fetch_time > CACHE_SECS:
+        if now - lock_fetch_time > CACHE_SECS_SLOW:
             lock_fetch_time = now
             agent_holds_lock = any(a.lock_held for a in agents
                                   if a.status not in ("stopped", "dead"))
