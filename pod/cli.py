@@ -876,7 +876,7 @@ def _tool_detail(name: str, inp: dict, state: AgentState) -> str:
         m = re.search(r"(?:^|&&\s*|;\s*)(?:\./)?coordination\s+claim\s+(\d+)", cmd)
         if m:
             state.claimed_issue = int(m.group(1))
-        m = re.search(r"(?:^|&&\s*|;\s*)(?:\./)?coordination\s+create-pr\s+(\d+)", cmd)
+        m = re.search(r"(?:^|&&\s*|;\s*)(?:\./)?coordination\s+create-pr\s+(?:--\S+\s+)*(\d+)", cmd)
         if m:
             state.pr_number = int(m.group(1))
         if desc and cmd:
@@ -1671,7 +1671,9 @@ def _sigterm_handler(signum, frame):
                 clear_claim(state.claimed_issue)
                 log(f"Unclaimed issue #{state.claimed_issue}")
             except Exception:
-                pass
+                # Don't clear_claim — leave in history so housekeeping
+                # can retry the GitHub label removal later.
+                log(f"Failed to skip #{state.claimed_issue} on kill, keeping in history")
 
         # Release lock if held
         if state.lock_held:
@@ -1934,6 +1936,7 @@ def agent_process_main(config: dict, agent_id: str | None = None,
         #     cycle from any agent sees that UUID as dead and forks a new agent,
         #     causing unbounded agent proliferation.
         if state.claimed_issue > 0 and state.pr_number == 0:
+            skip_ok = False
             try:
                 coordination(
                     config, "skip", str(state.claimed_issue),
@@ -1941,10 +1944,16 @@ def agent_process_main(config: dict, agent_id: str | None = None,
                     env_extra={"POD_SESSION_ID": state.uuid},
                     cwd=wt_dir,
                 )
+                skip_ok = True
             except Exception:
-                pass
-            clear_claim(state.claimed_issue)
-            log(f"Agent {short_id}: cleared claim on #{state.claimed_issue} (session ended without PR)")
+                log(f"Agent {short_id}: coordination skip #{state.claimed_issue} failed")
+            if skip_ok:
+                clear_claim(state.claimed_issue)
+                log(f"Agent {short_id}: cleared claim on #{state.claimed_issue} (session ended without PR)")
+            else:
+                # Leave in claim-history so check_dead_claimed_issues or
+                # reconcile_untracked_github_claims can clean it up later.
+                log(f"Agent {short_id}: keeping claim #{state.claimed_issue} in history (skip failed, will retry via housekeeping)")
 
         # --- Circuit breaker: sessions that exit too quickly are broken ---
         if elapsed < 15 and state.tokens_in == 0 and state.tokens_out == 0:
