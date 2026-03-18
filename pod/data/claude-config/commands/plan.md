@@ -93,11 +93,23 @@ blocked issues, create unblocked work before adding new dependencies.
 
 **Work type diversity**: Keep the open queue mixed.
 
-**Handling `replan` issues**: Check for issues with the `replan` label. For each:
+## Step 2b: Triage `replan` issues (do this before creating new work)
+
+Fetch the list:
+```
+gh issue list --label replan --state open --json number,title,body \
+    --jq '.[] | "### #\(.number) \(.title)\n\(.body)\n"'
+```
+
+Process the **oldest 3** (FIFO order) before creating any new issues.
+For each, exactly one of:
 - **Work already done** (a subsequent PR merged it): close with a note
-- **Plan stale**: create corrected issue, close original linking forward
-- **Partial progress**: create issue for remaining deliverables
-- **Still valid**: remove the `replan` label to re-open for workers
+- **Plan stale / approach changed**: create a corrected replacement issue, close original linking forward
+- **Partial progress**: create issue for remaining deliverables, close original linking forward
+- **Still valid, body still accurate**: remove the `replan` label (`gh issue edit N --remove-label replan`) to re-open for workers
+- **Still valid, body stale**: update the issue body with current state, then remove the `replan` label
+
+**Never delegate replan triage to a worker** — that is the planner's job.
 
 Each issue body MUST be **self-contained** — a worker will use it without reading
 progress history. Include:
