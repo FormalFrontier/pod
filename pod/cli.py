@@ -1338,7 +1338,7 @@ def reconcile_untracked_github_claims():
         try:
             r = subprocess.run(
                 ["gh", "api", f"repos/{repo}/issues/{issue_num}/comments",
-                 "--jq", '[.[] | select(.body | startswith("Claimed by session"))] | last | {body, createdAt}'],
+                 "--jq", '[.[] | select(.body | startswith("Claimed by session"))] | last | {body, created_at}'],
                 capture_output=True, text=True, timeout=30, cwd=cwd,
             )
             if r.returncode != 0:
@@ -1350,7 +1350,7 @@ def reconcile_untracked_github_claims():
             continue
 
         comment_body = comment_data.get("body", "")
-        comment_time = comment_data.get("createdAt", "")
+        comment_time = comment_data.get("created_at", "")
 
         # Parse: "Claimed by session `UUID` on branch `agent/SHORT_ID`"
         m = _re.search(r'Claimed by session `([^`]+)` on branch `agent/([^`]+)`', comment_body)
@@ -1399,6 +1399,12 @@ def reconcile_untracked_github_claims():
         if not m2 or m2.group(1) != owner_uuid:
             continue  # Owner changed since our first read — someone reclaimed it
 
+        # Re-check liveness — agent state may have changed during API calls
+        fresh_agents = read_all_agents()
+        fresh_live = {a.uuid for a in fresh_agents if a.status not in ("dead", "stopped")}
+        if owner_uuid in fresh_live:
+            continue  # Owner came back to life (e.g. resumed session)
+
         # Release the stale claim
         try:
             r3 = subprocess.run(
@@ -1414,16 +1420,20 @@ def reconcile_untracked_github_claims():
                 ["gh", "issue", "comment", str(issue_num), "--repo", repo, "--body", msg],
                 capture_output=True, timeout=30, cwd=cwd,
             )
-            # Record in history so we don't re-process this issue
+            # Record in history so we don't re-process this issue.
+            # Only write if no one reclaimed it in the meantime.
             with _claim_history_filelock():
                 h = load_claim_history()
-                h[str(issue_num)] = {
-                    "session_uuid": owner_uuid,
-                    "short_id": short_id,
-                    "restart_count": 0,
-                    "released": True,
-                }
-                _save_claim_history(h)
+                key = str(issue_num)
+                existing = h.get(key, {})
+                if not existing or existing.get("session_uuid") == owner_uuid:
+                    h[key] = {
+                        "session_uuid": owner_uuid,
+                        "short_id": short_id,
+                        "restart_count": 0,
+                        "released": True,
+                    }
+                    _save_claim_history(h)
             released_count += 1
             log(f"Reconcile: released stale claim #{issue_num} (owner {owner_uuid[:8]}, age {age_str})")
         except (subprocess.TimeoutExpired, OSError):
