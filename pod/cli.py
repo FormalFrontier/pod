@@ -1168,7 +1168,7 @@ def sync_claims_from_github():
     try:
         r = subprocess.run(
             ["gh", "issue", "list", "--label", "agent-plan", "--label", "claimed",
-             "--state", "open", "--limit", "20", "--json", "number"],
+             "--state", "open", "--limit", "100", "--json", "number"],
             capture_output=True, text=True, timeout=30, cwd=cwd,
         )
         if r.returncode != 0:
@@ -1302,6 +1302,170 @@ def check_dead_claimed_issues(config: dict):
                         "restart_count": restart_count,
                     }
             _save_claim_history(history)
+
+
+def reconcile_untracked_github_claims():
+    """Periodic safety net: find GitHub issues with 'claimed' label that are
+    not tracked in local claim-history.json, and either backfill them (if the
+    owning session is still alive) or release them (if dead and past the grace
+    period).
+
+    This covers the gap where a claim was recorded on GitHub (label + comment)
+    but never made it into claim-history.json — e.g. because the JSONL monitor
+    missed the `coordination claim` command, or the agent died before
+    record_claim() fired.
+
+    Fail-closed: any GitHub API error skips that issue rather than releasing it.
+    """
+    import re as _re
+
+    repo = _get_repo()
+    cwd = str(PROJECT_DIR)
+    grace_seconds = 600  # 10 minutes — don't release very fresh claims
+
+    # 1. Query GitHub for all currently-claimed issues
+    try:
+        r = subprocess.run(
+            ["gh", "issue", "list", "--label", "agent-plan", "--label", "claimed",
+             "--state", "open", "--limit", "100", "--json", "number"],
+            capture_output=True, text=True, timeout=30, cwd=cwd,
+        )
+        if r.returncode != 0:
+            return
+        github_claimed = {iss["number"] for iss in json.loads(r.stdout)}
+    except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError):
+        return
+
+    if not github_claimed:
+        return
+
+    # 2. Which of these are already tracked locally?
+    # Exclude released entries — those represent old dead claims that were
+    # already handled. If the same issue is now claimed again on GitHub,
+    # it's a new claim that needs reconciliation (record_claim skips
+    # re-adding released entries, so the new claim is effectively untracked).
+    history = load_claim_history()
+    tracked = {int(k) for k in history if not history[k].get("released")}
+    untracked = github_claimed - tracked
+    if not untracked:
+        return
+
+    # 3. Get live agent UUIDs for backfill check
+    agents = read_all_agents()
+    live_uuids = {a.uuid for a in agents if a.status not in ("dead", "stopped")}
+
+    now_epoch = time.time()
+    released_count = 0
+    backfilled_count = 0
+
+    for issue_num in sorted(untracked):
+        # Fetch the latest "Claimed by session" comment for this issue
+        try:
+            r = subprocess.run(
+                ["gh", "api", f"repos/{repo}/issues/{issue_num}/comments",
+                 "--jq", '[.[] | select(.body | startswith("Claimed by session"))] | last | {body, created_at}'],
+                capture_output=True, text=True, timeout=30, cwd=cwd,
+            )
+            if r.returncode != 0:
+                continue
+            comment_data = json.loads(r.stdout.strip()) if r.stdout.strip() else None
+            if not comment_data:
+                continue
+        except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError):
+            continue
+
+        comment_body = comment_data.get("body", "")
+        comment_time = comment_data.get("created_at", "")
+
+        # Parse: "Claimed by session `UUID` on branch `agent/SHORT_ID`"
+        m = _re.search(r'Claimed by session `([^`]+)` on branch `agent/([^`]+)`', comment_body)
+        if not m:
+            continue
+        owner_uuid, short_id = m.group(1), m.group(2)
+
+        # If the owning session is still alive, backfill into claim history
+        if owner_uuid in live_uuids:
+            with _claim_history_filelock():
+                h = load_claim_history()
+                key = str(issue_num)
+                if key not in h:
+                    h[key] = {"session_uuid": owner_uuid, "short_id": short_id, "restart_count": 0}
+                    _save_claim_history(h)
+                    backfilled_count += 1
+                    log(f"Reconcile: backfilled claim #{issue_num} → session {owner_uuid[:8]}")
+            continue
+
+        # Owner is dead — check grace period using claim comment timestamp
+        try:
+            from datetime import datetime, timezone
+            claim_dt = datetime.fromisoformat(comment_time.replace("Z", "+00:00"))
+            claim_epoch = claim_dt.timestamp()
+        except (ValueError, TypeError):
+            continue  # Can't parse timestamp, skip
+
+        age = now_epoch - claim_epoch
+        if age < grace_seconds:
+            continue  # Too fresh, might be a just-claimed issue
+
+        # Re-fetch latest claim owner before releasing (compare-and-swap)
+        try:
+            r2 = subprocess.run(
+                ["gh", "api", f"repos/{repo}/issues/{issue_num}/comments",
+                 "--jq", '[.[] | select(.body | startswith("Claimed by session"))] | last | .body'],
+                capture_output=True, text=True, timeout=30, cwd=cwd,
+            )
+            if r2.returncode != 0:
+                continue
+            latest_body = r2.stdout.strip().strip('"')
+        except (subprocess.TimeoutExpired, OSError):
+            continue
+
+        m2 = _re.search(r'Claimed by session `([^`]+)`', latest_body)
+        if not m2 or m2.group(1) != owner_uuid:
+            continue  # Owner changed since our first read — someone reclaimed it
+
+        # Re-check liveness — agent state may have changed during API calls
+        fresh_agents = read_all_agents()
+        fresh_live = {a.uuid for a in fresh_agents if a.status not in ("dead", "stopped")}
+        if owner_uuid in fresh_live:
+            continue  # Owner came back to life (e.g. resumed session)
+
+        # Release the stale claim
+        try:
+            r3 = subprocess.run(
+                ["gh", "issue", "edit", str(issue_num), "--repo", repo, "--remove-label", "claimed"],
+                capture_output=True, timeout=30, cwd=cwd,
+            )
+            if r3.returncode != 0:
+                continue
+            age_str = f"{int(age // 3600)}h{int((age % 3600) // 60)}m"
+            msg = (f"Stale claim released by reconciler — session `{owner_uuid}` "
+                   f"is no longer running (claimed {age_str} ago). Available for reclaim.")
+            subprocess.run(
+                ["gh", "issue", "comment", str(issue_num), "--repo", repo, "--body", msg],
+                capture_output=True, timeout=30, cwd=cwd,
+            )
+            # Record in history so we don't re-process this issue.
+            # Only write if no one reclaimed it in the meantime.
+            with _claim_history_filelock():
+                h = load_claim_history()
+                key = str(issue_num)
+                existing = h.get(key, {})
+                if not existing or existing.get("session_uuid") == owner_uuid:
+                    h[key] = {
+                        "session_uuid": owner_uuid,
+                        "short_id": short_id,
+                        "restart_count": 0,
+                        "released": True,
+                    }
+                    _save_claim_history(h)
+            released_count += 1
+            log(f"Reconcile: released stale claim #{issue_num} (owner {owner_uuid[:8]}, age {age_str})")
+        except (subprocess.TimeoutExpired, OSError):
+            continue
+
+    if released_count or backfilled_count:
+        log(f"Reconcile: {backfilled_count} backfilled, {released_count} released")
 
 
 # ---------------------------------------------------------------------------
@@ -1609,6 +1773,10 @@ def agent_process_main(config: dict, agent_id: str | None = None,
                 pass
             try:
                 check_dead_claimed_issues(config)
+            except Exception:
+                pass
+            try:
+                reconcile_untracked_github_claims()
             except Exception:
                 pass
 
