@@ -1572,6 +1572,54 @@ def cleanup_worktree(wt_dir: str, branch: str):
     )
 
 
+def _log_credential_state(session_uuid: str, claude_config_dir: Path | None = None):
+    """Log which credential sources are available at agent launch time.
+
+    Records the account label and token prefix from both the credentials.json
+    file and the macOS keychain, so we can diagnose account-swap issues.
+    """
+    import json as _json
+
+    parts = [f"session={session_uuid[:8]}"]
+
+    # Check credentials.json (or symlink target)
+    if claude_config_dir is not None:
+        creds_path = claude_config_dir / ".credentials.json"
+    else:
+        creds_path = Path.home() / ".claude" / ".credentials.json"
+    try:
+        with open(creds_path) as f:
+            creds = _json.load(f)
+        label = creds.get("accountLabel", "?")
+        token = creds.get("claudeAiOauth", {}).get("accessToken", "")
+        symlink_target = ""
+        if creds_path.is_symlink():
+            symlink_target = f" -> {os.readlink(creds_path)}"
+        parts.append(f"file=[{label}] token={token[:20]}...{symlink_target}")
+    except Exception as e:
+        parts.append(f"file=error({e})")
+
+    # Check macOS keychain
+    try:
+        import subprocess as _sp
+        r = _sp.run(
+            ["security", "find-generic-password",
+             "-s", "Claude Code-credentials", "-a", os.getenv("USER", "kim"), "-w"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            kc = _json.loads(r.stdout.strip())
+            kc_label = kc.get("accountLabel", "?")
+            kc_token = kc.get("claudeAiOauth", {}).get("accessToken", "")
+            parts.append(f"keychain=[{kc_label}] token={kc_token[:20]}...")
+        else:
+            parts.append("keychain=empty")
+    except Exception as e:
+        parts.append(f"keychain=error({e})")
+
+    log(f"Credential state at launch: {' | '.join(parts)}")
+
+
 def launch_claude(config: dict, session_uuid: str, prompt: str,
                    wt_dir: str,
                    claude_config_dir: Path | None = None) -> subprocess.Popen:
@@ -1603,6 +1651,9 @@ def launch_claude(config: dict, session_uuid: str, prompt: str,
     env["PATH"] = str(_data_dir()) + os.pathsep + env.get("PATH", "")
     if claude_config_dir is not None:
         env["CLAUDE_CONFIG_DIR"] = str(claude_config_dir)
+
+    # Log credential state at launch for debugging account-swap issues
+    _log_credential_state(session_uuid, claude_config_dir)
 
     stdout_fd = os.open(str(stdout_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
     proc = subprocess.Popen(
