@@ -387,20 +387,24 @@ def _save_claim_history(history: dict):
 def record_claim(issue: int, session_uuid: str, short_id: str):
     """Record that our session claimed this issue. Preserves restart_count.
 
-    Skips entries that were already released (max restarts reached) to avoid
-    a feedback loop where a resumed session re-adds a released claim with
-    restart_count=0, triggering infinite restart spawning.
+    If a *different* session re-claims an issue that was previously released,
+    the new claim overwrites the old released entry (with restart_count=0).
+    If the *same* session tries to re-add its own released claim, we skip
+    to avoid a feedback loop where a resumed session triggers infinite
+    restart spawning.
     """
     with _claim_history_filelock():
         history = load_claim_history()
         key = str(issue)
         existing = history.get(key, {})
         if existing.get("released"):
-            return  # Don't re-add a released claim
+            if existing.get("session_uuid") == session_uuid:
+                return  # Don't re-add our own released claim (prevents restart loops)
+            # Different session re-claimed this issue — allow tracking the new claim
         history[key] = {
             "session_uuid": session_uuid,
             "short_id": short_id,
-            "restart_count": existing.get("restart_count", 0),
+            "restart_count": existing.get("restart_count", 0) if not existing.get("released") else 0,
         }
         _save_claim_history(history)
 
@@ -1499,7 +1503,7 @@ def reconcile_untracked_github_claims():
             with _claim_history_filelock():
                 h = load_claim_history()
                 key = str(issue_num)
-                if key not in h:
+                if key not in h or h[key].get("released"):
                     h[key] = {"session_uuid": owner_uuid, "short_id": short_id, "restart_count": 0}
                     _save_claim_history(h)
                     backfilled_count += 1
@@ -1541,8 +1545,17 @@ def reconcile_untracked_github_claims():
         if owner_uuid in fresh_live:
             continue  # Owner came back to life (e.g. resumed session)
 
-        # Release the stale claim
+        # Release the stale claim — first verify the label is still present
+        # (prevents N parallel reconcilers from all posting release comments)
         try:
+            r_label_check = subprocess.run(
+                ["gh", "issue", "view", str(issue_num), "--repo", repo,
+                 "--json", "labels", "--jq", '[.labels[].name] | any(. == "claimed")'],
+                capture_output=True, text=True, timeout=30, cwd=cwd,
+            )
+            if r_label_check.returncode != 0 or r_label_check.stdout.strip() != "true":
+                continue  # Label already removed by another reconciler
+
             r3 = subprocess.run(
                 ["gh", "issue", "edit", str(issue_num), "--repo", repo, "--remove-label", "claimed"],
                 capture_output=True, timeout=30, cwd=cwd,
