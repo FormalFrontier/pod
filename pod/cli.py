@@ -1586,11 +1586,15 @@ def reconcile_untracked_github_claims():
         if not m2 or m2.group(1) != owner_uuid:
             continue  # Owner changed since our first read — someone reclaimed it
 
-        # Re-check liveness — agent state may have changed during API calls
+        # Re-check liveness — agent state may have changed during API calls.
+        # Check if ANY live agent has this issue claimed (not just the owner
+        # from the GitHub comment — another agent may have picked it up).
         fresh_agents = read_all_agents()
-        fresh_live = {a.uuid for a in fresh_agents if a.status not in ("dead", "stopped")}
+        fresh_live = {a.uuid for a in fresh_agents if a.status not in ("dead", "stopped", "killed")}
         if owner_uuid in fresh_live:
             continue  # Owner came back to life (e.g. resumed session)
+        if any(a.claimed_issue == issue_num and a.uuid in fresh_live for a in fresh_agents):
+            continue  # Another live agent has this issue — don't release
 
         # Release the stale claim — first verify the label is still present
         # (prevents N parallel reconcilers from all posting release comments)
