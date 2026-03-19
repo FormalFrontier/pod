@@ -127,6 +127,28 @@ PR is low quality or not worth salvaging:
 coordination close-pr <pr-number> "reason: <why not worth fixing>"
 ```
 
+## Step 4b: Assess Scope
+
+After orienting but **before writing code**, check whether the task fits
+in a single session. Warning signs it doesn't:
+
+- Target file is 500+ lines and you need to understand most of it
+- The work naturally splits into independent sub-lemmas or sub-tasks
+- Difficulty feels higher than the issue says
+
+**If so, decompose immediately** — don't attempt the whole thing first.
+
+```bash
+# Create sub-issues, then skip the parent
+echo "body..." | coordination plan --label feature "Sub-task 1: ..."
+echo "body..." | coordination plan --label feature "Sub-task 2: ..."
+coordination add-dep <sub2> <sub1>   # if ordering matters
+coordination skip <parent> "Decomposed into #X, #Y — too large for single session"
+```
+
+Then claim one of the sub-issues and work on that instead.
+A good decomposition is more valuable than a failed heroic attempt.
+
 ## Step 5: Execute
 
 After each coherent chunk of changes:
@@ -146,7 +168,7 @@ Pushed-but-not-PR'd work is effectively lost — nobody will find it.
 
 **Failure handling:**
 - Build fails on pre-existing issue → log and work around
-- Stuck after 3 fundamentally different attempts → document and move on
+- Stuck after 3 fundamentally different attempts → decompose into sub-issues (Step 4b)
 - 3 consecutive iterations with no commits → end session, document blockers
   (does not apply to review or self-improvement sessions)
 - If `/second-opinion` or `/reflect` is unavailable, skip and note in progress entry
