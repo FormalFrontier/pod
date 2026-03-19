@@ -173,13 +173,15 @@ def _claude_sync_check():
         return
 
     stored: dict[str, str] = {}
+    parse_ok = False
     if checksums_file.exists():
         try:
             stored = json.loads(checksums_file.read_text())
+            parse_ok = True
         except Exception:
             stored = {}
 
-    first_run = not checksums_file.exists()
+    first_run = not checksums_file.exists() or not parse_ok
     updated: list[str] = []
     custom: list[str] = []
     conflicts: list[str] = []
@@ -3075,7 +3077,7 @@ def _populate_claude_config():
     src = _data_dir() / "claude-config"
     dst = ISOLATED_CONFIG_DIR
     dst.mkdir(parents=True, exist_ok=True)
-    EXCLUDE = {"commands", "skills"}
+    EXCLUDE = {"commands", "skills", "CLAUDE.md"}
     for item in src.iterdir():
         if item.name in EXCLUDE:
             continue
@@ -3161,9 +3163,21 @@ def cmd_init(args):
     pod_dir.mkdir(parents=True, exist_ok=True)
     (pod_dir / "agents").mkdir(exist_ok=True)
 
-    # .gitignore
+    # .gitignore for .pod/
     gitignore = pod_dir / ".gitignore"
     gitignore.write_text("agents/\npod.log\nclaim-history.*\nclaude-config/\n")
+
+    # Ensure .claude/.pod-checksums is gitignored in the project root
+    proj_gitignore = git_root / ".gitignore"
+    checksums_pattern = ".claude/.pod-checksums"
+    if proj_gitignore.exists():
+        existing = proj_gitignore.read_text()
+        if checksums_pattern not in existing:
+            proj_gitignore.write_text(existing.rstrip("\n") + f"\n{checksums_pattern}\n")
+            print(f"  added {checksums_pattern} to .gitignore")
+    else:
+        proj_gitignore.write_text(f"{checksums_pattern}\n")
+        print(f"  created .gitignore with {checksums_pattern}")
 
     # config.toml
     if not config_path.exists() or getattr(args, "force", False):
