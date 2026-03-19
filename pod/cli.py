@@ -1325,7 +1325,7 @@ def sync_claims_from_github():
                 r = subprocess.run(
                     ["gh", "issue", "view", str(issue_num), "--repo", repo,
                      "--json", "comments",
-                     "--jq", '[.comments[] | select(.body | startswith("Claimed by session")) | .body] | last'],
+                     "--jq", '[.comments[] | select(.body | startswith("Claimed by session"))] | sort_by(.createdAt) | last | .body'],
                     capture_output=True, text=True, timeout=60, cwd=cwd,
                 )
                 if r.returncode != 0:
@@ -1476,11 +1476,14 @@ def reconcile_untracked_github_claims():
     # 2. Which of these are already tracked locally?
     history = load_claim_history()
     tracked = set()
-    released_sessions: dict[int, str] = {}  # issue_num → released session UUID
+    # Map issue → timestamp of the claim comment we already released.
+    # If the latest claim comment on GitHub has a newer timestamp, it's
+    # a different claim and we must not skip it.
+    released_at: dict[int, str] = {}  # issue_num → released claim_comment_time
     for k, v in history.items():
         issue = int(k)
         if v.get("released"):
-            released_sessions[issue] = v.get("session_uuid", "")
+            released_at[issue] = v.get("released_comment_time", "")
         else:
             tracked.add(issue)
     untracked = github_claimed - tracked
@@ -1501,7 +1504,7 @@ def reconcile_untracked_github_claims():
             r = subprocess.run(
                 ["gh", "issue", "view", str(issue_num), "--repo", repo,
                  "--json", "comments",
-                 "--jq", '[.comments[] | select(.body | startswith("Claimed by session"))] | last | {body, created_at: .createdAt}'],
+                 "--jq", '[.comments[] | select(.body | startswith("Claimed by session"))] | sort_by(.createdAt) | last | {body, created_at: .createdAt}'],
                 capture_output=True, text=True, timeout=60, cwd=cwd,
             )
             if r.returncode != 0:
@@ -1521,10 +1524,11 @@ def reconcile_untracked_github_claims():
             continue
         owner_uuid, short_id = m.group(1), m.group(2)
 
-        # Skip if we already released this exact session's claim on this issue.
-        # The issue may have been re-claimed by someone else (whose claim comment
-        # is not the latest because of ordering), so don't stomp on it.
-        if released_sessions.get(issue_num) == owner_uuid:
+        # Skip if the latest claim comment is the same one we already released.
+        # Compare by timestamp: if a newer claim comment exists, it's a new
+        # claim (possibly by the same UUID via resume) and must not be skipped.
+        prev_released_time = released_at.get(issue_num, "")
+        if prev_released_time and comment_time and comment_time <= prev_released_time:
             continue
 
         # If the owning session is still alive, backfill into claim history
@@ -1556,7 +1560,7 @@ def reconcile_untracked_github_claims():
             r2 = subprocess.run(
                 ["gh", "issue", "view", str(issue_num), "--repo", repo,
                  "--json", "comments",
-                 "--jq", '[.comments[] | select(.body | startswith("Claimed by session"))] | last | .body'],
+                 "--jq", '[.comments[] | select(.body | startswith("Claimed by session"))] | sort_by(.createdAt) | last | .body'],
                 capture_output=True, text=True, timeout=60, cwd=cwd,
             )
             if r2.returncode != 0:
@@ -1599,20 +1603,20 @@ def reconcile_untracked_github_claims():
                 ["gh", "issue", "comment", str(issue_num), "--repo", repo, "--body", msg],
                 capture_output=True, timeout=30, cwd=cwd,
             )
-            # Record in history so we don't re-process this issue.
-            # Only write if no one reclaimed it in the meantime.
+            # Record in history so we don't re-process this exact claim.
+            # Store the comment timestamp so we can distinguish this release
+            # from a future re-claim (even by the same UUID via resume).
             with _claim_history_filelock():
                 h = load_claim_history()
                 key = str(issue_num)
-                existing = h.get(key, {})
-                if not existing or existing.get("session_uuid") == owner_uuid:
-                    h[key] = {
-                        "session_uuid": owner_uuid,
-                        "short_id": short_id,
-                        "restart_count": 0,
-                        "released": True,
-                    }
-                    _save_claim_history(h)
+                h[key] = {
+                    "session_uuid": owner_uuid,
+                    "short_id": short_id,
+                    "restart_count": 0,
+                    "released": True,
+                    "released_comment_time": comment_time,
+                }
+                _save_claim_history(h)
             released_count += 1
             log(f"Reconcile: released stale claim #{issue_num} (owner {owner_uuid[:8]}, age {age_str})")
         except (subprocess.TimeoutExpired, OSError):
