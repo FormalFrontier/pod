@@ -26,6 +26,7 @@ import curses
 import dataclasses
 import datetime
 import fcntl
+import hashlib
 import json
 import os
 import random
@@ -140,12 +141,120 @@ copy_build_cache = true
 """
 
 
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _claude_sync_check():
+    """Compare pod template commands/skills with the project .claude/ and report/update.
+
+    Uses .claude/.pod-checksums to track what pod last installed, enabling
+    three-way detection:
+      - pod updated, project unchanged  → auto-overwrite
+      - project customised, pod unchanged → print note (user customisation)
+      - both changed independently       → warn, don't overwrite
+      - no checksums file yet            → bootstrap: record current hashes,
+                                           warn on any differences
+    """
+    data_config = _data_dir() / "claude-config"
+    proj_claude = PROJECT_DIR / ".claude"
+    checksums_file = proj_claude / ".pod-checksums"
+
+    # Collect all template files under commands/ and skills/
+    template_files: list[Path] = []
+    for subdir in ("commands", "skills"):
+        src = data_config / subdir
+        if src.is_dir():
+            for f in src.rglob("*"):
+                if f.is_file():
+                    template_files.append(f.relative_to(data_config))
+
+    if not template_files:
+        return
+
+    stored: dict[str, str] = {}
+    if checksums_file.exists():
+        try:
+            stored = json.loads(checksums_file.read_text())
+        except Exception:
+            stored = {}
+
+    first_run = not checksums_file.exists()
+    updated: list[str] = []
+    custom: list[str] = []
+    conflicts: list[str] = []
+
+    for rel in template_files:
+        key = str(rel)
+        pkg_file = data_config / rel
+        proj_file = proj_claude / rel
+
+        pkg_hash = _sha256(pkg_file)
+        proj_hash = _sha256(proj_file) if proj_file.exists() else None
+        inst_hash = stored.get(key)
+
+        if pkg_hash == proj_hash:
+            continue  # identical, nothing to do
+
+        if first_run or inst_hash is None:
+            # No tracking history yet — can't distinguish customisation from old version
+            if proj_file.exists():
+                conflicts.append(key)  # report as unknown difference
+            else:
+                updated.append(key)    # new file in template, install it
+        elif proj_hash == inst_hash:
+            # Project unchanged since install, template has been updated
+            updated.append(key)
+        elif pkg_hash == inst_hash:
+            # Template unchanged, project has been customised
+            custom.append(key)
+        else:
+            # Both changed independently
+            conflicts.append(key)
+
+    # Apply auto-updates
+    for key in updated:
+        src = data_config / key
+        dst = proj_claude / key
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(str(src), str(dst))
+
+    # Write checksums: record the pod-template hash for every file we installed or
+    # that is already in sync.  Do NOT record first-run conflicts — leave their
+    # inst_hash absent so they continue to be reported as unknown on future runs.
+    skip_keys = set(conflicts) if first_run else set()
+    new_checksums = dict(stored)
+    for rel in template_files:
+        key = str(rel)
+        if key in skip_keys:
+            continue
+        pkg_file = data_config / rel
+        # After any copy the project file matches the template; record pkg hash
+        # so future runs can distinguish "user edited" from "pod updated".
+        new_checksums[key] = _sha256(pkg_file)
+    checksums_file.write_text(json.dumps(new_checksums, sort_keys=True, indent=2) + "\n")
+
+    if updated:
+        print(f"pod: updated {len(updated)} file(s) from new pod version: "
+              f"{', '.join(updated)}")
+    if custom:
+        print(f"pod: {len(custom)} project-customised file(s) differ from pod template: "
+              f"{', '.join(custom)}")
+    if conflicts and not first_run:
+        print(f"pod: WARNING: {len(conflicts)} file(s) modified in both pod template and "
+              f"project .claude/ — not auto-updating: {', '.join(conflicts)}")
+    elif conflicts and first_run:
+        print(f"pod: {len(conflicts)} file(s) differ from pod template "
+              f"(origin unknown, tracking from now): {', '.join(conflicts)}")
+
+
 def ensure_config() -> dict:
     """Load config, requiring pod init to have been run."""
     if not CONFIG_PATH.exists():
         print(f"No .pod/config.toml found. Run 'pod init' first.", file=sys.stderr)
         sys.exit(1)
     AGENTS_DIR.mkdir(parents=True, exist_ok=True)
+    _claude_sync_check()
     with open(CONFIG_PATH, "rb") as f:
         return tomllib.load(f)
 
@@ -2957,12 +3066,26 @@ def cmd_config(config: dict, args):
 
 
 def _populate_claude_config():
-    """Copy bundled claude-config/ into .pod/claude-config/."""
+    """Copy bundled claude-config/ into .pod/claude-config/.
+
+    Only copies credentials/settings files — commands/ and skills/ are
+    installed directly into each worktree's .claude/ by install_agent_config,
+    not into the isolated config dir.
+    """
     src = _data_dir() / "claude-config"
     dst = ISOLATED_CONFIG_DIR
-    if dst.exists():
-        shutil.rmtree(dst)
-    shutil.copytree(str(src), str(dst))
+    dst.mkdir(parents=True, exist_ok=True)
+    EXCLUDE = {"commands", "skills"}
+    for item in src.iterdir():
+        if item.name in EXCLUDE:
+            continue
+        d = dst / item.name
+        if item.is_dir():
+            if d.exists():
+                shutil.rmtree(d)
+            shutil.copytree(str(item), str(d))
+        else:
+            shutil.copy2(str(item), str(d))
 
 
 REQUIRED_LABELS = {
