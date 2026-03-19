@@ -709,8 +709,14 @@ def coordination(config: dict, *args, env_extra: dict | None = None,
     # Pass protected-files list so coordination can enforce it.
     pf = cfg_get(config, "project", "protected_files", default=["PLAN.md"])
     if isinstance(pf, list):
-        pf = ":".join(pf)
-    env["POD_PROTECTED_FILES"] = pf
+        pf = list(pf)
+    else:
+        pf = pf.split(":")
+    # Auto-protect files installed by pod
+    for rel in _pod_installed_files():
+        if rel not in pf:
+            pf.append(rel)
+    env["POD_PROTECTED_FILES"] = ":".join(pf)
     if env_extra:
         env.update(env_extra)
     return subprocess.run(
@@ -1649,6 +1655,24 @@ def setup_worktree(config: dict, short_id: str) -> tuple[str, str]:
         )
 
     return str(wt_dir), branch
+
+
+def _pod_installed_files() -> list[str]:
+    """Return list of .claude/ relative paths that pod delivers.
+
+    Scans the bundled claude-config for commands and skills files.
+    These are automatically added to the protected-files list so agents
+    cannot modify pod-delivered files in PRs (but can create new ones).
+    """
+    data_config = _data_dir() / "claude-config"
+    result: list[str] = []
+    for subdir in ("commands", "skills"):
+        src = data_config / subdir
+        if src.is_dir():
+            for item in src.rglob("*"):
+                if item.is_file():
+                    result.append(f".claude/{subdir}/{item.relative_to(src)}")
+    return result
 
 
 def install_agent_config(wt_dir: str):
@@ -3248,8 +3272,13 @@ def cmd_coordination(args):
             config = tomllib.load(f)
         pf = cfg_get(config, "project", "protected_files", default=["PLAN.md"])
         if isinstance(pf, list):
-            pf = ":".join(pf)
-        env["POD_PROTECTED_FILES"] = pf
+            pf = list(pf)
+        else:
+            pf = pf.split(":")
+        for rel in _pod_installed_files():
+            if rel not in pf:
+                pf.append(rel)
+        env["POD_PROTECTED_FILES"] = ":".join(pf)
     result = subprocess.run(
         [script] + args.coordination_args,
         cwd=str(PROJECT_DIR), env=env,

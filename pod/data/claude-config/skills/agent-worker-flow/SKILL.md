@@ -135,14 +135,14 @@ After each coherent chunk of changes:
 
 Each commit must compile. One logical change per commit.
 
-**Commit early and push often.** Sessions can terminate at any time;
-unpushed work is lost.
+**Commit early, create PRs early.** Sessions can terminate at any time.
+Pushed-but-not-PR'd work is effectively lost — nobody will find it.
 
-- Commit after every compiling milestone (definition added, test passing,
-  sorry removed). Don't wait for the full feature.
-- `git push -u origin <branch>` after every 2-3 commits.
+- Commit after every compiling milestone. Don't wait for the full feature.
 - WIP commits are fine: `feat: WIP prove helper_lemma (2/4 sorries remain)`
 - If 20+ minutes have passed without a commit, stop and commit now.
+- Use `coordination create-pr N --partial` as soon as you have useful
+  progress, even if incomplete. This saves the work as a visible PR.
 
 **Failure handling:**
 - Build fails on pre-existing issue → log and work around
