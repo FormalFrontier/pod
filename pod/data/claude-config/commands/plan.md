@@ -27,7 +27,61 @@ These are direct instructions from the project owner. Treat them as highest prio
 - If unclaimed, prioritise creating any supporting infrastructure issues first, then exit
   — the next worker will claim the directive itself
 
-## Step 2: Understand existing plans
+## Step 2: Merge ready PRs
+
+Before anything else, merge all open PRs that are mergeable with passing CI:
+```bash
+gh pr list --state open \
+  --json number,mergeable,statusCheckRollup \
+  --jq '.[] | select(
+    .mergeable == "MERGEABLE" and
+    (.statusCheckRollup | length > 0) and
+    (.statusCheckRollup | all(.conclusion != "FAILURE" and .conclusion != "CANCELLED"))
+  ) | .number' \
+| xargs -I{} gh pr merge {} --squash --delete-branch
+```
+
+Never skip this step. Downstream agents are blocked on `main` until merged PRs land.
+
+## Step 3: Triage `replan` issues (before creating new work)
+
+Fetch the list:
+```
+gh issue list --label replan --state open --json number,title,body \
+    --jq '.[] | "### #\(.number) \(.title)\n\(.body)\n"'
+```
+
+Process **all** replan issues before creating any new issues.
+For each, exactly one of:
+- **Work already done** (a subsequent PR merged it): close with a note
+- **Plan stale / approach changed**: create a corrected replacement issue, close original linking forward
+- **Partial progress**: create issue for remaining deliverables, close original linking forward
+- **Still valid, body still accurate**: remove the `replan` label (`gh issue edit N --remove-label replan`) to re-open for workers
+- **Still valid, body stale**: update the issue body with current state, then remove the `replan` label
+
+**Never delegate replan triage to a worker** — that is the planner's job.
+
+## Step 4: Create fix issues for broken PRs
+
+Check for PRs with merge conflicts or failing CI:
+```bash
+gh pr list --state open --json number,title,mergeable,statusCheckRollup \
+  --jq '.[] | select(
+    .mergeable == "CONFLICTING" or
+    (.statusCheckRollup | any(.conclusion == "FAILURE"))
+  ) | "#\(.number) \(.title) \(if .mergeable == "CONFLICTING" then "[CONFLICTS]" else "[CI FAILED]" end)"'
+```
+
+For each broken PR, check if a fix issue already exists:
+```bash
+gh issue list --label agent-plan --state open --json number,title \
+  --jq '.[].title' | grep -i "PR #N"
+```
+
+If no fix issue exists, **create one immediately** using `coordination plan`.
+These fix issues take priority over all new feature work.
+
+## Step 5: Understand existing plans
 
 Read the **full body** of every open `agent-plan` issue:
 ```
@@ -38,140 +92,49 @@ gh issue list --label agent-plan --state open --limit 20 \
 Understand what's already planned at the **deliverable level**, not just the title.
 Your work item MUST NOT overlap with any existing issue's deliverables.
 
-## Step 3: Decide issue type and write the plan
+## Step 6: Write new issues
 
-The issue queue has four work types, each with its own label:
+Work types: **`feature`**, **`review`**, **`summarize`**, **`meditate`**.
+Target roughly 2:1 feature:review during implementation; 1:1 during cleanup.
 
-- **`feature`** — implementation work; claimed by `/feature` agents
-- **`review`** — review/quality; claimed by `/review` agents
-- **`summarize`** — progress analysis; claimed by `/summarize` agents
-- **`meditate`** — self-improvement; claimed by `/meditate` agents
+**Summarize trigger**: when 10+ PRs merged since last summarize issue closed.
+**Meditate trigger**: when 15+ PRs merged since last meditate issue closed.
 
-**Balance guidance**: target roughly 2:1 feature:review during active implementation
-phases; shift toward 1:1 during verification/cleanup phases. Check the open
-unclaimed queue composition — if dominated by one type, choose a different type.
+Each issue body MUST be **self-contained**:
+- **Current state**, **Deliverables**, **Context**, **Verification**
 
-Priority order for **feature** work:
-1. PRs needing attention (merge conflicts, failing CI)
-2. Next deliverable from the project's roadmap
+**Sizing**: max 3 deliverables, ~2 files, ~200 lines. Over 300 lines → split.
+When in doubt, split. Each issue must have a single logical concern.
 
-**Summarize trigger**: Create a summarize issue (if none is already open) when
-10+ PRs have merged since the last summarize issue closed, or PR titles suggest
-a milestone.
+**Queue health**: keep <3 unclaimed → create unblocked work.
+No transitive blocking. Keep work types mixed.
 
-**Meditate trigger**: Create a meditate issue (if none is already open) when
-15+ PRs have merged since the last meditate issue closed, or multiple progress
-entries mention the same kind of struggle.
-
-## Step 4: Write the plan
-
-Design work items, each scoped to complete well within a single context window.
-
-**Sizing rules:**
-- **Max 3 deliverables** per issue. If you have 4+, split into multiple issues.
-- **Typically 2 files modified** (excluding progress/plan files). 3-4 is
-  fine if tightly coupled. 5+ is almost certainly too big.
-- **~200 lines of new code** is the target. Over 300 is a yellow flag.
-  Over 500 means the issue should almost certainly have been split.
-
-**Estimation heuristic:** count the deliverables, multiply by the hardest
-one's estimated difficulty (1=mechanical, 2=moderate, 3=requires exploration).
-If the product exceeds 5, split the issue.
-
-**When in doubt, split.** Two small issues that finish cleanly are always
-better than one large issue that triggers compaction and produces sloppy
-partial work.
-
-**Atomicity rule**: each issue must have a single logical concern.
-Litmus test: "Could a worker skip deliverable X and still meaningfully complete
-the issue?" If yes, X belongs in a separate issue.
-
-**Queue health check**: If there are <3 unclaimed unblocked issues and ≥5
-blocked issues, create unblocked work before adding new dependencies.
-
-**No transitive blocking**: Never `depends-on` an issue that is itself `blocked`.
-
-**Work type diversity**: Keep the open queue mixed.
-
-## Step 2b: Triage `replan` issues (do this before creating new work)
-
-Fetch the list:
-```
-gh issue list --label replan --state open --json number,title,body \
-    --jq '.[] | "### #\(.number) \(.title)\n\(.body)\n"'
-```
-
-Process the **oldest 3** (FIFO order) before creating any new issues.
-For each, exactly one of:
-- **Work already done** (a subsequent PR merged it): close with a note
-- **Plan stale / approach changed**: create a corrected replacement issue, close original linking forward
-- **Partial progress**: create issue for remaining deliverables, close original linking forward
-- **Still valid, body still accurate**: remove the `replan` label (`gh issue edit N --remove-label replan`) to re-open for workers
-- **Still valid, body stale**: update the issue body with current state, then remove the `replan` label
-
-**Never delegate replan triage to a worker** — that is the planner's job.
-
-Each issue body MUST be **self-contained** — a worker will use it without reading
-progress history. Include:
-- **Current state**: phase, quality metrics, relevant recent changes
-- **Deliverables**: specific files to create/modify, what "done" looks like
-- **Context**: why this work matters, any dependencies or constraints
-- **Verification**: how the worker should verify success
-
-## Step 5: Atomicity and overlap check
-
-Re-read each issue's deliverables for atomicity.
-Re-fetch open issues to catch any created during your planning:
+After writing, re-fetch open issues to check for overlap:
 ```
 gh issue list --label agent-plan --state open --limit 20 \
     --json number,title --jq '.[].title'
 ```
 
-## Step 6: Post and exit
+## Step 7: Post and exit
 
 For each issue, write the plan body to `plans/<UUID-prefix>-N.md`, then post:
 ```
 coordination plan --label <feature|review|summarize|meditate> "title" < plans/<UUID-prefix>-N.md
 ```
 
-**If you created zero new issues** but open issues still exist (claimed,
-unclaimed, blocked, or with open PRs), signal that the planning queue is
-saturated and the project is winding down:
+**If you created zero new issues** but work is still in-flight (claimed issues,
+open PRs, blocked issues): `coordination nothing-to-plan` (decrements queue
+thresholds for graceful wind-down).
 
-```
-coordination nothing-to-plan
-```
-
-This decrements `min_queue` by 1 (so planning is re-triggered less eagerly)
-and decrements the target agent count by 1 (graceful pool wind-down). Use
-this when all remaining work is already in-flight or blocked, and you simply
-have nothing new to add right now.
-
-**If you created zero new issues** and all of the following are true, signal
-that control should return to the human:
-- No unclaimed issues in the queue
-- No claimed issues (no workers currently active)
-- No open PRs needing attention (failing CI, merge conflicts)
-
-```
-coordination human-oversight
-```
-
-Verify with:
+**If zero new issues AND nothing in-flight** (no unclaimed, no claimed, no
+broken PRs): `coordination human-oversight` (signals the pod TUI to stop
+spawning agents). Verify all three are zero first:
 ```bash
-# All three must show zero / empty
 coordination queue-depth
 gh issue list --label claimed --state open --json number --jq 'length'
 gh pr list --state open --json number,mergeable,statusCheckRollup \
   --jq '[.[] | select(.mergeable == "CONFLICTING" or (.statusCheckRollup | any(.conclusion == "FAILURE")))] | length'
 ```
-
-This adds the `return-to-human` label to the sentinel issue. The pod TUI
-detects it, sets the agent target to 0, and gracefully finishes all running
-agents. The human can clear this signal and resume via the `[r]` key in the
-TUI. Do this only when the project is genuinely complete or stalled with no
-actionable next steps — not simply because you happened not to create issues
-this pass.
 
 Then exit. Do NOT execute any code changes.
 
