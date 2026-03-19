@@ -409,17 +409,20 @@ def record_claim(issue: int, session_uuid: str, short_id: str):
         _save_claim_history(history)
 
 
-def clear_claim(issue: int):
-    """Mark issue as released in claim history (preserves tombstone so the
-    reconciler doesn't re-process a stale GitHub claim comment)."""
+def clear_claim(issue: int, session_uuid: str | None = None):
+    """Mark issue as released in claim history, but only if the entry belongs
+    to session_uuid (compare-and-swap).  If session_uuid is None, releases
+    unconditionally (legacy callers / PR-created path)."""
     with _claim_history_filelock():
         history = load_claim_history()
         key = str(issue)
         entry = history.get(key)
-        if entry:
-            entry["released"] = True
-            _save_claim_history(history)
-        # If no entry exists, nothing to do — don't create a synthetic one.
+        if not entry:
+            return
+        if session_uuid and entry.get("session_uuid") != session_uuid:
+            return  # Entry belongs to a different session — don't clobber
+        entry["released"] = True
+        _save_claim_history(history)
 
 
 # ---------------------------------------------------------------------------
@@ -1269,9 +1272,25 @@ def _get_repo() -> str:
 
 def _release_claim(issue_str: str, session_uuid: str, restart_count: int) -> bool:
     """Remove the 'claimed' label from an issue and leave an explanatory comment.
-    Returns True on success, False on failure (caller may revert history deletion)."""
+    Returns True on success, False on failure (caller may revert history deletion).
+    Includes a GitHub-side CAS: only releases if the latest claim comment still
+    belongs to session_uuid (prevents removing a fresh claim by a different agent)."""
+    import re as _re
     repo = _get_repo()
     try:
+        # GitHub-side CAS: verify latest claim comment is ours
+        r_cas = subprocess.run(
+            ["gh", "issue", "view", issue_str, "--repo", repo,
+             "--json", "comments",
+             "--jq", '[.comments[] | select(.body | startswith("Claimed by session"))] | sort_by(.createdAt) | last | .body'],
+            capture_output=True, text=True, timeout=60, cwd=str(PROJECT_DIR),
+        )
+        if r_cas.returncode == 0 and r_cas.stdout.strip():
+            m = _re.search(r'Claimed by session `([^`]+)`', r_cas.stdout.strip().strip('"'))
+            if m and m.group(1) != session_uuid:
+                log(f"Not releasing #{issue_str} — latest claim belongs to {m.group(1)[:8]}, not {session_uuid[:8]}")
+                return False
+
         r1 = subprocess.run(
             ["gh", "issue", "edit", issue_str, "--repo", repo, "--remove-label", "claimed"],
             capture_output=True, timeout=30, cwd=str(PROJECT_DIR),
@@ -1436,6 +1455,11 @@ def check_dead_claimed_issues(config: dict):
         other = live_claimed.get(issue_int)
         if other and other != session_uuid:
             log(f"Not releasing #{issue_str} — agent {other[:8]} still has it")
+            # Rebind history entry to the live owner so it stays tracked
+            # (the dead session's tombstone was already written above).
+            other_agent = next((a for a in fresh_agents if a.uuid == other), None)
+            if other_agent:
+                record_claim(issue_int, other_agent.uuid, other_agent.short_id)
             continue
         log(f"Max restarts reached for #{issue_str}, releasing claim")
         if not _release_claim(issue_str, session_uuid, restart_count):
@@ -1921,7 +1945,7 @@ def _sigterm_handler(signum, frame):
             )
             if other_live:
                 log(f"Agent {state.short_id}: not unclaiming #{state.claimed_issue} — another agent has it")
-                clear_claim(state.claimed_issue)
+                clear_claim(state.claimed_issue, session_uuid=state.uuid)
             else:
                 try:
                     coordination(
@@ -1929,7 +1953,7 @@ def _sigterm_handler(signum, frame):
                         f"Agent killed by operator (session {state.uuid})",
                         env_extra={"POD_SESSION_ID": state.uuid},
                     )
-                    clear_claim(state.claimed_issue)
+                    clear_claim(state.claimed_issue, session_uuid=state.uuid)
                     log(f"Unclaimed issue #{state.claimed_issue}")
                 except Exception:
                     # Don't clear_claim — leave in history so housekeeping
@@ -2172,7 +2196,7 @@ def agent_process_main(config: dict, agent_id: str | None = None,
                     record_claim(state.claimed_issue, state.uuid, state.short_id)
                     _last_tracked_issue = state.claimed_issue
             elif state.pr_number > 0 and state.claimed_issue > 0:
-                clear_claim(state.claimed_issue)
+                clear_claim(state.claimed_issue, session_uuid=state.uuid)
                 _last_tracked_issue = 0
             time.sleep(poll_interval)
 
@@ -2209,7 +2233,7 @@ def agent_process_main(config: dict, agent_id: str | None = None,
             except Exception:
                 log(f"Agent {short_id}: coordination skip #{state.claimed_issue} failed")
             if skip_ok:
-                clear_claim(state.claimed_issue)
+                clear_claim(state.claimed_issue, session_uuid=state.uuid)
                 log(f"Agent {short_id}: cleared claim on #{state.claimed_issue} (session ended without PR)")
             else:
                 # Leave in claim-history so check_dead_claimed_issues or
