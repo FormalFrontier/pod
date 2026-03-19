@@ -1305,9 +1305,10 @@ def sync_claims_from_github():
             # Fetch comments to find the most recent claim comment
             try:
                 r = subprocess.run(
-                    ["gh", "api", f"repos/{repo}/issues/{issue_num}/comments",
-                     "--jq", '[.[] | select(.body | startswith("Claimed by session")) | .body] | last'],
-                    capture_output=True, text=True, timeout=30, cwd=cwd,
+                    ["gh", "issue", "view", str(issue_num), "--repo", repo,
+                     "--json", "comments",
+                     "--jq", '[.comments[] | select(.body | startswith("Claimed by session")) | .body] | last'],
+                    capture_output=True, text=True, timeout=60, cwd=cwd,
                 )
                 if r.returncode != 0:
                     continue
@@ -1477,9 +1478,10 @@ def reconcile_untracked_github_claims():
         # Fetch the latest "Claimed by session" comment for this issue
         try:
             r = subprocess.run(
-                ["gh", "api", f"repos/{repo}/issues/{issue_num}/comments",
-                 "--jq", '[.[] | select(.body | startswith("Claimed by session"))] | last | {body, created_at}'],
-                capture_output=True, text=True, timeout=30, cwd=cwd,
+                ["gh", "issue", "view", str(issue_num), "--repo", repo,
+                 "--json", "comments",
+                 "--jq", '[.comments[] | select(.body | startswith("Claimed by session"))] | last | {body, created_at: .createdAt}'],
+                capture_output=True, text=True, timeout=60, cwd=cwd,
             )
             if r.returncode != 0:
                 continue
@@ -1525,9 +1527,10 @@ def reconcile_untracked_github_claims():
         # Re-fetch latest claim owner before releasing (compare-and-swap)
         try:
             r2 = subprocess.run(
-                ["gh", "api", f"repos/{repo}/issues/{issue_num}/comments",
-                 "--jq", '[.[] | select(.body | startswith("Claimed by session"))] | last | .body'],
-                capture_output=True, text=True, timeout=30, cwd=cwd,
+                ["gh", "issue", "view", str(issue_num), "--repo", repo,
+                 "--json", "comments",
+                 "--jq", '[.comments[] | select(.body | startswith("Claimed by session"))] | last | .body'],
+                capture_output=True, text=True, timeout=60, cwd=cwd,
             )
             if r2.returncode != 0:
                 continue
