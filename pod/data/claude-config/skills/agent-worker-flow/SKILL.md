@@ -135,25 +135,14 @@ After each coherent chunk of changes:
 
 Each commit must compile. One logical change per commit.
 
-**Commit early and push often.** Commit after every compiling milestone (a
-definition added, a test passing, a function implemented). Push after every
-2-3 commits. WIP commits are acceptable — losing work to a terminated session
-is far worse than an extra commit.
+**Commit early and push often.** Sessions can terminate at any time;
+unpushed work is lost.
 
-### Commit Checkpoint Protocol (MANDATORY)
-
-1. **Commit after every compiling milestone** — a helper lemma proved, a
-   definition added, a sorry removed, a proof framework scaffolded. Don't
-   wait for the full theorem.
-2. **Push after every 2-3 commits** — a local commit that isn't pushed is
-   lost if the session terminates. `git push -u origin <branch>` early.
-3. **WIP commits are acceptable** — `feat: WIP prove helper_lemma (2/4
-   sorries remain)` is infinitely better than losing the work entirely.
-4. **If you've been working for 20+ minutes without a commit**, stop and
-   commit what you have right now, even if incomplete.
-
-The cost of an extra WIP commit is near zero. The cost of a lost session
-is hours of wasted compute and a stale claim blocking the queue.
+- Commit after every compiling milestone (definition added, test passing,
+  sorry removed). Don't wait for the full feature.
+- `git push -u origin <branch>` after every 2-3 commits.
+- WIP commits are fine: `feat: WIP prove helper_lemma (2/4 sorries remain)`
+- If 20+ minutes have passed without a commit, stop and commit now.
 
 **Failure handling:**
 - Build fails on pre-existing issue → log and work around
