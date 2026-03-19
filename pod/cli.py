@@ -1417,8 +1417,21 @@ def check_dead_claimed_issues(config: dict):
         # agents to share one state file, making old processes invisible.
         spawn_agent(config, resume_uuid=session_uuid)
 
+    # Re-read live agents for the release check (state may have changed
+    # during restart spawning above).
+    fresh_agents = read_all_agents()
+    live_claimed: dict[int, str] = {}  # issue → uuid of live agent working on it
+    for a in fresh_agents:
+        if a.status not in ("dead", "stopped", "killed") and a.claimed_issue > 0:
+            live_claimed[a.claimed_issue] = a.uuid
+
     failed_releases: list[tuple[str, str, int]] = []
     for issue_str, session_uuid, restart_count in to_release:
+        issue_int = int(issue_str)
+        other = live_claimed.get(issue_int)
+        if other and other != session_uuid:
+            log(f"Not releasing #{issue_str} — agent {other[:8]} still has it")
+            continue
         log(f"Max restarts reached for #{issue_str}, releasing claim")
         if not _release_claim(issue_str, session_uuid, restart_count):
             failed_releases.append((issue_str, session_uuid, restart_count))
