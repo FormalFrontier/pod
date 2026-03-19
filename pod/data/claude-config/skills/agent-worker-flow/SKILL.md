@@ -85,7 +85,9 @@ If the queue is empty, write a brief progress note and exit.
 coordination claim <issue-number>
 ```
 
-If the claim fails (race detected), try the next issue. Read the full issue body:
+**You MUST check the output.** If it says `CLAIM FAILED`, you MUST NOT work
+on that issue — pick a different one. Only proceed if the output says
+`Claimed issue #N`. Read the full issue body:
 ```
 gh issue view <N> --json body --jq .body
 ```

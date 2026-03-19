@@ -961,7 +961,22 @@ def _parse_jsonl_line(line: bytes, state: AgentState):
     except json.JSONDecodeError:
         return
 
-    if d.get("type") != "assistant":
+    msg_type = d.get("type")
+
+    # Process tool results (type: "user") to detect successful claims
+    if msg_type == "user":
+        content = d.get("message", {}).get("content", [])
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    result_text = block.get("content", "")
+                    if isinstance(result_text, str):
+                        m = re.search(r"Claimed issue #(\d+)", result_text)
+                        if m:
+                            state.claimed_issue = int(m.group(1))
+        return
+
+    if msg_type != "assistant":
         return
 
     usage = d.get("message", {}).get("usage", {})
@@ -987,10 +1002,7 @@ def _tool_detail(name: str, inp: dict, state: AgentState) -> str:
     if name == "Bash":
         desc = inp.get("description", "")
         cmd = inp.get("command", "")
-        # Detect coordination claim/create-pr
-        m = re.search(r"(?:^|&&\s*|;\s*)(?:\./)?coordination\s+claim\s+(\d+)", cmd)
-        if m:
-            state.claimed_issue = int(m.group(1))
+        # Detect coordination create-pr (claim is detected from tool results instead)
         m = re.search(r"(?:^|&&\s*|;\s*)(?:\./)?coordination\s+create-pr\s+(?:--\S+\s+)*(\d+)", cmd)
         if m:
             state.pr_number = int(m.group(1))

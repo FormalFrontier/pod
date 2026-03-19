@@ -484,19 +484,19 @@ cmd_claim() {
     local labels
     labels="$(gh issue view "$issue_num" --repo "$REPO" --json labels --jq '[.labels[].name] | join(",")')"
     if echo "$labels" | grep -qw 'claimed'; then
-        echo "Issue #$issue_num is already claimed. Skipping."
+        echo "CLAIM FAILED: Issue #$issue_num is already claimed by another agent. You MUST NOT work on this issue. Pick a different issue immediately."
         return 1
     fi
     if echo "$labels" | grep -qw 'replan'; then
-        echo "Issue #$issue_num needs replan. Skipping."
+        echo "CLAIM FAILED: Issue #$issue_num needs replan. You MUST NOT work on this issue. Pick a different issue immediately."
         return 1
     fi
     if echo "$labels" | grep -qw 'blocked'; then
-        echo "Issue #$issue_num is blocked by dependencies. Skipping."
+        echo "CLAIM FAILED: Issue #$issue_num is blocked by dependencies. You MUST NOT work on this issue. Pick a different issue immediately."
         return 1
     fi
     if echo "$labels" | grep -qw 'has-pr'; then
-        echo "Issue #$issue_num already has an open PR. Skipping."
+        echo "CLAIM FAILED: Issue #$issue_num already has an open PR. You MUST NOT work on this issue. Pick a different issue immediately."
         return 1
     fi
 
@@ -526,7 +526,7 @@ cmd_claim() {
                    match("session `([^`]+)`") | .captures[0].string')"
 
         if [[ "$winner" != "$SESSION_ID" ]]; then
-            echo "Race detected on #$issue_num — session $winner won. Backing off."
+            echo "CLAIM FAILED: Race detected on #$issue_num — another agent won. You MUST NOT work on this issue. Pick a different issue immediately."
             # Do NOT remove the 'claimed' label — the winner needs it
             return 1
         fi
