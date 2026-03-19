@@ -410,11 +410,16 @@ def record_claim(issue: int, session_uuid: str, short_id: str):
 
 
 def clear_claim(issue: int):
-    """Remove issue from claim history (called when PR is created)."""
+    """Mark issue as released in claim history (preserves tombstone so the
+    reconciler doesn't re-process a stale GitHub claim comment)."""
     with _claim_history_filelock():
         history = load_claim_history()
-        history.pop(str(issue), None)
-        _save_claim_history(history)
+        key = str(issue)
+        entry = history.get(key)
+        if entry:
+            entry["released"] = True
+            _save_claim_history(history)
+        # If no entry exists, nothing to do — don't create a synthetic one.
 
 
 # ---------------------------------------------------------------------------
