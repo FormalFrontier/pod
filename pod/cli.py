@@ -1474,12 +1474,15 @@ def reconcile_untracked_github_claims():
         return
 
     # 2. Which of these are already tracked locally?
-    # Exclude released entries — those represent old dead claims that were
-    # already handled. If the same issue is now claimed again on GitHub,
-    # it's a new claim that needs reconciliation (record_claim skips
-    # re-adding released entries, so the new claim is effectively untracked).
     history = load_claim_history()
-    tracked = {int(k) for k in history if not history[k].get("released")}
+    tracked = set()
+    released_sessions: dict[int, str] = {}  # issue_num → released session UUID
+    for k, v in history.items():
+        issue = int(k)
+        if v.get("released"):
+            released_sessions[issue] = v.get("session_uuid", "")
+        else:
+            tracked.add(issue)
     untracked = github_claimed - tracked
     if not untracked:
         return
@@ -1517,6 +1520,12 @@ def reconcile_untracked_github_claims():
         if not m:
             continue
         owner_uuid, short_id = m.group(1), m.group(2)
+
+        # Skip if we already released this exact session's claim on this issue.
+        # The issue may have been re-claimed by someone else (whose claim comment
+        # is not the latest because of ordering), so don't stomp on it.
+        if released_sessions.get(issue_num) == owner_uuid:
+            continue
 
         # If the owning session is still alive, backfill into claim history
         if owner_uuid in live_uuids:
