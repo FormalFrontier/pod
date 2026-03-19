@@ -1874,20 +1874,32 @@ def _sigterm_handler(signum, frame):
                 pass
 
     if state and config:
-        # Unclaim issue if claimed and no PR yet
+        # Unclaim issue if claimed and no PR yet — but only if no other
+        # live agent is also working on this issue (prevents unclaiming
+        # when killing duplicate claimants).
         if state.claimed_issue > 0 and state.pr_number == 0:
-            try:
-                coordination(
-                    config, "skip", str(state.claimed_issue),
-                    f"Agent killed by operator (session {state.uuid})",
-                    env_extra={"POD_SESSION_ID": state.uuid},
-                )
+            other_live = any(
+                a.claimed_issue == state.claimed_issue
+                and a.uuid != state.uuid
+                and a.status not in ("dead", "stopped", "killed")
+                for a in read_all_agents()
+            )
+            if other_live:
+                log(f"Agent {state.short_id}: not unclaiming #{state.claimed_issue} — another agent has it")
                 clear_claim(state.claimed_issue)
-                log(f"Unclaimed issue #{state.claimed_issue}")
-            except Exception:
-                # Don't clear_claim — leave in history so housekeeping
-                # can retry the GitHub label removal later.
-                log(f"Failed to skip #{state.claimed_issue} on kill, keeping in history")
+            else:
+                try:
+                    coordination(
+                        config, "skip", str(state.claimed_issue),
+                        f"Agent killed by operator (session {state.uuid})",
+                        env_extra={"POD_SESSION_ID": state.uuid},
+                    )
+                    clear_claim(state.claimed_issue)
+                    log(f"Unclaimed issue #{state.claimed_issue}")
+                except Exception:
+                    # Don't clear_claim — leave in history so housekeeping
+                    # can retry the GitHub label removal later.
+                    log(f"Failed to skip #{state.claimed_issue} on kill, keeping in history")
 
         # Release lock if held
         if state.lock_held:
