@@ -140,6 +140,21 @@ definition added, a test passing, a function implemented). Push after every
 2-3 commits. WIP commits are acceptable — losing work to a terminated session
 is far worse than an extra commit.
 
+### Commit Checkpoint Protocol (MANDATORY)
+
+1. **Commit after every compiling milestone** — a helper lemma proved, a
+   definition added, a sorry removed, a proof framework scaffolded. Don't
+   wait for the full theorem.
+2. **Push after every 2-3 commits** — a local commit that isn't pushed is
+   lost if the session terminates. `git push -u origin <branch>` early.
+3. **WIP commits are acceptable** — `feat: WIP prove helper_lemma (2/4
+   sorries remain)` is infinitely better than losing the work entirely.
+4. **If you've been working for 20+ minutes without a commit**, stop and
+   commit what you have right now, even if incomplete.
+
+The cost of an extra WIP commit is near zero. The cost of a lost session
+is hours of wasted compute and a stale claim blocking the queue.
+
 **Failure handling:**
 - Build fails on pre-existing issue → log and work around
 - Stuck after 3 fundamentally different attempts → document and move on
