@@ -2126,8 +2126,16 @@ def agent_process_main(config: dict, agent_id: str | None = None,
         state.last_text = ""
         state.last_activity = 0.0
 
+        # Use session UUID prefix for worktree/branch to avoid branch reuse
+        # across sessions.  When the same agent process iterates, a persistent
+        # short_id would reuse the same branch name, hitting an existing remote
+        # PR from the *previous* issue.  A per-session prefix gives each
+        # session its own branch (agent/<session-prefix>), preventing the
+        # create-pr "PR already exists" shortcut from silently linking the
+        # wrong issue.
+        session_short = session_uuid[:8]
         try:
-            wt_dir, branch = setup_worktree(config, short_id)
+            wt_dir, branch = setup_worktree(config, session_short)
         except subprocess.CalledProcessError as e:
             log(f"Agent {short_id}: worktree setup failed: {e}")
             if lock_name:
