@@ -2511,7 +2511,7 @@ def _tui_main(stdscr, config: dict):
     if cached_return_to_human:
         write_target(0)
     CACHE_SECS = 60           # Refresh interval for primary GitHub API data (queue, items)
-    CACHE_SECS_SLOW = 120     # Refresh interval for less-critical data (blocked deps, lock, oversight)
+    CACHE_SECS_SLOW = 120     # Refresh interval for less-critical data (blocked deps, lock, return-to-human)
 
     # Background fetch infrastructure: all GH/coordination calls run in daemon
     # threads so the TUI never blocks on network I/O.
@@ -2600,7 +2600,7 @@ def _tui_main(stdscr, config: dict):
         if now - blocked_deps_fetch_time > CACHE_SECS_SLOW:
             _bg_fetch("blocked_deps", fetch_blocked_deps)
             blocked_deps_fetch_time = now
-        # Human-oversight signal: planner labels sentinel issue when no work remains.
+        # Return-to-human signal: planner labels sentinel issue when no work remains.
         if not _acted_on_return_to_human and now - return_to_human_fetch_time > CACHE_SECS:
             _bg_fetch("return_to_human", get_return_to_human, config)
             return_to_human_fetch_time = now
@@ -2888,7 +2888,7 @@ def _tui_main(stdscr, config: dict):
         if msg_active and msg_row < height:
             _addstr(stdscr, msg_row, 0, f" {message}"[:width], curses.A_BOLD)
 
-        # --- Human-oversight banner (persistent) ---
+        # --- Return-to-human banner (persistent) ---
         if cached_return_to_human:
             banner_row = msg_row + 1 if msg_active else msg_row
             if banner_row < height:
@@ -2957,7 +2957,7 @@ def _tui_main(stdscr, config: dict):
             auto_spawn_paused = False
             message = "Launched 1 agent"
             message_time = time.time()
-        elif ch == ord("f") or ch == ord("F"):
+        elif ch == ord("f"):
             if is_agent_selected and agents and 0 <= selected_idx < len(agents):
                 agent = agents[selected_idx]
                 if agent.pid > 0 and _pid_is_valid(agent.pid, agent.pid_start_time):
@@ -3042,7 +3042,7 @@ def _tui_main(stdscr, config: dict):
                     clear_return_to_human(config)
                     cached_return_to_human = False
                     _acted_on_return_to_human = False
-                    message = "Return-to-human signal cleared. Adjust target with [a]/[+] to resume."
+                    message = "Return-to-human signal cleared. Press [a] to add an agent."
                 except Exception as e:
                     message = f"Failed to clear signal: {e}"
                 message_time = time.time()
