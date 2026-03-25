@@ -6,12 +6,13 @@
 #
 # Usage:
 #   coordination orient                       — list open plans (claimed/unclaimed), PRs, issues needing attention
-#   coordination plan [--label L] "title"     — create GitHub issue with agent-plan label (body from stdin); optional extra label L (feature|review|summarize|meditate)
+#   coordination plan [--label L] [--critical-path] "title" — create GitHub issue with agent-plan label (body from stdin); optional extra label L (feature|review|summarize|meditate); --critical-path marks as pipeline bottleneck
 #   coordination create-pr N [--partial] ["title"] — push branch, create PR closing issue #N, enable auto-merge; rejects PRs touching protected files
 #   coordination claim-fix N                  — comment on failing PR #N claiming fix (30min cooldown)
 #   coordination close-pr N "reason"          — comment reason and close PR #N
 #   coordination list-unclaimed [--label L]   — list unclaimed agent-plan issues (FIFO order); optional label filter
 #   coordination queue-depth [L]              — count of unclaimed agent-plan issues; optional label filter
+#   coordination critical-path-depth          — count of unclaimed critical-path issues
 #   coordination claim N                      — claim an issue for this session (label + comment)
 #   coordination skip N "reason"              — mark a claimed issue as replan (stale/wrong assumptions)
 #   coordination add-dep N M                  — add depends-on: #M to issue #N's body; add blocked label if #M is open
@@ -121,7 +122,7 @@ _ensure_labels() {
     local existing
     existing="$(gh label list --repo "$REPO" --limit 100 --json name --jq '.[].name')"
     local label color
-    for pair in agent-plan:1D76DB claimed:FBCA04 blocked:B60205 has-pr:5319E7 replan:D93F0B coordination:0E8A16 human-oversight:CC317C return-to-human:E4A400; do
+    for pair in agent-plan:1D76DB claimed:FBCA04 blocked:B60205 has-pr:5319E7 replan:D93F0B coordination:0E8A16 human-oversight:CC317C return-to-human:E4A400 critical-path:FF6600; do
         label="${pair%%:*}"
         color="${pair##*:}"
         if ! echo "$existing" | grep -qx "$label"; then
@@ -207,13 +208,15 @@ cmd_orient() {
 # --- plan ---
 cmd_plan() {
     local extra_label=""
+    local critical_path=false
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --label) extra_label="${2:?--label requires a value}"; shift 2 ;;
+            --critical-path) critical_path=true; shift ;;
             *) break ;;
         esac
     done
-    local title="${1:?usage: coordination plan [--label L] \"title\"}"
+    local title="${1:?usage: coordination plan [--label L] [--critical-path] \"title\"}"
 
     # Fetch all open agent-plan issues with full bodies for overlap detection
     local existing_json
@@ -260,6 +263,7 @@ cmd_plan() {
     # Check for depends-on lines before creating the issue
     local create_labels="agent-plan"
     [[ -n "$extra_label" ]] && create_labels="$create_labels,$extra_label"
+    [[ "$critical_path" == true ]] && create_labels="$create_labels,critical-path"
     local deps
     deps="$(echo "$body" | grep -oE 'depends-on: #[0-9]+' | grep -oE '[0-9]+' || true)"
     if [[ -n "$deps" ]]; then
@@ -472,6 +476,23 @@ cmd_queue_depth() {
         esac
     done
     _unclaimed_issues "$extra_label" | jq 'length'
+}
+
+# --- critical-path-depth ---
+# Count unclaimed issues with the critical-path label (not blocked, not claimed, etc.)
+# Optional arg: extra label to filter by (e.g. "feature", "review")
+cmd_critical_path_depth() {
+    local extra_label="${1:-}"
+    local filter='[.[] | select(.labels | all(.name != "claimed") and all(.name != "blocked") and all(.name != "has-pr") and all(.name != "replan"))] | length'
+    if [[ -n "$extra_label" ]]; then
+        gh issue list --repo "$REPO" --label critical-path --label "$extra_label" --state open --limit 50 \
+            --json number,title,labels,createdAt \
+            --jq "$filter"
+    else
+        gh issue list --repo "$REPO" --label critical-path --state open --limit 50 \
+            --json number,title,labels,createdAt \
+            --jq "$filter"
+    fi
 }
 
 # --- claim ---
@@ -846,6 +867,7 @@ case "${1:-}" in
     close-pr)        shift; cmd_close_pr "$@" ;;
     list-unclaimed)  shift; cmd_list_unclaimed "$@" ;;
     queue-depth)     shift; cmd_queue_depth "$@" ;;
+    critical-path-depth)  shift; cmd_critical_path_depth "$@" ;;
     claim)           shift; cmd_claim "$@" ;;
     skip)            shift; cmd_skip "$@" ;;
     add-dep)                shift; cmd_add_dep "$@" ;;
@@ -860,5 +882,5 @@ case "${1:-}" in
     clear-human-oversight)  cmd_clear_human_oversight ;;
     nothing-to-plan)        cmd_nothing_to_plan ;;
     *)               die "unknown command: ${1:-}
-Usage: coordination {orient|plan [--label L]|create-pr|claim-fix|close-pr|list-unclaimed [--label L]|queue-depth [L]|claim|skip|add-dep|check-blocked|release-stale-claims|lock-planner|unlock-planner|lock-status|force-unlock-planner|human-oversight|check-human-oversight|clear-human-oversight|nothing-to-plan}" ;;
+Usage: coordination {orient|plan [--label L] [--critical-path]|create-pr|claim-fix|close-pr|list-unclaimed [--label L]|queue-depth [L]|critical-path-depth|claim|skip|add-dep|check-blocked|release-stale-claims|lock-planner|unlock-planner|lock-status|force-unlock-planner|human-oversight|check-human-oversight|clear-human-oversight|nothing-to-plan}" ;;
 esac

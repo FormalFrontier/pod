@@ -106,6 +106,27 @@ Each issue body MUST be **self-contained**:
 **Sizing**: max 3 deliverables, ~2 files, ~200 lines. Over 300 lines → split.
 When in doubt, split. Each issue must have a single logical concern.
 
+**Stage granularity**: If the project roadmap has "stages" or "phases", never put
+more than one stage in a single issue. Stages often contain work for many items
+(e.g., "transcribe all pages", "scaffold all formalizable items") that could be
+hundreds of sub-tasks for a large project. If you cannot yet determine the scope
+of a stage because it depends on earlier output (e.g., item discovery), create the
+issue for the whole stage but include a note in the body: **"This issue needs
+decomposition: once the prerequisite is complete, the claiming worker should
+`coordination skip N 'needs decomposition into per-item sub-issues'` so the
+planner can create properly-scoped sub-issues."** This keeps issue creation under
+planner locking and overlap protection. Never ask workers to create issues directly.
+
+**Critical-path issues**: When you create an issue that blocks all other planned
+work (e.g., the first issue in a sequential pipeline, or a bottleneck that many
+blocked issues depend on), use `--critical-path` when posting it:
+```
+coordination plan --label feature --critical-path "title" < plans/body.md
+```
+This tells the dispatcher to assign a worker immediately, bypassing the normal
+queue-size threshold. Use sparingly — only for genuine pipeline bottlenecks where
+no other useful work can proceed until this issue is done.
+
 **Queue health**: keep <3 unclaimed → create unblocked work.
 No transitive blocking. Keep work types mixed.
 

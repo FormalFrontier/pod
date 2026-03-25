@@ -1073,6 +1073,39 @@ def _choose_draining(config: dict, draining: dict) -> str | None:
     return None
 
 
+def _get_critical_path_depth(config: dict, label: str = "") -> int:
+    """Check for unclaimed critical-path issues, optionally filtered by label."""
+    try:
+        args = ["critical-path-depth"]
+        if label:
+            args.append(label)
+        r = coordination(config, *args)
+        return int(r.stdout.strip())
+    except (ValueError, subprocess.TimeoutExpired):
+        return 0
+
+
+def _choose_critical_path_draining(config: dict, draining: dict) -> str | None:
+    """Pick a draining worker type that has unclaimed critical-path work.
+
+    Like _choose_draining but only considers critical-path issues.
+    For typed workers (with issue_label), checks per-label critical-path depth.
+    For untyped workers, checks global critical-path depth.
+    """
+    items = list(draining.items())
+    random.shuffle(items)
+    for name, wt in items:
+        issue_label = wt.get("issue_label", "")
+        if issue_label:
+            if _get_critical_path_depth(config, issue_label) > 0:
+                return name
+        else:
+            # No label filter — handles all issue types
+            if _get_critical_path_depth(config) > 0:
+                return name
+    return None
+
+
 def dispatch_queue_balance(config: dict, queue_depth: int,
                            worker_types: dict,
                            state: AgentState | None = None) -> str | None:
@@ -1083,6 +1116,15 @@ def dispatch_queue_balance(config: dict, queue_depth: int,
     # Separate types into queue-filling (have locks) and queue-draining (no locks)
     filling = {k: v for k, v in worker_types.items() if v.get("lock")}
     draining = {k: v for k, v in worker_types.items() if not v.get("lock")}
+
+    # Critical-path override: if there are unclaimed critical-path issues,
+    # always dispatch a matching worker regardless of min_queue threshold.
+    # This prevents the startup stall where the pipeline is bottlenecked on
+    # a single issue but the queue is too small to trigger worker dispatch.
+    if queue_depth > 0 and draining:
+        chosen = _choose_critical_path_draining(config, draining)
+        if chosen is not None:
+            return chosen
 
     if queue_depth < min_queue and filling:
         # Try to acquire lock for a filling type
