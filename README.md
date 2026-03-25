@@ -7,7 +7,7 @@ autonomous Claude sessions, coordinating via GitHub issues, labels, and PRs.
 
 ```bash
 # Install
-uv tool install git+https://github.com/kim-em/pod.git
+uv tool install git+https://github.com/FormalFrontier/pod.git
 
 # For development: uv pip install -e .
 
