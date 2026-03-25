@@ -106,13 +106,21 @@ Each issue body MUST be **self-contained**:
 **Sizing**: max 3 deliverables, ~2 files, ~200 lines. Over 300 lines → split.
 When in doubt, split. Each issue must have a single logical concern.
 
-**Stage granularity**: If the project roadmap has "stages" or "phases", never put
-more than one stage in a single issue. Stages often contain work for many items
-(e.g., "transcribe all pages", "scaffold all formalizable items") that could be
-hundreds of sub-tasks for a large project. If you cannot yet determine the scope
-of a stage because it depends on earlier output (e.g., item discovery), create the
-issue for the whole stage but include a note in the body: **"This issue needs
-decomposition: once the prerequisite is complete, the claiming worker should
+**Stage granularity**: If the project roadmap has "stages" or "phases", **never
+create an issue that spans multiple stages**. Each issue belongs to exactly one
+stage.
+
+Within a stage, maximise parallelism: if the stage contains independent items
+(e.g., "transcribe all pages", "formalise each definition"), create a **separate
+issue per item** (or per small batch of items) so workers can execute them
+concurrently. If the PLAN.md gives explicit parallelisation instructions for a
+stage, follow them. The goal is many small, independent issues — not one large
+issue per stage.
+
+If you cannot yet determine the scope of a stage because it depends on earlier
+output (e.g., item discovery), create the issue for the whole stage but include
+a note in the body: **"This issue needs decomposition: once the prerequisite is
+complete, the claiming worker should
 `coordination skip N 'needs decomposition into per-item sub-issues'` so the
 planner can create properly-scoped sub-issues."** This keeps issue creation under
 planner locking and overlap protection. Never ask workers to create issues directly.

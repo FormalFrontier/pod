@@ -32,9 +32,14 @@ Pod manages a pool of autonomous Claude Code agents, each running in its
 own git worktree on its own branch. Agents coordinate through GitHub
 issues and PRs:
 
-- **Planners** create scoped work items as GitHub issues, then exit
-- **Workers** claim issues, implement changes, and open PRs
-- Auto-merge handles the rest
+1. Write a `PLAN.md` describing the project goals, stages, and structure
+2. **Planners** read `PLAN.md` and create scoped work items as GitHub issues
+3. **Workers** claim issues, implement changes, and open PRs
+4. Auto-merge handles the rest
+
+`PLAN.md` is the single source of truth — planners decompose it into
+issues, workers execute those issues.  Agents never modify `PLAN.md`
+itself; update it directly when you want to steer the project.
 
 ## Requirements
 
