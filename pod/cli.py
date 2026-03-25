@@ -704,6 +704,18 @@ def compute_historical_cost(pricing: dict,
     )
 
 
+def _reload_config_value(*keys, default=None):
+    """Re-read a single value from config.toml on disk (hot-reload safe)."""
+    try:
+        with open(CONFIG_PATH, "rb") as f:
+            cfg = tomllib.load(f)
+        for k in keys:
+            cfg = cfg[k]
+        return cfg
+    except (OSError, KeyError, tomllib.TOMLDecodeError):
+        return default
+
+
 def check_quota(config: dict, force: bool = False) -> bool:
     """Check if Claude quota is available. Returns True if OK."""
     if force or FORCE_QUOTA_FILE.exists():
@@ -718,7 +730,8 @@ def check_quota(config: dict, force: bool = False) -> bool:
         if result.returncode != 0:
             return False
         available = result.stdout.strip()
-        required = cfg_get(config, "claude", "model", default="opus")
+        # Re-read model from disk so config.toml edits take effect without restart.
+        required = _reload_config_value("claude", "model", default="opus")
         # Model tier: higher-tier availability satisfies lower-tier requirements.
         _MODEL_TIER = {"opus": 2, "sonnet": 1}
         return _MODEL_TIER.get(available, 0) >= _MODEL_TIER.get(required, 0)
@@ -1933,7 +1946,8 @@ def launch_claude(config: dict, session_uuid: str, prompt: str,
                    wt_dir: str,
                    claude_config_dir: Path | None = None) -> subprocess.Popen:
     """Launch claude in the worktree directory."""
-    model = cfg_get(config, "claude", "model", default="opus")
+    # Re-read model from disk so config.toml edits take effect without restart.
+    model = _reload_config_value("claude", "model", default="opus")
     session_dir = PROJECT_DIR / cfg_get(config, "project", "session_dir", default="sessions")
     session_dir.mkdir(parents=True, exist_ok=True)
     stdout_path = session_dir / f"{session_uuid}.stdout"
