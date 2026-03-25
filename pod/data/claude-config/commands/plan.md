@@ -167,7 +167,7 @@ open PRs, blocked issues): set target to the number of currently claimed issues
 (workers already running) and set min_queue to 1.
 
 **If zero new issues AND nothing in-flight** (no unclaimed, no claimed, no
-broken PRs): `coordination human-oversight` (signals the pod TUI to stop
+broken PRs): `coordination return-to-human` (signals the pod TUI to stop
 spawning agents). Verify all three are zero first:
 ```bash
 coordination queue-depth

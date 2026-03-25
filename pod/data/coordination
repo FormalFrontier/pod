@@ -20,9 +20,9 @@
 #   coordination release-stale-claims [SECS]  — release claimed issues with no activity for SECS seconds (default 14400 = 4h)
 #   coordination lock-planner                 — acquire advisory planner lock (20min TTL)
 #   coordination unlock-planner               — release planner lock early
-#   coordination human-oversight              — planner signals no work remains; TUI sets target=0 and finishes agents
-#   coordination check-human-oversight        — check if return-to-human signal is set on sentinel (exits 0 if set)
-#   coordination clear-human-oversight        — remove return-to-human signal (e.g. to resume work after completion)
+#   coordination return-to-human              — planner signals no work remains; TUI sets target=0 and finishes agents
+#   coordination check-return-to-human        — check if return-to-human signal is set on sentinel (exits 0 if set)
+#   coordination clear-return-to-human        — remove return-to-human signal (e.g. to resume work after completion)
 #   coordination set-target N                 — planner sets recommended target agent count (pod uses min of this and user target)
 #   coordination set-min-queue N              — planner sets recommended min_queue (pod uses min of this and config value, floored at 1)
 #   coordination nothing-to-plan              — planner signals queue saturated; decrements target by 1 (deprecated: use set-target/set-min-queue instead)
@@ -783,22 +783,25 @@ cmd_check_blocked() {
     done
 }
 
-# --- human-oversight ---
+# --- return-to-human ---
 # Called by a planner when it determines there is no work left to plan and the
-# project is complete. Adds the label "human-oversight" to the sentinel issue.
+# project is complete. Adds the "return-to-human" label to the sentinel issue.
 # The pod TUI monitors this label and responds by setting the agent target to 0
 # and gracefully finishing all running agents, returning control to the operator.
-cmd_human_oversight() {
+#
+# NOTE: This is unrelated to the "human-oversight" label on work issues, which
+# marks directives injected by the human into the work queue.
+cmd_return_to_human() {
     _resolve_planner_lock_issue
     gh issue edit "$PLANNER_LOCK_ISSUE" --repo "$REPO" --add-label return-to-human
-    echo "Human-oversight signal sent (label added to sentinel issue #$PLANNER_LOCK_ISSUE)"
+    echo "Return-to-human signal sent (label added to sentinel issue #$PLANNER_LOCK_ISSUE)"
 }
 
-# --- check-human-oversight ---
+# --- check-return-to-human ---
 # Read-only: check whether the return-to-human signal has been set on the sentinel issue.
 # Prints "true" and exits 0 if the signal is set; prints "false" and exits 1 otherwise.
 # Used by the pod TUI to poll for the signal.
-cmd_check_human_oversight() {
+cmd_check_return_to_human() {
     _resolve_planner_lock_issue
     local labels
     labels="$(gh issue view "$PLANNER_LOCK_ISSUE" --repo "$REPO" --json labels \
@@ -812,15 +815,15 @@ cmd_check_human_oversight() {
     fi
 }
 
-# --- clear-human-oversight ---
+# --- clear-return-to-human ---
 # Remove the return-to-human signal from the sentinel issue.
 # Use this to resume pod operation after inspecting a completed project, or when
 # the signal was set in error. The TUI also exposes this via the 'r' keypress.
-cmd_clear_human_oversight() {
+cmd_clear_return_to_human() {
     _resolve_planner_lock_issue
     gh issue edit "$PLANNER_LOCK_ISSUE" --repo "$REPO" --remove-label return-to-human \
         2>/dev/null || true
-    echo "Human-oversight signal cleared (label removed from sentinel issue #$PLANNER_LOCK_ISSUE)"
+    echo "Return-to-human signal cleared (label removed from sentinel issue #$PLANNER_LOCK_ISSUE)"
 }
 
 # --- set-target ---
@@ -881,12 +884,16 @@ case "${1:-}" in
     unlock-planner)         cmd_unlock_planner ;;
     lock-status)            cmd_lock_status ;;
     force-unlock-planner)   cmd_force_unlock_planner ;;
-    human-oversight)        cmd_human_oversight ;;
-    check-human-oversight)  cmd_check_human_oversight ;;
-    clear-human-oversight)  cmd_clear_human_oversight ;;
+    return-to-human)        cmd_return_to_human ;;
+    check-return-to-human)  cmd_check_return_to_human ;;
+    clear-return-to-human)  cmd_clear_return_to_human ;;
+    # Backward compat aliases (deprecated)
+    human-oversight)        cmd_return_to_human ;;
+    check-human-oversight)  cmd_check_return_to_human ;;
+    clear-human-oversight)  cmd_clear_return_to_human ;;
     nothing-to-plan)        cmd_nothing_to_plan ;;
     set-target)          shift; cmd_set_target "$@" ;;
     set-min-queue)       shift; cmd_set_min_queue "$@" ;;
     *)               die "unknown command: ${1:-}
-Usage: coordination {orient|plan [--label L] [--critical-path]|create-pr|claim-fix|close-pr|list-unclaimed [--label L]|queue-depth [L]|critical-path-depth|claim|skip|add-dep|check-blocked|release-stale-claims|lock-planner|unlock-planner|lock-status|force-unlock-planner|human-oversight|check-human-oversight|clear-human-oversight|nothing-to-plan|set-target|set-min-queue}" ;;
+Usage: coordination {orient|plan [--label L] [--critical-path]|create-pr|claim-fix|close-pr|list-unclaimed [--label L]|queue-depth [L]|critical-path-depth|claim|skip|add-dep|check-blocked|release-stale-claims|lock-planner|unlock-planner|lock-status|force-unlock-planner|return-to-human|check-return-to-human|clear-return-to-human|nothing-to-plan|set-target|set-min-queue}" ;;
 esac

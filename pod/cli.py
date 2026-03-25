@@ -826,9 +826,9 @@ def get_queue_depth(config: dict) -> int:
 
 
 def get_return_to_human(config: dict) -> bool:
-    """Check whether a planner has signalled human-oversight on the sentinel issue."""
+    """Check whether a planner has signalled return-to-human on the sentinel issue."""
     try:
-        r = coordination(config, "check-human-oversight")
+        r = coordination(config, "check-return-to-human")
         return r.stdout.strip() == "true"
     except subprocess.TimeoutExpired:
         return False
@@ -837,7 +837,7 @@ def get_return_to_human(config: dict) -> bool:
 def clear_return_to_human(config: dict) -> None:
     """Remove the return-to-human signal from the sentinel issue."""
     try:
-        coordination(config, "clear-human-oversight")
+        coordination(config, "clear-return-to-human")
     except subprocess.TimeoutExpired:
         pass
 
@@ -2497,7 +2497,7 @@ def _tui_main(stdscr, config: dict):
     blocked_deps_fetch_time = 0.0
     cached_lock_status: str | None = None  # "locked" or "unlocked"
     lock_fetch_time = 0.0
-    # Check for pre-existing human-oversight signal synchronously at startup.
+    # Check for pre-existing return-to-human signal synchronously at startup.
     # If it was already set before this TUI session, we honour it (target=0, banner)
     # but do NOT send SIGUSR1 — the human restarted pod intentionally.
     try:
@@ -2627,7 +2627,7 @@ def _tui_main(stdscr, config: dict):
             if _bg_data["return_to_human"] is not None:
                 cached_return_to_human = _bg_data["return_to_human"]
 
-        # React to human-oversight signal: set target=0 and gracefully finish all agents.
+        # React to return-to-human signal: set target=0 and gracefully finish all agents.
         # Only act once per TUI session (idempotent).
         if cached_return_to_human and not _acted_on_return_to_human:
             _acted_on_return_to_human = True
@@ -2638,7 +2638,7 @@ def _tui_main(stdscr, config: dict):
                         os.kill(a.pid, signal.SIGUSR1)
                     except (ProcessLookupError, OSError):
                         pass
-            message = "Planner signalled: no work remains. Target set to 0; agents finishing."
+            message = "Return-to-human: planner found no remaining work. Target set to 0; agents finishing."
             message_time = now
 
         # Auto-spawn agents to maintain target (only if no agents are finishing).
@@ -2892,7 +2892,7 @@ def _tui_main(stdscr, config: dict):
         if cached_return_to_human:
             banner_row = msg_row + 1 if msg_active else msg_row
             if banner_row < height:
-                banner = " *** human-oversight signalled: no work remains — target=0, agents finishing ***"
+                banner = " *** return-to-human: planner found no remaining work — target=0, agents finishing ***"
                 _addstr(stdscr, banner_row, 0, banner[:width], curses.color_pair(2) | curses.A_BOLD)
 
         stdscr.refresh()
@@ -3036,13 +3036,13 @@ def _tui_main(stdscr, config: dict):
                 message = "Global force-quota ON (all agents skip quota checks)"
             message_time = time.time()
         elif ch == ord("r") or ch == ord("R"):
-            # Clear human-oversight signal and resume normal operation
+            # Clear return-to-human signal and resume normal operation
             if cached_return_to_human:
                 try:
                     clear_return_to_human(config)
                     cached_return_to_human = False
                     _acted_on_return_to_human = False
-                    message = "Human-oversight signal cleared. Adjust target with [a]/[+] to resume."
+                    message = "Return-to-human signal cleared. Adjust target with [a]/[+] to resume."
                 except Exception as e:
                     message = f"Failed to clear signal: {e}"
                 message_time = time.time()

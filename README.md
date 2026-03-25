@@ -122,9 +122,9 @@ it directly for debugging or manual intervention.
 |------------|-------------|
 | `set-target <N>` | Recommend N agents; pod uses min(user target, planner target) |
 | `set-min-queue <N>` | Recommend min_queue of N; pod floors at 1 |
-| `human-oversight` | Signal pod to stop spawning and return control to operator |
-| `check-human-oversight` | Check if the return-to-human signal is set |
-| `clear-human-oversight` | Clear the signal to resume operation |
+| `return-to-human` | Signal pod to stop spawning and return control to operator |
+| `check-return-to-human` | Check if the return-to-human signal is set |
+| `clear-return-to-human` | Clear the signal to resume operation |
 
 ## License
 
