@@ -82,6 +82,7 @@ ISOLATED_CONFIG_DIR = POD_DIR / "claude-config"
 TARGET_FILE = POD_DIR / "target"  # Target agent count (int, one per line)
 PLANNER_TARGET_FILE = POD_DIR / "planner-target"  # Planner-recommended target agent count
 PLANNER_MIN_QUEUE_FILE = POD_DIR / "planner-min-queue"  # Planner-recommended min_queue
+FORCE_QUOTA_FILE = POD_DIR / "force-quota"  # If exists, skip quota checks globally
 
 # ---------------------------------------------------------------------------
 # Default configuration (written on first run)
@@ -705,7 +706,7 @@ def compute_historical_cost(pricing: dict,
 
 def check_quota(config: dict, force: bool = False) -> bool:
     """Check if Claude quota is available. Returns True if OK."""
-    if force:
+    if force or FORCE_QUOTA_FILE.exists():
         return True
     cmd = os.path.expanduser(cfg_get(config, "claude", "quota_check", default=""))
     if not cmd:
@@ -2655,6 +2656,8 @@ def _tui_main(stdscr, config: dict):
         lock_indicator = ""
         if cached_lock_status == "locked":
             lock_indicator = " | LOCK"
+        if FORCE_QUOTA_FILE.exists():
+            lock_indicator += " | FORCE"
         effective = target  # already computed via get_effective_target() above
         user_t = read_target()
         if effective is not None and user_t is not None and effective < user_t:
@@ -2858,7 +2861,7 @@ def _tui_main(stdscr, config: dict):
                 footer_text = " No agent selected"
                 input_mode = ""
         else:
-            footer_text = " [a]dd  [f]inish  [k]ill  [o]pen  [!]force  [L]ock  [q]uit  [Q]uit all  ↑↓/1-9"
+            footer_text = " [a]dd  [f]inish  [k]ill  [o]pen  [!]force  [F]orce-all  [L]ock  [q]uit  [Q]uit all  ↑↓/1-9"
             if cached_return_to_human:
                 footer_text = " [r]esume work  " + footer_text.lstrip()
 
@@ -3009,6 +3012,15 @@ def _tui_main(stdscr, config: dict):
                 except (OSError, json.JSONDecodeError) as e:
                     message = f"Failed to toggle force: {e}"
                 message_time = time.time()
+        elif ch == ord("F"):
+            # Toggle global force-quota override
+            if FORCE_QUOTA_FILE.exists():
+                FORCE_QUOTA_FILE.unlink()
+                message = "Global force-quota OFF"
+            else:
+                FORCE_QUOTA_FILE.write_text("")
+                message = "Global force-quota ON (all agents skip quota checks)"
+            message_time = time.time()
         elif ch == ord("r") or ch == ord("R"):
             # Clear human-oversight signal and resume normal operation
             if cached_return_to_human:
@@ -3391,7 +3403,7 @@ def cmd_init(args):
 
     # .gitignore for .pod/
     gitignore = pod_dir / ".gitignore"
-    gitignore.write_text("agents/\npod.log\nclaim-history.*\nclaude-config/\n")
+    gitignore.write_text("agents/\npod.log\nclaim-history.*\nclaude-config/\nforce-quota\n")
 
     # Ensure .claude/.pod-checksums is gitignored in the project root
     proj_gitignore = git_root / ".gitignore"
