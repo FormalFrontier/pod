@@ -80,7 +80,8 @@ LOG_PATH = POD_DIR / "pod.log"
 CLAIM_HISTORY_PATH = POD_DIR / "claim-history.json"
 ISOLATED_CONFIG_DIR = POD_DIR / "claude-config"
 TARGET_FILE = POD_DIR / "target"  # Target agent count (int, one per line)
-MIN_QUEUE_DECREMENT_FILE = POD_DIR / "min-queue-decrement"  # Cumulative nothing-to-plan decrements
+PLANNER_TARGET_FILE = POD_DIR / "planner-target"  # Planner-recommended target agent count
+PLANNER_MIN_QUEUE_FILE = POD_DIR / "planner-min-queue"  # Planner-recommended min_queue
 
 # ---------------------------------------------------------------------------
 # Default configuration (written on first run)
@@ -526,16 +527,29 @@ def write_target(n: int):
     TARGET_FILE.write_text(str(max(0, n)))
 
 
-def read_min_queue_decrement() -> int:
-    """Read cumulative min_queue decrement from .pod/min-queue-decrement.
-
-    Incremented by `coordination nothing-to-plan` each time a planner finds
-    the queue saturated but work is still in progress.
-    """
+def read_planner_target() -> int | None:
+    """Read planner-recommended target from .pod/planner-target, or None if not set."""
     try:
-        return int(MIN_QUEUE_DECREMENT_FILE.read_text().strip())
+        return int(PLANNER_TARGET_FILE.read_text().strip())
     except (OSError, ValueError):
-        return 0
+        return None
+
+
+def read_planner_min_queue() -> int | None:
+    """Read planner-recommended min_queue from .pod/planner-min-queue, or None if not set."""
+    try:
+        return int(PLANNER_MIN_QUEUE_FILE.read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def get_effective_target() -> int | None:
+    """Effective target = min(user_target, planner_target). User target is the ceiling."""
+    user_target = read_target()
+    planner_target = read_planner_target()
+    if user_target is not None and planner_target is not None:
+        return min(user_target, planner_target)
+    return user_target  # planner_target alone doesn't create a target; user must set one
 
 
 # ---------------------------------------------------------------------------
@@ -1111,7 +1125,11 @@ def dispatch_queue_balance(config: dict, queue_depth: int,
                            state: AgentState | None = None) -> str | None:
     """Low queue → locked types (queue-filling), high queue → unlocked types (queue-draining)."""
     config_min_queue = cfg_get(config, "dispatch", "min_queue", default=3)
-    min_queue = max(0, config_min_queue - read_min_queue_decrement())
+    planner_min_queue = read_planner_min_queue()
+    if planner_min_queue is not None:
+        min_queue = max(1, min(config_min_queue, planner_min_queue))
+    else:
+        min_queue = max(1, config_min_queue)
 
     # Separate types into queue-filling (have locks) and queue-draining (no locks)
     filling = {k: v for k, v in worker_types.items() if v.get("lock")}
@@ -1470,7 +1488,7 @@ def check_dead_claimed_issues(config: dict):
             deduped_restart.append(entry)
 
     # Respect target_agents: don't spawn more agents than the target.
-    target = read_target()
+    target = get_effective_target()
     if target is not None:
         current_count = len([a for a in agents if a.status not in ("dead", "stopped")])
         slots = max(0, target - current_count)
@@ -2585,7 +2603,7 @@ def _tui_main(stdscr, config: dict):
             message_time = now
 
         # Auto-spawn agents to maintain target (only if no agents are finishing).
-        target = read_target()
+        target = get_effective_target()
         if target is not None and running < target and now - last_auto_spawn_time > 5.0:
             finishing_count = sum(1 for a in agents if a.status == "finishing")
             if finishing_count == 0:
@@ -2613,8 +2631,13 @@ def _tui_main(stdscr, config: dict):
         lock_indicator = ""
         if cached_lock_status == "locked":
             lock_indicator = " | LOCK"
-        agent_str = f"{running}/{target}" if target is not None else str(running)
-        agent_word = "agent" if (target or running) == 1 else "agents"
+        effective = target  # already computed via get_effective_target() above
+        user_t = read_target()
+        if effective is not None and user_t is not None and effective < user_t:
+            agent_str = f"{running}/{effective}({user_t})"
+        else:
+            agent_str = f"{running}/{effective}" if effective is not None else str(running)
+        agent_word = "agent" if (effective or running) == 1 else "agents"
         if cached_queue is not None:
             header = f" pod -- {agent_str} {agent_word} running | queue: {cached_queue}{lock_indicator} | ${all_time:.2f} total ({session_info})"
         else:

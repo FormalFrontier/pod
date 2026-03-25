@@ -143,9 +143,20 @@ For each issue, write the plan body to `plans/<UUID-prefix>-N.md`, then post:
 coordination plan --label <feature|review|summarize|meditate> "title" < plans/<UUID-prefix>-N.md
 ```
 
+**Adjusting agent pool size**: After assessing the project state, use these
+commands to tell the dispatcher what you think is appropriate:
+- `coordination set-target N` — recommend N agents for this project (pod uses
+  min of your recommendation and the user's configured maximum)
+- `coordination set-min-queue N` — recommend min_queue of N (pod uses min of
+  your recommendation and the config value, floored at 1)
+
+Set target based on how much parallelisable work exists. Set min_queue based on
+how far ahead you want planning to stay (typically 2-3 during active development,
+1 during sequential bottlenecks).
+
 **If you created zero new issues** but work is still in-flight (claimed issues,
-open PRs, blocked issues): `coordination nothing-to-plan` (decrements queue
-thresholds for graceful wind-down).
+open PRs, blocked issues): set target to the number of currently claimed issues
+(workers already running) and set min_queue to 1.
 
 **If zero new issues AND nothing in-flight** (no unclaimed, no claimed, no
 broken PRs): `coordination human-oversight` (signals the pod TUI to stop
