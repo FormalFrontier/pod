@@ -702,9 +702,11 @@ def check_quota(config: dict, force: bool = False) -> bool:
         )
         if result.returncode != 0:
             return False
-        model = result.stdout.strip()
+        available = result.stdout.strip()
         required = cfg_get(config, "claude", "model", default="opus")
-        return model == required
+        # Model tier: higher-tier availability satisfies lower-tier requirements.
+        _MODEL_TIER = {"opus": 2, "sonnet": 1}
+        return _MODEL_TIER.get(available, 0) >= _MODEL_TIER.get(required, 0)
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         return False
 
