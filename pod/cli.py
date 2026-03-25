@@ -1080,10 +1080,15 @@ def _choose_draining(config: dict, draining: dict) -> str | None:
             except (ValueError, subprocess.TimeoutExpired):
                 depth = 0
             if depth > 0:
+                log(f"_choose_draining: {name} (label={issue_label}) has depth={depth}")
                 return name
+            else:
+                log(f"_choose_draining: {name} (label={issue_label}) has depth=0, skipping")
         else:
             # No label filter — treat as always having work
+            log(f"_choose_draining: {name} (no label filter) → selected")
             return name
+    log(f"_choose_draining: no type had work out of {[n for n,_ in items]}")
     return None
 
 
@@ -1135,6 +1140,10 @@ def dispatch_queue_balance(config: dict, queue_depth: int,
     filling = {k: v for k, v in worker_types.items() if v.get("lock")}
     draining = {k: v for k, v in worker_types.items() if not v.get("lock")}
 
+    log(f"dispatch: queue_depth={queue_depth} min_queue={min_queue} "
+        f"(config={config_min_queue} planner={planner_min_queue}) "
+        f"filling={list(filling)} draining={list(draining)}")
+
     # Critical-path override: if there are unclaimed critical-path issues,
     # always dispatch a matching worker regardless of min_queue threshold.
     # This prevents the startup stall where the pipeline is bottlenecked on
@@ -1142,9 +1151,11 @@ def dispatch_queue_balance(config: dict, queue_depth: int,
     if queue_depth > 0 and draining:
         chosen = _choose_critical_path_draining(config, draining)
         if chosen is not None:
+            log(f"dispatch: critical-path override → {chosen}")
             return chosen
 
     if queue_depth < min_queue and filling:
+        log(f"dispatch: queue low ({queue_depth} < {min_queue}), trying filling types")
         # Try to acquire lock for a filling type
         for name, wt in filling.items():
             lock_name = wt["lock"]
@@ -1153,19 +1164,26 @@ def dispatch_queue_balance(config: dict, queue_depth: int,
                 if state:
                     state.lock_held = lock_name
                     state.write()
+                log(f"dispatch: acquired {lock_name} lock → {name}")
                 return name
         # Lock held — fall back to draining if queue > 0
         if queue_depth > 0 and draining:
-            return _choose_draining(config, draining)
+            chosen = _choose_draining(config, draining)
+            log(f"dispatch: lock held, draining fallback → {chosen}")
+            return chosen
         # Queue empty and lock held — wait
+        log("dispatch: lock held, queue empty → None")
         return None
     elif draining:
         chosen = _choose_draining(config, draining)
         if chosen is not None:
+            log(f"dispatch: draining → {chosen}")
             return chosen
         # No labeled work available despite nonzero global queue (e.g. unlabeled issues
         # from before the typed-worker migration). Fall back to planner to create
         # properly-typed issues rather than stalling indefinitely.
+        log("dispatch: _choose_draining returned None despite draining types existing, "
+            "falling back to filling")
         if filling:
             for name, wt in filling.items():
                 lock_name = wt["lock"]
@@ -1174,9 +1192,12 @@ def dispatch_queue_balance(config: dict, queue_depth: int,
                     if state:
                         state.lock_held = lock_name
                         state.write()
+                    log(f"dispatch: draining-fallback acquired {lock_name} lock → {name}")
                     return name
+        log("dispatch: no work available → None")
         return None
     elif filling:
+        log("dispatch: no draining types, trying filling only")
         # Only filling types exist — try them
         for name, wt in filling.items():
             lock_name = wt["lock"]
@@ -1185,8 +1206,11 @@ def dispatch_queue_balance(config: dict, queue_depth: int,
                 if state:
                     state.lock_held = lock_name
                     state.write()
+                log(f"dispatch: filling-only acquired {lock_name} lock → {name}")
                 return name
+        log("dispatch: filling-only, all locks held → None")
         return None
+    log("dispatch: no worker types matched → None")
     return None
 
 
