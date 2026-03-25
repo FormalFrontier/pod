@@ -142,7 +142,7 @@ _ensure_labels
 # Always includes human-oversight issues (even without agent-plan) when no extra label is given.
 _unclaimed_issues() {
     local extra_label="${1:-}"
-    local filter='[.[] | select(.labels | all(.name != "claimed") and all(.name != "blocked") and all(.name != "has-pr") and all(.name != "replan"))] | sort_by(.createdAt)'
+    local filter='[.[] | select(.labels | all(.name != "claimed") and all(.name != "blocked") and all(.name != "has-pr") and all(.name != "replan"))] | sort_by(if (.labels | any(.name == "critical-path")) then 0 else 1 end, .createdAt)'
     if [[ -n "$extra_label" ]]; then
         gh issue list --repo "$REPO" --label agent-plan --label "$extra_label" --state open --limit 50 \
             --json number,title,labels,createdAt \
@@ -856,33 +856,10 @@ cmd_set_min_queue() {
 }
 
 # --- nothing-to-plan ---
-# Called by the planner when it has reviewed the queue and cannot find any new
-# work to create, but open issues still exist (so the project is NOT done yet).
-# Decrements the target agent count by 1 (graceful pool wind-down).
-# Note: min-queue-decrement is deprecated. Use `coordination set-min-queue N` instead.
+# Deprecated: this is now a no-op. Planners should use set-target/set-min-queue instead.
 cmd_nothing_to_plan() {
-    # Locate the main repo root (works from both the main repo and any worktree).
-    local main_root
-    main_root="$(cd "$(git rev-parse --git-common-dir)/.." && pwd -P)"
-    local pod_dir="$main_root/.pod"
-
-    if [[ ! -d "$pod_dir" ]]; then
-        echo "error: .pod/ not found at $pod_dir (not in a pod-managed repo?)" >&2
-        return 1
-    fi
-
-    # Decrement the target agent count (if the target file exists).
-    # Note: min-queue-decrement is deprecated. Use `coordination set-min-queue N` instead.
-    local target_file="$pod_dir/target"
-    if [[ -f "$target_file" ]]; then
-        local current_target
-        current_target="$(cat "$target_file" 2>/dev/null || echo 1)"
-        local new_target=$(( current_target > 0 ? current_target - 1 : 0 ))
-        printf '%d' "$new_target" > "$target_file"
-        echo "nothing-to-plan: target=$new_target"
-    else
-        echo "nothing-to-plan: (no target file)"
-    fi
+    # Deprecated: this command is a no-op. Planners should use set-target/set-min-queue instead.
+    echo "nothing-to-plan: deprecated — use 'coordination set-target N' or 'coordination set-min-queue N' instead"
 }
 
 # --- dispatch ---

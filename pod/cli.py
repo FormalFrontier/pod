@@ -2908,6 +2908,9 @@ def _tui_main(stdscr, config: dict):
             spawn_agent(config)
             cur_target = read_target()
             write_target((cur_target or running) + 1)
+            # Clear planner advisories so user intent takes immediate effect
+            PLANNER_TARGET_FILE.unlink(missing_ok=True)
+            PLANNER_MIN_QUEUE_FILE.unlink(missing_ok=True)
             last_auto_spawn_time = time.time()
             auto_spawn_failures = 0
             auto_spawn_paused = False
@@ -3295,6 +3298,7 @@ REQUIRED_LABELS = {
     "has-pr": "5319E7",
     "replan": "D93F0B",
     "coordination": "0E8A16",
+    "critical-path": "E11D48",
 }
 
 
@@ -3505,7 +3509,10 @@ def main():
         cmd_add(config, args)
     elif args.command == "target":
         write_target(args.count)
-        print(f"Target set to {args.count} agents.")
+        # Clear planner advisories so user target takes immediate effect
+        PLANNER_TARGET_FILE.unlink(missing_ok=True)
+        PLANNER_MIN_QUEUE_FILE.unlink(missing_ok=True)
+        print(f"Target set to {args.count} agents (planner advisories cleared).")
     elif args.command == "finish":
         cmd_finish(config, args)
     elif args.command == "kill":
