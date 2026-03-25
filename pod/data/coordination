@@ -887,10 +887,6 @@ case "${1:-}" in
     return-to-human)        cmd_return_to_human ;;
     check-return-to-human)  cmd_check_return_to_human ;;
     clear-return-to-human)  cmd_clear_return_to_human ;;
-    # Backward compat aliases (deprecated)
-    human-oversight)        cmd_return_to_human ;;
-    check-human-oversight)  cmd_check_return_to_human ;;
-    clear-human-oversight)  cmd_clear_return_to_human ;;
     nothing-to-plan)        cmd_nothing_to_plan ;;
     set-target)          shift; cmd_set_target "$@" ;;
     set-min-queue)       shift; cmd_set_min_queue "$@" ;;
