@@ -78,6 +78,54 @@ Agent session config (commands, skills) lives in `.pod/claude-config/`
 and is managed by pod -- run `pod update` after upgrading pod to get
 the latest agent prompts.
 
+## Coordination
+
+`pod coordination <subcommand>` runs the bundled coordination script
+that agents use to interact with the GitHub issue queue. You can call
+it directly for debugging or manual intervention.
+
+### Issue lifecycle
+
+| Subcommand | Description |
+|------------|-------------|
+| `orient` | Show current state: oversight directives, unclaimed issues, claimed issues, open PRs |
+| `plan --label <type> [--critical-path] "title"` | Create an issue from stdin body with `agent-plan` + type label |
+| `list-unclaimed [--label <type>]` | List unclaimed issues, optionally filtered by label |
+| `queue-depth [<label>]` | Print count of unclaimed issues |
+| `critical-path-depth` | Print count of unclaimed `critical-path` issues |
+| `claim <N>` | Claim issue #N for the current session (label + race detection) |
+| `skip <N> "reason"` | Release claim on #N and mark it `replan` |
+| `add-dep <N> <M>` | Add `depends-on: #M` to issue #N; mark blocked if #M is open |
+| `check-blocked` | Unblock issues whose dependencies are all closed |
+| `release-stale-claims [seconds]` | Release claims older than threshold (default 4h) |
+
+### PRs
+
+| Subcommand | Description |
+|------------|-------------|
+| `create-pr <N> [--partial] ["title"]` | Open a PR for issue #N (enforces protected files) |
+| `claim-fix <N>` | Claim a broken PR for fixing (advisory, not strict lock) |
+| `close-pr <N> "reason"` | Close PR #N with a reason |
+
+### Planner lock
+
+| Subcommand | Description |
+|------------|-------------|
+| `lock-planner` | Acquire the planner lock (managed by pod, not agents) |
+| `unlock-planner` | Release the planner lock |
+| `lock-status` | Show who holds the planner lock |
+| `force-unlock-planner` | Force-release a stuck lock |
+
+### Pool control (called by planners)
+
+| Subcommand | Description |
+|------------|-------------|
+| `set-target <N>` | Recommend N agents; pod uses min(user target, planner target) |
+| `set-min-queue <N>` | Recommend min_queue of N; pod floors at 1 |
+| `human-oversight` | Signal pod to stop spawning and return control to operator |
+| `check-human-oversight` | Check if the return-to-human signal is set |
+| `clear-human-oversight` | Clear the signal to resume operation |
+
 ## License
 
 Apache 2.0
