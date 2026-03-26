@@ -32,20 +32,28 @@ set -euo pipefail
 # Cache REPO and BASE_BRANCH in /tmp to avoid 2 GraphQL calls per invocation.
 # Keyed by the git toplevel directory so multiple repos don't collide.
 # Uses atomic writes (mktemp+mv) and validates cached values look sane.
+# Cache expires after 1 hour to handle repo renames/transfers.
 _git_toplevel="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 _cache_key="$(echo "$_git_toplevel" | tr '/' '-')"
 _repo_cache="/tmp/pod-repo-cache${_cache_key}"
 _base_branch_cache="/tmp/pod-base-branch-cache${_cache_key}"
+_REPO_CACHE_TTL=3600  # seconds
 
 _cached_repo=""
 _cached_base=""
+_cache_stale=false
 if [[ -f "$_repo_cache" && -f "$_base_branch_cache" ]]; then
     _cached_repo="$(cat "$_repo_cache" 2>/dev/null)"
     _cached_base="$(cat "$_base_branch_cache" 2>/dev/null)"
+    # Check TTL: if cache file is older than _REPO_CACHE_TTL, treat as stale
+    _cache_age=$(( $(date +%s) - $(stat -c %Y "$_repo_cache" 2>/dev/null || echo 0) ))
+    if (( _cache_age > _REPO_CACHE_TTL )); then
+        _cache_stale=true
+    fi
 fi
 
-# Validate: REPO must look like "owner/name", BASE_BRANCH must be non-empty
-if [[ "$_cached_repo" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ && -n "$_cached_base" ]]; then
+# Validate: REPO must look like "owner/name", BASE_BRANCH must be non-empty, cache not stale
+if [[ "$_cache_stale" == "false" && "$_cached_repo" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ && -n "$_cached_base" ]]; then
     REPO="$_cached_repo"
     BASE_BRANCH="$_cached_base"
 else
