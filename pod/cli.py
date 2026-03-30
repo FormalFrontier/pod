@@ -122,6 +122,7 @@ poll_interval = 2                  # Seconds between status updates
 jsonl_stale_warning = 300          # Warn if JSONL unchanged for this many seconds
 jsonl_missing_warning = 60         # Warn if JSONL not created after this many seconds
 max_claim_restarts = 1             # Max times to auto-restart a dead session before releasing claim
+show_costs = false                 # Show estimated API costs in TUI and status
 
 # --- Worker Types ---
 # Each [worker_types.<name>] defines a type of agent session.
@@ -629,12 +630,14 @@ def fmt_tokens(n: int) -> str:
     return str(n)
 
 
-def token_summary(state: AgentState, pricing: dict) -> str:
+def token_summary(state: AgentState, pricing: dict, show_costs: bool = True) -> str:
     total_in = state.tokens_in + state.cache_read + state.cache_create
     if total_in == 0 and state.tokens_out == 0:
         return ""
-    cost = state.cost(pricing)
-    return f"{fmt_tokens(total_in)}/{fmt_tokens(state.tokens_out)}~${cost:.2f}"
+    if show_costs:
+        cost = state.cost(pricing)
+        return f"{fmt_tokens(total_in)}/{fmt_tokens(state.tokens_out)}~${cost:.2f}"
+    return f"{fmt_tokens(total_in)}/{fmt_tokens(state.tokens_out)}"
 
 
 def compute_historical_cost(pricing: dict,
@@ -2552,10 +2555,11 @@ def _tui_main(stdscr, config: dict):
     auto_spawn_paused = False   # True when crash-loop detected
 
     pricing = cfg_get(config, "pricing", default={})
+    show_costs = cfg_get(config, "monitor", "show_costs", default=False)
 
     # Compute all-time historical cost once at startup
     claude_config_dir = get_claude_config_dir(config)
-    historical_cost = compute_historical_cost(pricing, claude_config_dir)
+    historical_cost = compute_historical_cost(pricing, claude_config_dir) if show_costs else 0.0
     # Track session-accumulated costs (persists across agent deaths)
     session_agent_costs: dict[str, float] = {}  # agent short_id -> last known cost
     # Accumulated cost from previous iterations (when token counters reset)
@@ -2670,8 +2674,6 @@ def _tui_main(stdscr, config: dict):
                             spawn_agent(config)
                         last_auto_spawn_time = now
 
-        all_time = historical_cost + session_cost
-        session_info = f"${session_cost:.2f} this session, {session_runs} run{'s' if session_runs != 1 else ''}"
         lock_indicator = ""
         if cached_lock_status == "locked":
             lock_indicator = " | LOCK"
@@ -2684,10 +2686,16 @@ def _tui_main(stdscr, config: dict):
         else:
             agent_str = f"{running}/{effective}" if effective is not None else str(running)
         agent_word = "agent" if (effective or running) == 1 else "agents"
-        if cached_queue is not None:
-            header = f" pod -- {agent_str} {agent_word} running | queue: {cached_queue}{lock_indicator} | ${all_time:.2f} total ({session_info})"
+        if show_costs:
+            all_time = historical_cost + session_cost
+            session_info = f"${session_cost:.2f} this session, {session_runs} run{'s' if session_runs != 1 else ''}"
+            cost_str = f" | ${all_time:.2f} total ({session_info})"
         else:
-            header = f" pod -- {agent_str} {agent_word} running{lock_indicator} | ${all_time:.2f} total ({session_info})"
+            cost_str = ""
+        if cached_queue is not None:
+            header = f" pod -- {agent_str} {agent_word} running | queue: {cached_queue}{lock_indicator}{cost_str}"
+        else:
+            header = f" pod -- {agent_str} {agent_word} running{lock_indicator}{cost_str}"
 
         _addstr(stdscr, 0, 0, header[:width], curses.color_pair(4) | curses.A_BOLD)
         _addstr(stdscr, 1, 0, "─" * min(width, 80), curses.color_pair(4))
@@ -2732,7 +2740,7 @@ def _tui_main(stdscr, config: dict):
                 elapsed = human_duration(time.time() - agent.session_start)
 
             # Tokens
-            tok = token_summary(agent, pricing)
+            tok = token_summary(agent, pricing, show_costs)
 
             # Activity text: for non-running states show status, not stale last_text
             if agent.status in ("running", "finishing"):
@@ -3255,12 +3263,10 @@ def cmd_status(config: dict, args):
     agents = read_all_agents()
     alive = [a for a in agents if a.status not in ("stopped", "dead")]
     pricing = cfg_get(config, "pricing", default={})
+    show_costs = cfg_get(config, "monitor", "show_costs", default=False)
 
-    session_cost = sum(a.cost(pricing) for a in alive)
     total_in = sum(a.tokens_in + a.cache_read + a.cache_create for a in alive)
     total_out = sum(a.tokens_out for a in alive)
-    claude_config_dir = get_claude_config_dir(config)
-    historical_cost = compute_historical_cost(pricing, claude_config_dir)
 
     try:
         queue = get_queue_depth(config)
@@ -3279,8 +3285,12 @@ def cmd_status(config: dict, args):
         print(f"  Breakdown:    {', '.join(parts)}")
 
     print(f"Total tokens:   {fmt_tokens(total_in)} in / {fmt_tokens(total_out)} out")
-    print(f"Running cost:   ${session_cost:.2f}")
-    print(f"All-time cost:  ${historical_cost:.2f}")
+    if show_costs:
+        session_cost = sum(a.cost(pricing) for a in alive)
+        claude_config_dir = get_claude_config_dir(config)
+        historical_cost = compute_historical_cost(pricing, claude_config_dir)
+        print(f"Running cost:   ${session_cost:.2f}")
+        print(f"All-time cost:  ${historical_cost:.2f}")
 
 
 def cmd_log(config: dict, args):
