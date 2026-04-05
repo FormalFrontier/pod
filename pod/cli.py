@@ -1890,16 +1890,56 @@ def copy_build_cache(wt_dir: str, config: dict):
 
 
 def cleanup_worktree(wt_dir: str, branch: str):
-    """Remove worktree and delete branch."""
+    """Remove worktree and delete branch.
+
+    Removes the build cache directory (e.g. `.lake`) explicitly before
+    invoking `git worktree remove`. On projects that rsync a large build
+    cache into each worktree (Lean/Mathlib `.lake/` is multiple GB of
+    small olean files), letting `git worktree remove` walk and unlink the
+    whole tree reliably exceeds its timeout. When the timeout fires the
+    subprocess is abandoned mid-walk, `TimeoutExpired` escapes the
+    caller, and the worktree leaks on disk — over hundreds of sessions
+    that grows `worktrees/` unboundedly.
+
+    We also swallow `TimeoutExpired` at every subprocess call so a slow
+    cleanup can never crash the agent loop, and fall back to an
+    in-process rmtree + `git worktree prune` if git still times out.
+    """
     if os.path.isdir(wt_dir):
-        subprocess.run(
-            ["git", "-C", str(PROJECT_DIR), "worktree", "remove", "--force", wt_dir],
-            capture_output=True, timeout=30,
+        build_cache = _reload_config_value(
+            "project", "build_cache_dir", default=".lake"
         )
-    subprocess.run(
-        ["git", "branch", "-D", branch],
-        capture_output=True, timeout=10, cwd=str(PROJECT_DIR),
-    )
+        cache_path = os.path.join(wt_dir, build_cache)
+        if os.path.isdir(cache_path):
+            try:
+                shutil.rmtree(cache_path, ignore_errors=True)
+            except Exception as e:
+                log(f"cleanup_worktree: rmtree {cache_path} failed: {e}")
+
+        try:
+            subprocess.run(
+                ["git", "-C", str(PROJECT_DIR), "worktree", "remove",
+                 "--force", wt_dir],
+                capture_output=True, timeout=120,
+            )
+        except subprocess.TimeoutExpired:
+            log(f"cleanup_worktree: git worktree remove timed out: {wt_dir}")
+            try:
+                shutil.rmtree(wt_dir, ignore_errors=True)
+                subprocess.run(
+                    ["git", "-C", str(PROJECT_DIR), "worktree", "prune"],
+                    capture_output=True, timeout=30,
+                )
+            except Exception as e:
+                log(f"cleanup_worktree: fallback cleanup failed: {e}")
+
+    try:
+        subprocess.run(
+            ["git", "branch", "-D", branch],
+            capture_output=True, timeout=10, cwd=str(PROJECT_DIR),
+        )
+    except subprocess.TimeoutExpired:
+        log(f"cleanup_worktree: git branch -D timed out: {branch}")
 
 
 def _log_credential_state(session_uuid: str, claude_config_dir: Path | None = None):
