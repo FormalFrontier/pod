@@ -719,16 +719,112 @@ def _reload_config_value(*keys, default=None):
         return default
 
 
-def check_quota(config: dict, force: bool = False) -> bool:
-    """Check if Claude quota is available. Returns True if OK."""
+def _claude_keychain_service(claude_config_dir: Path | None) -> str:
+    """Compute the macOS keychain service name Claude Code uses for credentials.
+
+    Mirrors the JS in @anthropic-ai/claude-code/cli.js:
+
+        function n8() {
+          return (process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), ".claude")).normalize("NFC")
+        }
+        function Ud(A = "") {
+          let q = n8()
+          let Y = !process.env.CLAUDE_CONFIG_DIR
+            ? ""
+            : `-${createHash("sha256").update(q).digest("hex").substring(0, 8)}`
+          return `Claude Code${OAUTH_FILE_SUFFIX}${A}${Y}`
+        }
+
+    With A = "-credentials", this yields "Claude Code-credentials" for the
+    default ~/.claude config dir, or "Claude Code-credentials-<sha256[:8]>"
+    for an isolated CLAUDE_CONFIG_DIR.
+    """
+    import hashlib
+    import unicodedata
+    if claude_config_dir is None:
+        return "Claude Code-credentials"
+    normalized = unicodedata.normalize("NFC", str(claude_config_dir))
+    suffix = hashlib.sha256(normalized.encode()).hexdigest()[:8]
+    return f"Claude Code-credentials-{suffix}"
+
+
+def resolve_claude_credential(claude_config_dir: Path | None) -> dict:
+    """Resolve the credential Claude Code will actually use at launch time.
+
+    Mirrors Claude Code's lookup order: macOS keychain entry (keyed by
+    sha256(CLAUDE_CONFIG_DIR)) first, then falls back to a plaintext
+    ``$CLAUDE_CONFIG_DIR/.credentials.json`` file.
+
+    Returns a dict with:
+        accountLabel: str    -- e.g. "qim", "lean-fro", or "?" if unknown
+        tokenPrefix:  str    -- first 20 chars of the access token, for logging
+        source:       str    -- human-readable description of where it came from
+    """
+    import json as _json
+    service = _claude_keychain_service(claude_config_dir)
+
+    # 1. Try the macOS keychain entry Claude Code will actually read.
+    try:
+        r = subprocess.run(
+            ["security", "find-generic-password",
+             "-s", service, "-a", os.getenv("USER", ""), "-w"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            kc = _json.loads(r.stdout.strip())
+            return {
+                "accountLabel": kc.get("accountLabel", "?"),
+                "tokenPrefix": kc.get("claudeAiOauth", {}).get("accessToken", "")[:20],
+                "source": f"keychain[{service}]",
+            }
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError, ValueError):
+        pass
+
+    # 2. Fall back to the plaintext credentials file.
+    if claude_config_dir is not None:
+        creds_path = claude_config_dir / ".credentials.json"
+    else:
+        creds_path = Path.home() / ".claude" / ".credentials.json"
+    try:
+        with open(creds_path) as f:
+            creds = _json.load(f)
+        symlink = ""
+        if creds_path.is_symlink():
+            symlink = f" -> {os.readlink(creds_path)}"
+        return {
+            "accountLabel": creds.get("accountLabel", "?"),
+            "tokenPrefix": creds.get("claudeAiOauth", {}).get("accessToken", "")[:20],
+            "source": f"file[{creds_path}]{symlink}",
+        }
+    except (OSError, ValueError):
+        pass
+
+    return {"accountLabel": "?", "tokenPrefix": "", "source": "none"}
+
+
+def check_quota(config: dict, force: bool = False,
+                claude_config_dir: Path | None = None) -> bool:
+    """Check if Claude quota is available. Returns True if OK.
+
+    Resolves the credential Claude Code will actually use for the given
+    ``claude_config_dir`` and asks the quota helper about *that* account
+    specifically — otherwise the helper checks whichever account happens to
+    own the default keychain entry, which may be a completely different
+    account from the one launched sessions hit.
+    """
     if force or FORCE_QUOTA_FILE.exists():
         return True
     cmd = os.path.expanduser(cfg_get(config, "claude", "quota_check", default=""))
     if not cmd:
         return True
+    args = [cmd]
+    resolved = resolve_claude_credential(claude_config_dir)
+    label = resolved.get("accountLabel", "")
+    if label and label != "?":
+        args += ["--account", label]
     try:
         result = subprocess.run(
-            [cmd], capture_output=True, text=True, timeout=30
+            args, capture_output=True, text=True, timeout=30
         )
         if result.returncode != 0:
             return False
@@ -1903,49 +1999,30 @@ def cleanup_worktree(wt_dir: str, branch: str):
 
 
 def _log_credential_state(session_uuid: str, claude_config_dir: Path | None = None):
-    """Log which credential sources are available at agent launch time.
+    """Log which credential Claude Code will actually use at agent launch time.
 
-    Records the account label and token prefix from both the credentials.json
-    file and the macOS keychain, so we can diagnose account-swap issues.
+    Reports the resolved credential (the one Claude Code will read from the
+    suffixed keychain entry, or fall back to from the credentials.json file)
+    and warns if it diverges from the default keychain entry — that
+    divergence is the canonical sign of the "wrong account" failure mode.
     """
-    import json as _json
-
     parts = [f"session={session_uuid[:8]}"]
 
-    # Check credentials.json (or symlink target)
-    if claude_config_dir is not None:
-        creds_path = claude_config_dir / ".credentials.json"
-    else:
-        creds_path = Path.home() / ".claude" / ".credentials.json"
-    try:
-        with open(creds_path) as f:
-            creds = _json.load(f)
-        label = creds.get("accountLabel", "?")
-        token = creds.get("claudeAiOauth", {}).get("accessToken", "")
-        symlink_target = ""
-        if creds_path.is_symlink():
-            symlink_target = f" -> {os.readlink(creds_path)}"
-        parts.append(f"file=[{label}] token={token[:20]}...{symlink_target}")
-    except Exception as e:
-        parts.append(f"file=error({e})")
+    resolved = resolve_claude_credential(claude_config_dir)
+    parts.append(
+        f"resolved=[{resolved['accountLabel']}] "
+        f"token={resolved['tokenPrefix']}... via {resolved['source']}"
+    )
 
-    # Check macOS keychain
-    try:
-        import subprocess as _sp
-        r = _sp.run(
-            ["security", "find-generic-password",
-             "-s", "Claude Code-credentials", "-a", os.getenv("USER", "kim"), "-w"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if r.returncode == 0 and r.stdout.strip():
-            kc = _json.loads(r.stdout.strip())
-            kc_label = kc.get("accountLabel", "?")
-            kc_token = kc.get("claudeAiOauth", {}).get("accessToken", "")
-            parts.append(f"keychain=[{kc_label}] token={kc_token[:20]}...")
-        else:
-            parts.append("keychain=empty")
-    except Exception as e:
-        parts.append(f"keychain=error({e})")
+    # If we're using an isolated config dir, also report the default-keychain
+    # account so divergence is visible in the log.
+    if claude_config_dir is not None:
+        default_resolved = resolve_claude_credential(None)
+        if default_resolved["accountLabel"] != resolved["accountLabel"]:
+            parts.append(
+                f"WARNING default keychain has [{default_resolved['accountLabel']}] "
+                f"-- isolated config diverges"
+            )
 
     log(f"Credential state at launch: {' | '.join(parts)}")
 
@@ -2141,7 +2218,8 @@ def agent_process_main(config: dict, agent_id: str | None = None,
         # --- Quota check ---
         state.status = "waiting_quota"
         state.write()
-        while not check_quota(config, force=state.force_quota):
+        while not check_quota(config, force=state.force_quota,
+                               claude_config_dir=claude_config_dir):
             if state.finishing:
                 break
             # Re-read state file to pick up force_quota toggled by TUI
