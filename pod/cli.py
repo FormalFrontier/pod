@@ -1801,6 +1801,11 @@ def setup_worktree(config: dict, short_id: str) -> tuple[str, str]:
 
     # Clean up any leftover worktree/branch from a crash
     if wt_dir.exists():
+        # Unlock first — locked worktrees survive prune even when the dir is gone
+        subprocess.run(
+            ["git", "-C", str(PROJECT_DIR), "worktree", "unlock", str(wt_dir)],
+            capture_output=True, timeout=10,
+        )
         shutil.rmtree(str(wt_dir), ignore_errors=True)
         subprocess.run(
             ["git", "-C", str(PROJECT_DIR), "worktree", "prune"],
@@ -1897,30 +1902,68 @@ def cleanup_worktree(wt_dir: str, branch: str):
     Uses shutil.rmtree instead of ``git worktree remove`` because the latter
     takes a git lock and can time out when many worktrees exist concurrently.
     After removing the directory we run ``git worktree prune`` to update git's
-    metadata.
+    metadata.  Errors are logged rather than silently suppressed.
     """
     if os.path.isdir(wt_dir):
+        # Unlock first so prune can clean up metadata
+        subprocess.run(
+            ["git", "-C", str(PROJECT_DIR), "worktree", "unlock", wt_dir],
+            capture_output=True, timeout=10,
+        )
         shutil.rmtree(wt_dir, ignore_errors=True)
+        if os.path.isdir(wt_dir):
+            log(f"Warning: failed to fully remove worktree {wt_dir}")
+
     # Tell git to prune stale worktree metadata (fast — just scans admin dir)
-    subprocess.run(
-        ["git", "-C", str(PROJECT_DIR), "worktree", "prune"],
-        capture_output=True, timeout=30,
-    )
-    subprocess.run(
+    try:
+        subprocess.run(
+            ["git", "-C", str(PROJECT_DIR), "worktree", "prune"],
+            capture_output=True, timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        log("Warning: git worktree prune timed out")
+
+    r = subprocess.run(
         ["git", "branch", "-D", branch],
+        capture_output=True, text=True, timeout=10, cwd=str(PROJECT_DIR),
+    )
+    if r.returncode != 0 and "not found" not in r.stderr:
+        log(f"Warning: git branch -D {branch} failed: {r.stderr.strip()}")
+
+
+CLEANUP_LOCK_PATH = POD_DIR / "cleanup.lock"
+CLEANUP_MIN_AGE_SECONDS = 120  # Don't delete worktrees younger than this
+
+
+def _is_pod_owned_worktree(entry: Path) -> bool:
+    """Check whether a worktree directory was created by pod.
+
+    Verifies that a corresponding ``agent/<dirname>`` branch exists, which
+    is the naming convention pod uses.  This prevents accidental deletion
+    of non-pod directories that happen to live under worktree_base.
+    """
+    branch = f"agent/{entry.name}"
+    r = subprocess.run(
+        ["git", "rev-parse", "--verify", f"refs/heads/{branch}"],
         capture_output=True, timeout=10, cwd=str(PROJECT_DIR),
     )
+    return r.returncode == 0
 
 
-def cleanup_stale_worktrees(config: dict, *, verbose: bool = False) -> int:
+def cleanup_stale_worktrees(config: dict, *, verbose: bool = False,
+                            min_age: float = CLEANUP_MIN_AGE_SECONDS,
+                            force: bool = False) -> int:
     """Remove worktree directories that no running agent owns.
 
-    Returns the number of worktrees removed.  JSONL session logs live in the
-    isolated Claude config dir (.pod/claude-config/projects/) and are NOT
-    touched by this function.
+    Returns the number of worktrees actually removed.  JSONL session logs
+    live in the isolated Claude config dir (.pod/claude-config/projects/)
+    and are NOT touched by this function.
 
-    Removals are parallelized with ``rm -rf`` subprocesses to avoid blocking
-    on large worktrees.
+    Uses a cross-process file lock so only one cleanup runs at a time
+    (prevents thundering-herd when many agents hit housekeeping together).
+    Skips worktrees younger than *min_age* seconds to avoid racing with
+    agents that are still setting up.  Only deletes directories that are
+    confirmed pod-owned (have a matching ``agent/<name>`` branch).
     """
     import concurrent.futures
 
@@ -1928,18 +1971,62 @@ def cleanup_stale_worktrees(config: dict, *, verbose: bool = False) -> int:
     if not base.is_dir():
         return 0
 
+    # --- Cross-process lock (non-blocking: skip if another process is cleaning) ---
+    CLEANUP_LOCK_PATH.touch(exist_ok=True)
+    lock_fd = open(CLEANUP_LOCK_PATH)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        # Another process holds the lock — skip this cycle
+        lock_fd.close()
+        if verbose:
+            log("Skipping stale worktree cleanup (another process holds the lock)")
+        return 0
+
+    try:
+        return _cleanup_stale_worktrees_locked(
+            config, base, verbose=verbose, min_age=min_age, force=force,
+        )
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        lock_fd.close()
+
+
+def _cleanup_stale_worktrees_locked(
+    config: dict, base: Path, *, verbose: bool, min_age: float, force: bool,
+) -> int:
+    """Inner cleanup implementation — caller must hold CLEANUP_LOCK_PATH."""
+    import concurrent.futures
+
     # Collect worktree dirs owned by live agents
     live_worktrees: set[str] = set()
     for agent in read_all_agents():
         if agent.worktree and agent.status != "dead":
             live_worktrees.add(agent.worktree)
 
+    now = time.time()
     stale: list[Path] = []
     for entry in sorted(base.iterdir()):
         if not entry.is_dir():
             continue
-        if str(entry) not in live_worktrees:
-            stale.append(entry)
+        if str(entry) in live_worktrees:
+            continue
+        # Age threshold: skip recently-created worktrees unless force
+        if not force:
+            try:
+                age = now - entry.stat().st_mtime
+            except OSError:
+                continue
+            if age < min_age:
+                if verbose:
+                    log(f"Skipping young worktree {entry.name} (age {age:.0f}s < {min_age:.0f}s)")
+                continue
+        # Ownership check: only delete pod-owned worktrees
+        if not _is_pod_owned_worktree(entry):
+            if verbose:
+                log(f"Skipping non-pod worktree {entry.name} (no agent/* branch)")
+            continue
+        stale.append(entry)
 
     if not stale:
         return 0
@@ -1947,38 +2034,62 @@ def cleanup_stale_worktrees(config: dict, *, verbose: bool = False) -> int:
     if verbose:
         log(f"Cleaning {len(stale)} stale worktree(s)...")
 
-    def _remove_one(entry: Path):
-        # Unlock worktree if locked (otherwise prune won't clean it up)
+    removed = 0
+    failed: list[str] = []
+
+    def _remove_one(entry: Path) -> bool:
+        """Remove one worktree. Returns True on success."""
+        # Only unlock if this is a pod-owned worktree (agent/* branch exists)
         subprocess.run(
             ["git", "-C", str(PROJECT_DIR), "worktree", "unlock",
              str(entry)],
             capture_output=True, timeout=10,
         )
-        subprocess.run(
+        r = subprocess.run(
             ["rm", "-rf", str(entry)],
             capture_output=True, timeout=120,
         )
+        return r.returncode == 0 and not entry.exists()
 
     # Parallel rm -rf — each is I/O-bound, so threads work well
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-        list(pool.map(_remove_one, stale))
+        futures = {pool.submit(_remove_one, e): e for e in stale}
+        for fut in concurrent.futures.as_completed(futures):
+            entry = futures[fut]
+            try:
+                if fut.result():
+                    removed += 1
+                else:
+                    failed.append(entry.name)
+                    log(f"Failed to remove worktree {entry.name}")
+            except Exception as exc:
+                failed.append(entry.name)
+                log(f"Exception removing worktree {entry.name}: {exc}")
 
-    # Prune metadata first, then delete branches (can't delete a branch
+    # Prune metadata, then delete branches (can't delete a branch
     # that git still thinks is checked out in a worktree)
-    subprocess.run(
-        ["git", "-C", str(PROJECT_DIR), "worktree", "prune"],
-        capture_output=True, timeout=30,
-    )
-    for entry in stale:
+    try:
         subprocess.run(
-            ["git", "branch", "-D", f"agent/{entry.name}"],
-            capture_output=True, timeout=10, cwd=str(PROJECT_DIR),
+            ["git", "-C", str(PROJECT_DIR), "worktree", "prune"],
+            capture_output=True, timeout=30,
         )
+    except subprocess.TimeoutExpired:
+        log("git worktree prune timed out")
+
+    for entry in stale:
+        if entry.name not in failed:
+            subprocess.run(
+                ["git", "branch", "-D", f"agent/{entry.name}"],
+                capture_output=True, timeout=10, cwd=str(PROJECT_DIR),
+            )
 
     if verbose:
-        log(f"Cleaned {len(stale)} stale worktree(s)")
+        msg = f"Cleaned {removed} stale worktree(s)"
+        if failed:
+            msg += f" ({len(failed)} failed: {', '.join(failed)})"
+        log(msg)
 
-    return len(stale)
+    return removed
 
 
 def _log_credential_state(session_uuid: str, claude_config_dir: Path | None = None):
@@ -2326,10 +2437,22 @@ def agent_process_main(config: dict, agent_id: str | None = None,
         # create-pr "PR already exists" shortcut from silently linking the
         # wrong issue.
         session_short = session_uuid[:8]
+
+        # Pre-register worktree in state BEFORE creation so that
+        # cleanup_stale_worktrees() won't delete it during setup.
+        base = PROJECT_DIR / cfg_get(config, "project", "worktree_base", default="worktrees")
+        wt_dir_expected = str(base / session_short)
+        branch_expected = f"agent/{session_short}"
+        state.worktree = wt_dir_expected
+        state.branch = branch_expected
+        state.write()
+
         try:
             wt_dir, branch = setup_worktree(config, session_short)
         except subprocess.CalledProcessError as e:
             log(f"Agent {short_id}: worktree setup failed: {e}")
+            state.worktree = ""
+            state.branch = ""
             if lock_name:
                 coordination(config, f"unlock-{lock_name}")
                 state.lock_held = ""
@@ -2340,6 +2463,8 @@ def agent_process_main(config: dict, agent_id: str | None = None,
 
         if not os.path.isdir(wt_dir):
             log(f"Agent {short_id}: worktree dir missing after setup_worktree returned: {wt_dir}")
+            state.worktree = ""
+            state.branch = ""
             if lock_name:
                 coordination(config, f"unlock-{lock_name}")
                 state.lock_held = ""
@@ -3424,15 +3549,54 @@ def cmd_cleanup(config: dict, args):
     for agent in read_all_agents():
         if agent.worktree and agent.status != "dead":
             live_worktrees.add(agent.worktree)
-    stale = [d for d in all_dirs if str(d) not in live_worktrees]
+
+    now = time.time()
+    min_age = 0 if args.force else CLEANUP_MIN_AGE_SECONDS
+    stale = []
+    skipped_young = 0
+    skipped_non_pod = 0
+    for d in sorted(all_dirs):
+        if str(d) in live_worktrees:
+            continue
+        if not args.force:
+            try:
+                age = now - d.stat().st_mtime
+            except OSError:
+                continue
+            if age < min_age:
+                skipped_young += 1
+                continue
+        if not _is_pod_owned_worktree(d):
+            skipped_non_pod += 1
+            continue
+        stale.append(d)
 
     if not stale:
-        print(f"All {len(all_dirs)} worktrees are owned by running agents.")
+        parts = [f"All {len(all_dirs)} worktrees are owned by running agents"]
+        if skipped_young:
+            parts.append(f"{skipped_young} skipped (too young, use --force)")
+        if skipped_non_pod:
+            parts.append(f"{skipped_non_pod} skipped (not pod-owned)")
+        print(". ".join(parts) + ".")
         return
 
     print(f"Found {len(stale)} stale worktrees (of {len(all_dirs)} total).")
+    if skipped_young:
+        print(f"  {skipped_young} skipped (younger than {CLEANUP_MIN_AGE_SECONDS}s, use --force)")
+    if skipped_non_pod:
+        print(f"  {skipped_non_pod} skipped (not pod-owned)")
 
-    removed = cleanup_stale_worktrees(config, verbose=True)
+    if args.dry_run:
+        for d in stale:
+            try:
+                age = now - d.stat().st_mtime
+            except OSError:
+                age = 0
+            print(f"  would remove: {d.name}  (age {age:.0f}s)")
+        print(f"Dry run: {len(stale)} worktrees would be removed.")
+        return
+
+    removed = cleanup_stale_worktrees(config, verbose=True, force=args.force)
     print(f"Removed {removed} stale worktrees.")
 
 
@@ -3649,7 +3813,11 @@ def main():
     p_kill.add_argument("target", help="Agent ID prefix or 'all'")
 
     sub.add_parser("status", help="Show aggregate status")
-    sub.add_parser("cleanup", help="Remove stale worktrees not owned by any agent")
+    p_cleanup = sub.add_parser("cleanup", help="Remove stale worktrees not owned by any agent")
+    p_cleanup.add_argument("--dry-run", "-n", action="store_true",
+                            help="Show what would be removed without deleting")
+    p_cleanup.add_argument("--force", "-f", action="store_true",
+                            help="Skip age threshold (remove all stale worktrees)")
 
     p_log = sub.add_parser("log", help="Tail agent session output")
     p_log.add_argument("target", nargs="?", default=None,
