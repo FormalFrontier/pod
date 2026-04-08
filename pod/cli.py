@@ -1948,29 +1948,37 @@ def cleanup_stale_worktrees(config: dict, *, verbose: bool = False) -> int:
         log(f"Cleaning {len(stale)} stale worktree(s)...")
 
     def _remove_one(entry: Path):
+        # Unlock worktree if locked (otherwise prune won't clean it up)
+        subprocess.run(
+            ["git", "-C", str(PROJECT_DIR), "worktree", "unlock",
+             str(entry)],
+            capture_output=True, timeout=10,
+        )
         subprocess.run(
             ["rm", "-rf", str(entry)],
             capture_output=True, timeout=120,
-        )
-        subprocess.run(
-            ["git", "branch", "-D", f"agent/{entry.name}"],
-            capture_output=True, timeout=10, cwd=str(PROJECT_DIR),
         )
 
     # Parallel rm -rf — each is I/O-bound, so threads work well
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
         list(pool.map(_remove_one, stale))
 
+    # Prune metadata first, then delete branches (can't delete a branch
+    # that git still thinks is checked out in a worktree)
     subprocess.run(
         ["git", "-C", str(PROJECT_DIR), "worktree", "prune"],
         capture_output=True, timeout=30,
     )
+    for entry in stale:
+        subprocess.run(
+            ["git", "branch", "-D", f"agent/{entry.name}"],
+            capture_output=True, timeout=10, cwd=str(PROJECT_DIR),
+        )
+
     if verbose:
         log(f"Cleaned {len(stale)} stale worktree(s)")
 
     return len(stale)
-
-    return removed
 
 
 def _log_credential_state(session_uuid: str, claude_config_dir: Path | None = None):
