@@ -13,6 +13,7 @@ Usage:
     pod finish [ID|all]  # Signal agent(s) to finish after current work
     pod kill [ID|all]    # Kill agent(s) immediately (unclaims issues)
     pod status           # Queue depth, agent count, total cost
+    pod cleanup          # Remove stale worktrees not owned by any agent
     pod log [ID]         # Tail agent's session stdout
     pod config           # Print current config
     pod coordination ... # Run bundled coordination script
@@ -1800,8 +1801,9 @@ def setup_worktree(config: dict, short_id: str) -> tuple[str, str]:
 
     # Clean up any leftover worktree/branch from a crash
     if wt_dir.exists():
+        shutil.rmtree(str(wt_dir), ignore_errors=True)
         subprocess.run(
-            ["git", "-C", str(PROJECT_DIR), "worktree", "remove", "--force", str(wt_dir)],
+            ["git", "-C", str(PROJECT_DIR), "worktree", "prune"],
             capture_output=True, timeout=30,
         )
     subprocess.run(
@@ -1890,16 +1892,71 @@ def copy_build_cache(wt_dir: str, config: dict):
 
 
 def cleanup_worktree(wt_dir: str, branch: str):
-    """Remove worktree and delete branch."""
+    """Remove worktree and delete branch.
+
+    Uses shutil.rmtree instead of ``git worktree remove`` because the latter
+    takes a git lock and can time out when many worktrees exist concurrently.
+    After removing the directory we run ``git worktree prune`` to update git's
+    metadata.
+    """
     if os.path.isdir(wt_dir):
-        subprocess.run(
-            ["git", "-C", str(PROJECT_DIR), "worktree", "remove", "--force", wt_dir],
-            capture_output=True, timeout=30,
-        )
+        shutil.rmtree(wt_dir, ignore_errors=True)
+    # Tell git to prune stale worktree metadata (fast — just scans admin dir)
+    subprocess.run(
+        ["git", "-C", str(PROJECT_DIR), "worktree", "prune"],
+        capture_output=True, timeout=30,
+    )
     subprocess.run(
         ["git", "branch", "-D", branch],
         capture_output=True, timeout=10, cwd=str(PROJECT_DIR),
     )
+
+
+def cleanup_stale_worktrees(config: dict, *, verbose: bool = False) -> int:
+    """Remove worktree directories that no running agent owns.
+
+    Returns the number of worktrees removed.  JSONL session logs live in the
+    isolated Claude config dir (.pod/claude-config/projects/) and are NOT
+    touched by this function.
+    """
+    base = PROJECT_DIR / cfg_get(config, "project", "worktree_base", default="worktrees")
+    if not base.is_dir():
+        return 0
+
+    # Collect worktree dirs owned by live agents
+    live_worktrees: set[str] = set()
+    for agent in read_all_agents():
+        if agent.worktree and agent.status != "dead":
+            live_worktrees.add(agent.worktree)
+
+    removed = 0
+    for entry in sorted(base.iterdir()):
+        if not entry.is_dir():
+            continue
+        wt_path = str(entry)
+        if wt_path in live_worktrees:
+            continue
+        # This worktree has no live agent — remove it
+        branch = f"agent/{entry.name}"
+        if verbose:
+            log(f"Cleaning stale worktree: {entry.name}")
+        shutil.rmtree(wt_path, ignore_errors=True)
+        subprocess.run(
+            ["git", "branch", "-D", branch],
+            capture_output=True, timeout=10, cwd=str(PROJECT_DIR),
+        )
+        removed += 1
+
+    if removed > 0:
+        # Single prune call after all removals
+        subprocess.run(
+            ["git", "-C", str(PROJECT_DIR), "worktree", "prune"],
+            capture_output=True, timeout=30,
+        )
+        if verbose:
+            log(f"Cleaned {removed} stale worktree(s)")
+
+    return removed
 
 
 def _log_credential_state(session_uuid: str, claude_config_dir: Path | None = None):
@@ -2173,6 +2230,10 @@ def agent_process_main(config: dict, agent_id: str | None = None,
                 pass
             try:
                 reconcile_untracked_github_claims()
+            except Exception:
+                pass
+            try:
+                cleanup_stale_worktrees(config, verbose=True)
             except Exception:
                 pass
 
@@ -3328,6 +3389,31 @@ def cmd_config(config: dict, args):
         print(CONFIG_PATH.read_text(), end="")
 
 
+def cmd_cleanup(config: dict, args):
+    """Remove stale worktrees that no running agent owns."""
+    base = PROJECT_DIR / cfg_get(config, "project", "worktree_base", default="worktrees")
+    if not base.is_dir():
+        print("No worktrees directory found.")
+        return
+
+    # Show current state
+    all_dirs = [d for d in base.iterdir() if d.is_dir()]
+    live_worktrees: set[str] = set()
+    for agent in read_all_agents():
+        if agent.worktree and agent.status != "dead":
+            live_worktrees.add(agent.worktree)
+    stale = [d for d in all_dirs if str(d) not in live_worktrees]
+
+    if not stale:
+        print(f"All {len(all_dirs)} worktrees are owned by running agents.")
+        return
+
+    print(f"Found {len(stale)} stale worktrees (of {len(all_dirs)} total).")
+
+    removed = cleanup_stale_worktrees(config, verbose=True)
+    print(f"Removed {removed} stale worktrees.")
+
+
 # ---------------------------------------------------------------------------
 # Init / Update / Coordination subcommands
 # ---------------------------------------------------------------------------
@@ -3541,6 +3627,7 @@ def main():
     p_kill.add_argument("target", help="Agent ID prefix or 'all'")
 
     sub.add_parser("status", help="Show aggregate status")
+    sub.add_parser("cleanup", help="Remove stale worktrees not owned by any agent")
 
     p_log = sub.add_parser("log", help="Tail agent session output")
     p_log.add_argument("target", nargs="?", default=None,
@@ -3584,6 +3671,8 @@ def main():
         cmd_kill(config, args)
     elif args.command == "status":
         cmd_status(config, args)
+    elif args.command == "cleanup":
+        cmd_cleanup(config, args)
     elif args.command == "log":
         cmd_log(config, args)
     elif args.command == "config":
