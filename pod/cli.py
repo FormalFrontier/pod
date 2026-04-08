@@ -1918,7 +1918,12 @@ def cleanup_stale_worktrees(config: dict, *, verbose: bool = False) -> int:
     Returns the number of worktrees removed.  JSONL session logs live in the
     isolated Claude config dir (.pod/claude-config/projects/) and are NOT
     touched by this function.
+
+    Removals are parallelized with ``rm -rf`` subprocesses to avoid blocking
+    on large worktrees.
     """
+    import concurrent.futures
+
     base = PROJECT_DIR / cfg_get(config, "project", "worktree_base", default="worktrees")
     if not base.is_dir():
         return 0
@@ -1929,32 +1934,41 @@ def cleanup_stale_worktrees(config: dict, *, verbose: bool = False) -> int:
         if agent.worktree and agent.status != "dead":
             live_worktrees.add(agent.worktree)
 
-    removed = 0
+    stale: list[Path] = []
     for entry in sorted(base.iterdir()):
         if not entry.is_dir():
             continue
-        wt_path = str(entry)
-        if wt_path in live_worktrees:
-            continue
-        # This worktree has no live agent — remove it
-        branch = f"agent/{entry.name}"
-        if verbose:
-            log(f"Cleaning stale worktree: {entry.name}")
-        shutil.rmtree(wt_path, ignore_errors=True)
+        if str(entry) not in live_worktrees:
+            stale.append(entry)
+
+    if not stale:
+        return 0
+
+    if verbose:
+        log(f"Cleaning {len(stale)} stale worktree(s)...")
+
+    def _remove_one(entry: Path):
         subprocess.run(
-            ["git", "branch", "-D", branch],
+            ["rm", "-rf", str(entry)],
+            capture_output=True, timeout=120,
+        )
+        subprocess.run(
+            ["git", "branch", "-D", f"agent/{entry.name}"],
             capture_output=True, timeout=10, cwd=str(PROJECT_DIR),
         )
-        removed += 1
 
-    if removed > 0:
-        # Single prune call after all removals
-        subprocess.run(
-            ["git", "-C", str(PROJECT_DIR), "worktree", "prune"],
-            capture_output=True, timeout=30,
-        )
-        if verbose:
-            log(f"Cleaned {removed} stale worktree(s)")
+    # Parallel rm -rf — each is I/O-bound, so threads work well
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(_remove_one, stale))
+
+    subprocess.run(
+        ["git", "-C", str(PROJECT_DIR), "worktree", "prune"],
+        capture_output=True, timeout=30,
+    )
+    if verbose:
+        log(f"Cleaned {len(stale)} stale worktree(s)")
+
+    return len(stale)
 
     return removed
 
