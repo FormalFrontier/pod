@@ -124,6 +124,9 @@ jsonl_stale_warning = 300          # Warn if JSONL unchanged for this many secon
 jsonl_missing_warning = 60         # Warn if JSONL not created after this many seconds
 max_claim_restarts = 1             # Max times to auto-restart a dead session before releasing claim
 show_costs = false                 # Show estimated API costs in TUI and status
+stuck_initial_timeout = 3600       # Seconds since last assistant output before first stuck check
+stuck_confirm_timeout = 1200       # Seconds to wait before confirming kill (after first detection)
+stuck_check_interval = 30          # Seconds between process health checks during stuck detection
 
 # --- Worker Types ---
 # Each [worker_types.<name>] defines a type of agent session.
@@ -583,6 +586,127 @@ def _pid_is_valid(pid: int, expected_start: float) -> bool:
         if actual > 0 and actual != expected_start:
             return False  # PID reused by a different process
     return True
+
+
+def _check_process_stuck(pid: int) -> tuple[bool, str]:
+    """Check if a claude subprocess (process group leader) appears stuck.
+
+    Checks two hard signals for the entire process group:
+      1. CPU usage: sum of %CPU across all group members must be < 0.5%
+      2. No network connections: no TCP/UDP sockets open by any group member
+
+    Child process state is logged for diagnostics but not used as a gate.
+
+    Returns (is_stuck, detail) where detail is a human-readable string.
+    Both hard signals must indicate stuck for is_stuck=True.
+    If any check fails, conservatively returns (False, ...).
+    """
+    details = []
+
+    # --- Get all processes in the process group ---
+    try:
+        result = subprocess.run(
+            ["ps", "ax", "-o", "pid=,pgid=,%cpu=,state="],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+        return (False, f"ps failed: {e}")
+
+    group_procs: list[tuple[int, float, str]] = []  # (pid, cpu, state)
+    for line in result.stdout.strip().splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        try:
+            p_pid = int(parts[0])
+            p_pgid = int(parts[1])
+            p_cpu = float(parts[2])
+            p_state = parts[3]
+        except (ValueError, IndexError):
+            continue
+        if p_pgid == pid:
+            group_procs.append((p_pid, p_cpu, p_state))
+
+    if not group_procs:
+        return (True, "process group empty (all processes gone)")
+
+    # --- CPU check (hard signal) ---
+    total_cpu = sum(cpu for _, cpu, _ in group_procs)
+    if total_cpu >= 0.5:
+        return (False, f"CPU active: {total_cpu:.1f}% across {len(group_procs)} processes")
+    details.append(f"cpu={total_cpu:.1f}%")
+
+    # --- Child state (diagnostic only, not a gate) ---
+    children = [(p, s) for p, _, s in group_procs if p != pid]
+    zombie_children = [(p, s) for p, s in children if s.startswith("Z")]
+    active_children = [(p, s) for p, s in children if not s.startswith("Z")]
+    if children:
+        if active_children:
+            details.append(f"children={len(children)} ({len(active_children)} active, "
+                           f"{len(zombie_children)} zombie)")
+        else:
+            details.append(f"children={len(children)} all zombie")
+    else:
+        details.append("no children")
+
+    # --- Network connections (hard signal) ---
+    all_pids = [str(p) for p, _, _ in group_procs]
+    pid_list_str = ",".join(all_pids)
+    try:
+        result = subprocess.run(
+            ["lsof", "-i", "-a", "-p", pid_list_str],
+            capture_output=True, text=True, timeout=10,
+        )
+        # lsof returns exit 1 when no matches found (normal for "no connections")
+        net_lines = [l for l in result.stdout.strip().splitlines()
+                     if l and not l.startswith("COMMAND")]
+        if net_lines:
+            return (False, f"network connections: {len(net_lines)} open sockets")
+        details.append("no network")
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+        return (False, f"lsof failed: {e}")
+
+    # --- Both hard signals indicate stuck ---
+    return (True, "; ".join(details))
+
+
+def _kill_stuck_subprocess(proc: subprocess.Popen) -> None:
+    """Kill a stuck claude subprocess and its entire process group.
+
+    Uses SIGTERM then SIGKILL escalation (same as _sigterm_handler).
+    Does NOT exit the agent process or do cleanup — the caller's monitor
+    loop detects proc.poll() != None and proceeds through normal
+    session-end logic (unclaiming, worktree cleanup, etc.).
+    """
+    try:
+        pgid = os.getpgid(proc.pid)
+    except (ProcessLookupError, OSError):
+        return  # Already dead
+
+    # SIGTERM first
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except (ProcessLookupError, OSError):
+        return
+
+    # Wait briefly for graceful shutdown
+    try:
+        proc.wait(timeout=5)
+        return  # Exited cleanly
+    except subprocess.TimeoutExpired:
+        pass
+
+    # SIGKILL — force kill
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, OSError):
+        pass
+
+    # Final wait to reap
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        log(f"WARNING: failed to reap stuck subprocess PID {proc.pid} after SIGKILL")
 
 
 def human_size(n: int) -> str:
@@ -2513,6 +2637,10 @@ def agent_process_main(config: dict, agent_id: str | None = None,
 
         # --- Monitor until claude exits ---
         _last_tracked_issue = 0
+        _stuck_first_detected = 0.0   # monotonic time of first stuck detection
+        _stuck_kill_pending = False    # True after phase-1 detection, waiting for confirm
+        _last_stuck_check = 0.0       # monotonic time of last health check
+
         while _claude_proc.poll() is None:
             state.write()
             # Track claim changes: write to history when claimed, clear when PR created
@@ -2523,6 +2651,57 @@ def agent_process_main(config: dict, agent_id: str | None = None,
             elif state.pr_number > 0 and state.claimed_issue > 0:
                 clear_claim(state.claimed_issue, session_uuid=state.uuid)
                 _last_tracked_issue = 0
+
+            # --- Stuck-agent detection ---
+            stuck_initial = _reload_config_value(
+                "monitor", "stuck_initial_timeout", default=3600)
+            stuck_confirm = _reload_config_value(
+                "monitor", "stuck_confirm_timeout", default=1200)
+            stuck_interval = _reload_config_value(
+                "monitor", "stuck_check_interval", default=30)
+
+            # Determine idle duration (wall-clock, since last_activity uses time.time)
+            if state.last_activity > 0:
+                idle = time.time() - state.last_activity
+            elif state.session_start > 0:
+                # Fallback: session never produced assistant output
+                idle = time.time() - state.session_start
+            else:
+                idle = 0
+
+            if idle >= stuck_initial and _claude_proc is not None:
+                now_mono = time.monotonic()
+                if now_mono - _last_stuck_check >= stuck_interval:
+                    _last_stuck_check = now_mono
+                    is_stuck, detail = _check_process_stuck(_claude_proc.pid)
+
+                    if is_stuck and not _stuck_kill_pending:
+                        # Phase 1: first stuck detection — log and start confirm timer
+                        _stuck_first_detected = now_mono
+                        _stuck_kill_pending = True
+                        log(f"Agent {short_id}: stuck detected "
+                            f"(idle {human_duration(idle)}, {detail}). "
+                            f"Will re-check in {human_duration(stuck_confirm)}.")
+                    elif is_stuck and _stuck_kill_pending and \
+                            now_mono - _stuck_first_detected >= stuck_confirm:
+                        # Phase 2: confirmed stuck — kill subprocess
+                        log(f"Agent {short_id}: KILLING stuck subprocess "
+                            f"(idle {human_duration(idle)}, confirmed after "
+                            f"{human_duration(now_mono - _stuck_first_detected)}). "
+                            f"Detail: {detail}")
+                        _kill_stuck_subprocess(_claude_proc)
+                        # Don't break — let poll() return non-None on next iteration
+                    elif not is_stuck and _stuck_kill_pending:
+                        # Activity detected — reset
+                        log(f"Agent {short_id}: stuck detection reset — "
+                            f"process showed activity: {detail}")
+                        _stuck_kill_pending = False
+                        _stuck_first_detected = 0.0
+            elif _stuck_kill_pending:
+                # New JSONL output arrived (idle dropped below threshold) — reset
+                _stuck_kill_pending = False
+                _stuck_first_detected = 0.0
+
             time.sleep(poll_interval)
 
         exit_code = _claude_proc.returncode
