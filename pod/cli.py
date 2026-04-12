@@ -99,11 +99,22 @@ session_dir = "sessions"           # Session stdout capture directory
 build_cache_dir = ".lake"          # Build cache to rsync into worktrees
 protected_files = ["PLAN.md"]      # Files agents may not modify in PRs
 
-[claude]
+[agent]
+backend = "claude"                 # "claude" or "codex"
+
+[agent.claude]
 model = "opus"                     # Claude model to use
 quota_check = "~/.claude/skills/claude-usage/claude-available-model"
+quota_check_required = true        # Hard-fail if quota unavailable
 quota_retry_seconds = 60           # Sleep duration when quota unavailable
 isolated_config = true             # Use isolated CLAUDE_CONFIG_DIR for agents
+
+[agent.codex]
+model = "gpt-5"                    # Codex model to use
+quota_check = "~/.claude/skills/claude-usage/codex-available-model"
+quota_check_required = false       # Proceed if quota cache missing/stale
+quota_retry_seconds = 60           # Sleep duration when quota unavailable
+isolated_config = true             # Use isolated CODEX_HOME for agents
 
 [pricing]
 # Dollars per million tokens
@@ -265,12 +276,13 @@ def ensure_config() -> dict:
     AGENTS_DIR.mkdir(parents=True, exist_ok=True)
     _claude_sync_check()
     with open(CONFIG_PATH, "rb") as f:
-        return tomllib.load(f)
+        cfg = tomllib.load(f)
+    return _migrate_legacy_config(cfg)
 
 
 def get_claude_config_dir(config: dict) -> Path | None:
     """Return isolated CLAUDE_CONFIG_DIR path, or None if disabled. No side effects."""
-    if not cfg_get(config, "claude", "isolated_config", default=False):
+    if not _backend_cfg(config, "isolated_config", default=False):
         return None
     return ISOLATED_CONFIG_DIR
 
@@ -324,6 +336,33 @@ def cfg_get(config: dict, *keys, default=None):
         else:
             return default
     return d
+
+
+def _backend(config: dict) -> str:
+    """Return the agent backend name ('claude' or 'codex')."""
+    return cfg_get(config, "agent", "backend", default="claude")
+
+
+def _backend_cfg(config: dict, *keys, default=None):
+    """Read a backend-specific config value.
+    e.g. _backend_cfg(config, 'model') reads agent.<backend>.model."""
+    return cfg_get(config, "agent", _backend(config), *keys, default=default)
+
+
+def _migrate_legacy_config(cfg: dict) -> dict:
+    """Migrate legacy top-level [claude] section to [agent.claude]."""
+    if "claude" not in cfg:
+        return cfg
+    agent = cfg.get("agent", {})
+    if "claude" in agent:
+        raise SystemExit(
+            "Config error: both [claude] and [agent.claude] exist — "
+            "remove the legacy [claude] section"
+        )
+    log("Deprecation: [claude] section is now [agent.claude]; migrating in memory")
+    cfg.setdefault("agent", {}).setdefault("backend", "claude")
+    cfg["agent"]["claude"] = cfg.pop("claude")
+    return cfg
 
 
 # ---------------------------------------------------------------------------
@@ -441,6 +480,7 @@ class AgentState:
     """Mutable state for one agent, serialised to .pod/agents/<id>.json."""
     short_id: str = ""
     uuid: str = ""
+    backend_session_id: str = ""  # Backend-native id (Codex thread_id, or same as uuid for Claude)
     pid: int = 0
     pid_start_time: float = 0.0    # /proc start time — detects PID reuse
     worker_type: str = ""          # e.g. "work", "plan"
@@ -837,6 +877,10 @@ def _reload_config_value(*keys, default=None):
     try:
         with open(CONFIG_PATH, "rb") as f:
             cfg = tomllib.load(f)
+        # Support legacy [claude] config
+        if "claude" in cfg and "agent" not in cfg:
+            cfg.setdefault("agent", {})["claude"] = cfg.pop("claude")
+            cfg["agent"].setdefault("backend", "claude")
         for k in keys:
             cfg = cfg[k]
         return cfg
@@ -844,25 +888,41 @@ def _reload_config_value(*keys, default=None):
         return default
 
 
+_MODEL_TIER: dict[str, dict[str, int]] = {
+    "claude": {"opus": 2, "sonnet": 1, "haiku": 0},
+    "codex": {"gpt-5": 2, "gpt-5-codex": 2, "gpt-5-mini": 1, "o3": 2, "o3-mini": 1},
+}
+
+
+def _model_tier(backend: str, model: str) -> int:
+    """Return the capability tier (higher = more capable) for a model."""
+    return _MODEL_TIER.get(backend, {}).get(model, 0)
+
+
 def check_quota(config: dict, force: bool = False) -> bool:
-    """Check if Claude quota is available. Returns True if OK."""
+    """Check if agent quota is available. Returns True if OK."""
     if force or FORCE_QUOTA_FILE.exists():
         return True
-    cmd = os.path.expanduser(cfg_get(config, "claude", "quota_check", default=""))
+    cmd = os.path.expanduser(_backend_cfg(config, "quota_check", default=""))
     if not cmd:
         return True
+    quota_required = _backend_cfg(config, "quota_check_required", default=True)
     try:
         result = subprocess.run(
             [cmd], capture_output=True, text=True, timeout=30
         )
+        if result.returncode == 2 and not quota_required:
+            # Exit 2 = cache missing/stale; proceed if quota check is optional
+            log("quota_check returned 2 (unknown); proceeding because quota_check_required=false")
+            return True
         if result.returncode != 0:
             return False
         available = result.stdout.strip()
         # Re-read model from disk so config.toml edits take effect without restart.
-        required = _reload_config_value("claude", "model", default="opus")
+        backend = _backend(config)
+        required = _reload_config_value("agent", backend, "model", default="opus")
         # Model tier: higher-tier availability satisfies lower-tier requirements.
-        _MODEL_TIER = {"opus": 2, "sonnet": 1}
-        return _MODEL_TIER.get(available, 0) >= _MODEL_TIER.get(required, 0)
+        return _model_tier(backend, available) >= _model_tier(backend, required)
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         return False
 
@@ -2269,7 +2329,8 @@ def launch_claude(config: dict, session_uuid: str, prompt: str,
                    claude_config_dir: Path | None = None) -> subprocess.Popen:
     """Launch claude in the worktree directory."""
     # Re-read model from disk so config.toml edits take effect without restart.
-    model = _reload_config_value("claude", "model", default="opus")
+    backend = _reload_config_value("agent", "backend", default="claude")
+    model = _reload_config_value("agent", backend, "model", default="opus")
     session_dir = PROJECT_DIR / cfg_get(config, "project", "session_dir", default="sessions")
     session_dir.mkdir(parents=True, exist_ok=True)
     stdout_path = session_dir / f"{session_uuid}.stdout"
@@ -2434,7 +2495,7 @@ def agent_process_main(config: dict, agent_id: str | None = None,
     signal.signal(signal.SIGUSR1, _sigusr1_handler)
 
     poll_interval = cfg_get(config, "monitor", "poll_interval", default=2)
-    quota_retry = cfg_get(config, "claude", "quota_retry_seconds", default=60)
+    quota_retry = _backend_cfg(config, "quota_retry_seconds", default=60)
     worker_types = cfg_get(config, "worker_types", default={})
     pricing = cfg_get(config, "pricing", default={})
 
