@@ -1168,7 +1168,8 @@ def fetch_blocked_deps() -> dict[int, list[int]]:
 # JSONL Monitor (runs as a thread inside agent process)
 # ---------------------------------------------------------------------------
 
-def jsonl_monitor(jsonl_path: str, state: AgentState, stop: threading.Event):
+def jsonl_monitor(jsonl_path: str, state: AgentState, stop: threading.Event,
+                  backend: str = "claude"):
     """Poll JSONL file and update agent state. Runs in a daemon thread."""
     pos = 0
     while not stop.is_set():
@@ -1185,13 +1186,73 @@ def jsonl_monitor(jsonl_path: str, state: AgentState, stop: threading.Event):
                     if not line.endswith(b"\n"):
                         break  # Partial line — retry next poll
                     pos += len(line)
-                    _parse_jsonl_line(line, state)
+                    _parse_jsonl_line(line, state, backend)
         except OSError:
             pass
         stop.wait(1)
 
 
-def _parse_jsonl_line(line: bytes, state: AgentState):
+def _parse_jsonl_line(line: bytes, state: AgentState, backend: str = "claude"):
+    """Dispatch JSONL parsing to the appropriate backend parser."""
+    if backend == "codex":
+        _parse_codex_jsonl_line(line, state)
+    else:
+        _parse_claude_jsonl_line(line, state)
+
+
+def _parse_codex_jsonl_line(line: bytes, state: AgentState):
+    """Parse one JSONL line from Codex --json stdout and update state.
+
+    Codex stdout event types (verified from codex exec --json v0.104.0):
+      thread.started   → capture backend_session_id for resume
+      turn.completed   → token usage
+      item.completed   → agent_message (text), command_execution (tool output)
+    """
+    try:
+        d = json.loads(line)
+    except json.JSONDecodeError:
+        return
+
+    t = d.get("type")
+
+    if t == "thread.started":
+        # Capture Codex thread id for resume; do NOT overwrite state.uuid
+        if not state.backend_session_id:
+            state.backend_session_id = d.get("thread_id", "")
+        state.last_activity = time.time()
+
+    elif t == "turn.completed":
+        usage = d.get("usage", {})
+        state.tokens_in += usage.get("input_tokens", 0)
+        state.cache_read += usage.get("cached_input_tokens", 0)
+        state.tokens_out += usage.get("output_tokens", 0)
+        # Codex has no cache_creation_input_tokens equivalent
+        state.last_activity = time.time()
+
+    elif t == "item.completed":
+        item = d.get("item", {})
+        itype = item.get("type")
+        if itype == "agent_message":
+            text = item.get("text", "").strip()
+            if text:
+                state.last_text = text[:200]
+                state.last_activity = time.time()
+        elif itype == "command_execution":
+            cmd = item.get("command", "")[:120]
+            state.last_text = f"[exec] {cmd}"
+            state.last_activity = time.time()
+            # Detect claim from coordination script output
+            output = item.get("aggregated_output", "")
+            m = re.search(r"Claimed issue #(\d+)", output)
+            if m:
+                state.claimed_issue = int(m.group(1))
+            # Detect PR creation from coordination create-pr
+            m2 = re.search(r"(?:coordination\s+create-pr\s+(?:--\S+\s+)*)(\d+)", cmd)
+            if m2:
+                state.pr_number = int(m2.group(1))
+
+
+def _parse_claude_jsonl_line(line: bytes, state: AgentState):
     """Parse one JSONL line and update state."""
     try:
         d = json.loads(line)
@@ -2033,40 +2094,78 @@ def _pod_installed_files() -> list[str]:
     return result
 
 
-def install_agent_config(wt_dir: str):
-    """Install bundled commands, skills, and agent CLAUDE.md into worktree.
+def install_agent_config(wt_dir: str, backend: str = "claude"):
+    """Install bundled commands, skills, and agent instructions into worktree.
 
-    Merges the bundled agent-config/claude into the worktree's .claude/
-    directory so that Claude can find slash commands (/feature, /summarize,
-    etc.) and the agent-worker-flow skill.  The bundled agent CLAUDE.md is
-    appended to the project's existing CLAUDE.md so the agent gets both
-    project context and pod-specific instructions.
+    For Claude: merges agent-config/claude into .claude/ (commands, skills,
+    CLAUDE.md).
+    For Codex: installs AGENTS.md at worktree root. Skills are installed
+    into CODEX_HOME by _setup_codex_home(). Commands are read at launch
+    time by _worker_prompt() and delivered via stdin.
     """
-    data_config = _data_dir() / "agent-config" / "claude"
-    wt_claude = Path(wt_dir) / ".claude"
-    wt_claude.mkdir(parents=True, exist_ok=True)
+    data_config = _data_dir() / "agent-config" / backend
 
-    # Commands
-    src_cmds = data_config / "commands"
-    if src_cmds.is_dir():
-        dst_cmds = wt_claude / "commands"
-        shutil.copytree(str(src_cmds), str(dst_cmds), dirs_exist_ok=True)
+    if backend == "codex":
+        # Install AGENTS.md at worktree root
+        agent_md = data_config / "AGENTS.md"
+        if agent_md.is_file():
+            dst_md = Path(wt_dir) / "AGENTS.md"
+            existing = dst_md.read_text() if dst_md.is_file() else ""
+            agent_text = agent_md.read_text()
+            if agent_text not in existing:
+                with open(dst_md, "a") as f:
+                    f.write("\n\n" + agent_text)
+        # Skills and commands are handled by _setup_codex_home and
+        # _worker_prompt respectively — nothing else to install here.
+    else:
+        # Claude: install into .claude/
+        wt_claude = Path(wt_dir) / ".claude"
+        wt_claude.mkdir(parents=True, exist_ok=True)
 
-    # Skills
-    src_skills = data_config / "skills"
-    if src_skills.is_dir():
-        dst_skills = wt_claude / "skills"
-        shutil.copytree(str(src_skills), str(dst_skills), dirs_exist_ok=True)
+        # Commands
+        src_cmds = data_config / "commands"
+        if src_cmds.is_dir():
+            dst_cmds = wt_claude / "commands"
+            shutil.copytree(str(src_cmds), str(dst_cmds), dirs_exist_ok=True)
 
-    # Append agent CLAUDE.md to project CLAUDE.md
-    agent_md = data_config / "CLAUDE.md"
-    if agent_md.is_file():
-        dst_md = wt_claude / "CLAUDE.md"
-        existing = dst_md.read_text() if dst_md.is_file() else ""
-        agent_text = agent_md.read_text()
-        if agent_text not in existing:
-            with open(dst_md, "a") as f:
-                f.write("\n\n" + agent_text)
+        # Skills
+        src_skills = data_config / "skills"
+        if src_skills.is_dir():
+            dst_skills = wt_claude / "skills"
+            shutil.copytree(str(src_skills), str(dst_skills), dirs_exist_ok=True)
+
+        # Append agent CLAUDE.md to project CLAUDE.md
+        agent_md = data_config / "CLAUDE.md"
+        if agent_md.is_file():
+            dst_md = wt_claude / "CLAUDE.md"
+            existing = dst_md.read_text() if dst_md.is_file() else ""
+            agent_text = agent_md.read_text()
+            if agent_text not in existing:
+                with open(dst_md, "a") as f:
+                    f.write("\n\n" + agent_text)
+
+
+def _worker_prompt(config: dict, worker_type: str) -> str:
+    """Return the prompt text for a given worker type.
+
+    For Claude: returns the slash command name (e.g. "/work").
+    For Codex: reads the command template file and returns its full text,
+    since Codex has no slash command system.
+    """
+    backend = _backend(config)
+    worker_types = cfg_get(config, "worker_types", default={})
+    wt_cfg = worker_types.get(worker_type, {})
+    prompt = wt_cfg.get("prompt", f"/{worker_type}")
+
+    if backend == "codex" and prompt.startswith("/"):
+        # Slash command — resolve to the command template file body
+        cmd_name = prompt.lstrip("/")
+        cmd_file = _data_dir() / "agent-config" / "codex" / "commands" / f"{cmd_name}.md"
+        if cmd_file.is_file():
+            return cmd_file.read_text()
+        # Fallback: use the command name as-is
+        log(f"Warning: no Codex command template for '{cmd_name}', using raw prompt")
+    return prompt
 
 
 def copy_build_cache(wt_dir: str, config: dict):
@@ -2327,7 +2426,7 @@ def _log_credential_state(session_uuid: str, claude_config_dir: Path | None = No
 def launch_agent(config: dict, session_uuid: str, prompt: str,
                    wt_dir: str,
                    claude_config_dir: Path | None = None) -> subprocess.Popen:
-    """Launch claude in the worktree directory."""
+    """Launch agent subprocess (Claude or Codex) in the worktree directory."""
     # Re-read model from disk so config.toml edits take effect without restart.
     backend = _reload_config_value("agent", "backend", default="claude")
     model = _reload_config_value("agent", backend, "model", default="opus")
@@ -2335,35 +2434,59 @@ def launch_agent(config: dict, session_uuid: str, prompt: str,
     session_dir.mkdir(parents=True, exist_ok=True)
     stdout_path = session_dir / f"{session_uuid}.stdout"
 
-    # Determine JSONL dir for this worktree
-    jsonl_dir = _claude_projects_dir(claude_config_dir) / wt_dir.replace("/", "-")
-
-    # Check if we can resume an existing session
-    local_jsonl = jsonl_dir / f"{session_uuid}.jsonl"
-    claude_args = ["claude", "--model", model]
-    if local_jsonl.exists():
-        claude_args += ["--resume", session_uuid]
-    else:
-        claude_args += ["--session-id", session_uuid]
-    if claude_config_dir is not None:
-        claude_args += ["--dangerously-skip-permissions"]
-    claude_args += ["-p", prompt]
-
     env = dict(os.environ)
-    env["ANTHROPIC_API_KEY"] = ""  # Force subscription auth
     env["POD_SESSION_ID"] = session_uuid
-    env["POD_IS_RESUME"] = "1" if local_jsonl.exists() else "0"
     # Inject bundled data dir into PATH so agents find `coordination`
     env["PATH"] = str(_data_dir()) + os.pathsep + env.get("PATH", "")
-    if claude_config_dir is not None:
-        env["CLAUDE_CONFIG_DIR"] = str(claude_config_dir)
 
-    # Log credential state at launch for debugging account-swap issues
-    _log_credential_state(session_uuid, claude_config_dir)
+    stdin_pipe = None  # Only used for Codex (stdin prompt delivery)
+
+    if backend == "codex":
+        # --- Codex launch ---
+        codex_args = ["codex", "exec", "--json",
+                      "--dangerously-bypass-approvals-and-sandbox",
+                      "--skip-git-repo-check",
+                      "-m", model,
+                      "-C", wt_dir,
+                      "-"]  # Read prompt from stdin
+        env["OPENAI_API_KEY"] = ""  # Force subscription auth
+        env["POD_IS_RESUME"] = "0"
+
+        # Set up isolated CODEX_HOME if configured
+        codex_home = _setup_codex_home(config, wt_dir)
+        if codex_home:
+            env["CODEX_HOME"] = str(codex_home)
+
+        stdin_pipe = subprocess.PIPE
+        agent_args = codex_args
+    else:
+        # --- Claude launch (existing behavior) ---
+        jsonl_dir = _claude_projects_dir(claude_config_dir) / wt_dir.replace("/", "-")
+        local_jsonl = jsonl_dir / f"{session_uuid}.jsonl"
+
+        claude_args = ["claude", "--model", model]
+        if local_jsonl.exists():
+            claude_args += ["--resume", session_uuid]
+        else:
+            claude_args += ["--session-id", session_uuid]
+        if claude_config_dir is not None:
+            claude_args += ["--dangerously-skip-permissions"]
+        claude_args += ["-p", prompt]
+
+        env["ANTHROPIC_API_KEY"] = ""  # Force subscription auth
+        env["POD_IS_RESUME"] = "1" if local_jsonl.exists() else "0"
+        if claude_config_dir is not None:
+            env["CLAUDE_CONFIG_DIR"] = str(claude_config_dir)
+
+        # Log credential state at launch for debugging account-swap issues
+        _log_credential_state(session_uuid, claude_config_dir)
+
+        agent_args = claude_args
 
     stdout_fd = os.open(str(stdout_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
     proc = subprocess.Popen(
-        claude_args,
+        agent_args,
+        stdin=stdin_pipe,
         stdout=stdout_fd,
         stderr=subprocess.STDOUT,
         cwd=wt_dir,
@@ -2371,12 +2494,69 @@ def launch_agent(config: dict, session_uuid: str, prompt: str,
         start_new_session=True,  # Create process group for clean killing
     )
     os.close(stdout_fd)  # Child inherited it; parent no longer needs it
+
+    # For Codex, deliver prompt via stdin and close
+    if backend == "codex" and proc.stdin is not None:
+        try:
+            proc.stdin.write(prompt.encode())
+            proc.stdin.close()
+        except OSError:
+            pass  # Process may have exited immediately
+
     return proc
 
 
+def _setup_codex_home(config: dict, wt_dir: str) -> Path | None:
+    """Create an isolated CODEX_HOME directory for a Codex agent.
+
+    Sets up skills from the bundled agent-config/codex/ and symlinks
+    auth from ~/.codex/auth.json so the agent uses the user's login.
+    Returns the CODEX_HOME path, or None if isolation is disabled.
+    """
+    if not _backend_cfg(config, "isolated_config", default=True):
+        return None
+
+    codex_home = Path(wt_dir) / ".pod-codex-home"
+    codex_home.mkdir(parents=True, exist_ok=True)
+
+    # Symlink auth from user's global Codex config
+    real_codex = Path.home() / ".codex"
+    auth_link = codex_home / "auth.json"
+    auth_target = real_codex / "auth.json"
+    if auth_target.exists():
+        try:
+            auth_link.unlink(missing_ok=True)
+            auth_link.symlink_to(auth_target)
+        except FileExistsError:
+            pass
+
+    # Copy config.toml from user's global config if it exists
+    user_config = real_codex / "config.toml"
+    if user_config.exists():
+        dest_config = codex_home / "config.toml"
+        if not dest_config.exists():
+            shutil.copy2(str(user_config), str(dest_config))
+
+    # Install bundled skills
+    data_skills = _data_dir() / "agent-config" / "codex" / "skills"
+    if data_skills.is_dir():
+        dst_skills = codex_home / "skills"
+        shutil.copytree(str(data_skills), str(dst_skills), dirs_exist_ok=True)
+
+    return codex_home
+
+
 def get_jsonl_path(wt_dir: str, session_uuid: str,
-                   claude_config_dir: Path | None = None) -> str:
-    """Compute JSONL file path for a session."""
+                   claude_config_dir: Path | None = None,
+                   backend: str = "claude") -> str:
+    """Compute JSONL file path for a session.
+
+    For Claude: reads from ~/.claude/projects/{wt_dir}/{uuid}.jsonl
+    For Codex: reads from sessions/{uuid}.stdout (the --json stream)
+    """
+    if backend == "codex":
+        session_dir = PROJECT_DIR / "sessions"
+        return str(session_dir / f"{session_uuid}.stdout")
     jsonl_dir = _claude_projects_dir(claude_config_dir) / wt_dir.replace("/", "-")
     return str(jsonl_dir / f"{session_uuid}.jsonl")
 
@@ -2593,7 +2773,7 @@ def agent_process_main(config: dict, agent_id: str | None = None,
 
             consecutive_wait = 0  # Reset backoff on successful dispatch
             wt_config = worker_types.get(chosen_type, {})
-            prompt = wt_config.get("prompt", f"/{chosen_type}")
+            prompt = _worker_prompt(config, chosen_type)
             lock_name = wt_config.get("lock", "")
 
             state.worker_type = chosen_type
@@ -2662,30 +2842,32 @@ def agent_process_main(config: dict, agent_id: str | None = None,
         state.branch = branch
         state.git_start = _git_rev(wt_dir)
 
-        install_agent_config(wt_dir)
+        install_agent_config(wt_dir, backend=_backend(config))
 
         if wt_config.get("copy_build_cache", wt_config.get("copy_lake_cache", False)):
             copy_build_cache(wt_dir, config)
 
         # --- Start JSONL monitor ---
-        jsonl_path = get_jsonl_path(wt_dir, session_uuid, claude_config_dir)
+        jsonl_path = get_jsonl_path(wt_dir, session_uuid, claude_config_dir,
+                                    backend=_backend(config))
         stop_monitor = threading.Event()
         monitor_thread = threading.Thread(
-            target=jsonl_monitor, args=(jsonl_path, state, stop_monitor),
+            target=jsonl_monitor,
+            args=(jsonl_path, state, stop_monitor, _backend(config)),
             daemon=True,
         )
         monitor_thread.start()
 
-        # --- Launch claude ---
+        # --- Launch agent ---
         state.status = "running"
         state.write()
-        log(f"Agent {short_id}: launching claude session {session_uuid} in {wt_dir}")
+        log(f"Agent {short_id}: launching {_backend(config)} session {session_uuid} in {wt_dir}")
 
         try:
             _agent_proc = launch_agent(config, session_uuid, prompt, wt_dir,
                                         claude_config_dir)
         except (OSError, FileNotFoundError) as e:
-            log(f"Agent {short_id}: failed to launch claude: {e}")
+            log(f"Agent {short_id}: failed to launch {_backend(config)}: {e}")
             stop_monitor.set()
             cleanup_worktree(wt_dir, branch)
             if lock_name:
