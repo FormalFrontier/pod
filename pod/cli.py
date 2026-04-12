@@ -163,7 +163,7 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _claude_sync_check():
+def _agent_config_sync_check():
     """Compare pod template commands/skills with the project .claude/ and report/update.
 
     Uses .claude/.pod-checksums to track what pod last installed, enabling
@@ -174,7 +174,7 @@ def _claude_sync_check():
       - no checksums file yet            → bootstrap: record current hashes,
                                            warn on any differences
     """
-    data_config = _data_dir() / "claude-config"
+    data_config = _data_dir() / "agent-config" / "claude"
     proj_claude = PROJECT_DIR / ".claude"
     checksums_file = proj_claude / ".pod-checksums"
 
@@ -274,22 +274,22 @@ def ensure_config() -> dict:
         print(f"No .pod/config.toml found. Run 'pod init' first.", file=sys.stderr)
         sys.exit(1)
     AGENTS_DIR.mkdir(parents=True, exist_ok=True)
-    _claude_sync_check()
+    _agent_config_sync_check()
     with open(CONFIG_PATH, "rb") as f:
         cfg = tomllib.load(f)
     return _migrate_legacy_config(cfg)
 
 
-def get_claude_config_dir(config: dict) -> Path | None:
+def get_isolated_config_dir(config: dict) -> Path | None:
     """Return isolated CLAUDE_CONFIG_DIR path, or None if disabled. No side effects."""
     if not _backend_cfg(config, "isolated_config", default=False):
         return None
     return ISOLATED_CONFIG_DIR
 
 
-def ensure_claude_config(config: dict) -> Path | None:
+def ensure_isolated_config(config: dict) -> Path | None:
     """Set up isolated CLAUDE_CONFIG_DIR for agents. Returns path or None if disabled."""
-    config_dir = get_claude_config_dir(config)
+    config_dir = get_isolated_config_dir(config)
     if config_dir is None:
         return None
 
@@ -2018,11 +2018,11 @@ def setup_worktree(config: dict, short_id: str) -> tuple[str, str]:
 def _pod_installed_files() -> list[str]:
     """Return list of .claude/ relative paths that pod delivers.
 
-    Scans the bundled claude-config for commands and skills files.
+    Scans the bundled agent-config/claude for commands and skills files.
     These are automatically added to the protected-files list so agents
     cannot modify pod-delivered files in PRs (but can create new ones).
     """
-    data_config = _data_dir() / "claude-config"
+    data_config = _data_dir() / "agent-config" / "claude"
     result: list[str] = []
     for subdir in ("commands", "skills"):
         src = data_config / subdir
@@ -2036,13 +2036,13 @@ def _pod_installed_files() -> list[str]:
 def install_agent_config(wt_dir: str):
     """Install bundled commands, skills, and agent CLAUDE.md into worktree.
 
-    Merges the bundled claude-config into the worktree's .claude/ directory
-    so that Claude can find slash commands (/feature, /summarize, etc.) and
-    the agent-worker-flow skill.  The bundled agent CLAUDE.md is appended to
-    the project's existing CLAUDE.md so the agent gets both project context
-    and pod-specific instructions.
+    Merges the bundled agent-config/claude into the worktree's .claude/
+    directory so that Claude can find slash commands (/feature, /summarize,
+    etc.) and the agent-worker-flow skill.  The bundled agent CLAUDE.md is
+    appended to the project's existing CLAUDE.md so the agent gets both
+    project context and pod-specific instructions.
     """
-    data_config = _data_dir() / "claude-config"
+    data_config = _data_dir() / "agent-config" / "claude"
     wt_claude = Path(wt_dir) / ".claude"
     wt_claude.mkdir(parents=True, exist_ok=True)
 
@@ -2324,7 +2324,7 @@ def _log_credential_state(session_uuid: str, claude_config_dir: Path | None = No
     log(f"Credential state at launch: {' | '.join(parts)}")
 
 
-def launch_claude(config: dict, session_uuid: str, prompt: str,
+def launch_agent(config: dict, session_uuid: str, prompt: str,
                    wt_dir: str,
                    claude_config_dir: Path | None = None) -> subprocess.Popen:
     """Launch claude in the worktree directory."""
@@ -2387,13 +2387,13 @@ def get_jsonl_path(wt_dir: str, session_uuid: str,
 
 # Globals for signal handlers
 _agent_state: AgentState | None = None
-_claude_proc: subprocess.Popen | None = None
+_agent_proc: subprocess.Popen | None = None
 _agent_config: dict = {}
 
 
 def _sigterm_handler(signum, frame):
     """Handle SIGTERM: kill claude, unclaim, cleanup, exit."""
-    global _agent_state, _claude_proc, _agent_config
+    global _agent_state, _agent_proc, _agent_config
     state = _agent_state
     config = _agent_config
 
@@ -2403,16 +2403,16 @@ def _sigterm_handler(signum, frame):
         state.write()
 
     # Kill claude subprocess
-    if _claude_proc and _claude_proc.poll() is None:
+    if _agent_proc and _agent_proc.poll() is None:
         try:
-            os.killpg(os.getpgid(_claude_proc.pid), signal.SIGTERM)
+            os.killpg(os.getpgid(_agent_proc.pid), signal.SIGTERM)
         except (ProcessLookupError, OSError):
             pass
         try:
-            _claude_proc.wait(timeout=5)
+            _agent_proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             try:
-                os.killpg(os.getpgid(_claude_proc.pid), signal.SIGKILL)
+                os.killpg(os.getpgid(_agent_proc.pid), signal.SIGKILL)
             except (ProcessLookupError, OSError):
                 pass
 
@@ -2474,7 +2474,7 @@ def _sigusr1_handler(signum, frame):
 def agent_process_main(config: dict, agent_id: str | None = None,
                         resume_uuid: str | None = None):
     """Entry point for a forked agent process. Runs the agent loop."""
-    global _agent_state, _claude_proc, _agent_config
+    global _agent_state, _agent_proc, _agent_config
     _agent_config = config
 
     short_id = agent_id or uuid.uuid4().hex[:8]
@@ -2499,7 +2499,7 @@ def agent_process_main(config: dict, agent_id: str | None = None,
     worker_types = cfg_get(config, "worker_types", default={})
     pricing = cfg_get(config, "pricing", default={})
 
-    claude_config_dir = ensure_claude_config(config)
+    claude_config_dir = ensure_isolated_config(config)
     if claude_config_dir:
         log(f"Agent {short_id}: using isolated CLAUDE_CONFIG_DIR={claude_config_dir}")
 
@@ -2682,7 +2682,7 @@ def agent_process_main(config: dict, agent_id: str | None = None,
         log(f"Agent {short_id}: launching claude session {session_uuid} in {wt_dir}")
 
         try:
-            _claude_proc = launch_claude(config, session_uuid, prompt, wt_dir,
+            _agent_proc = launch_agent(config, session_uuid, prompt, wt_dir,
                                         claude_config_dir)
         except (OSError, FileNotFoundError) as e:
             log(f"Agent {short_id}: failed to launch claude: {e}")
@@ -2702,7 +2702,7 @@ def agent_process_main(config: dict, agent_id: str | None = None,
         _stuck_kill_pending = False    # True after phase-1 detection, waiting for confirm
         _last_stuck_check = 0.0       # monotonic time of last health check
 
-        while _claude_proc.poll() is None:
+        while _agent_proc.poll() is None:
             state.write()
             # Track claim changes: write to history when claimed, clear when PR created
             if state.claimed_issue > 0 and state.pr_number == 0:
@@ -2730,11 +2730,11 @@ def agent_process_main(config: dict, agent_id: str | None = None,
             else:
                 idle = 0
 
-            if idle >= stuck_initial and _claude_proc is not None:
+            if idle >= stuck_initial and _agent_proc is not None:
                 now_mono = time.monotonic()
                 if now_mono - _last_stuck_check >= stuck_interval:
                     _last_stuck_check = now_mono
-                    is_stuck, detail = _check_process_stuck(_claude_proc.pid)
+                    is_stuck, detail = _check_process_stuck(_agent_proc.pid)
 
                     if is_stuck and not _stuck_kill_pending:
                         # Phase 1: first stuck detection — log and start confirm timer
@@ -2750,7 +2750,7 @@ def agent_process_main(config: dict, agent_id: str | None = None,
                             f"(idle {human_duration(idle)}, confirmed after "
                             f"{human_duration(now_mono - _stuck_first_detected)}). "
                             f"Detail: {detail}")
-                        _kill_stuck_subprocess(_claude_proc)
+                        _kill_stuck_subprocess(_agent_proc)
                         # Don't break — let poll() return non-None on next iteration
                     elif not is_stuck and _stuck_kill_pending:
                         # Activity detected — reset
@@ -2765,8 +2765,8 @@ def agent_process_main(config: dict, agent_id: str | None = None,
 
             time.sleep(poll_interval)
 
-        exit_code = _claude_proc.returncode
-        _claude_proc = None
+        exit_code = _agent_proc.returncode
+        _agent_proc = None
 
         # --- Session ended ---
         stop_monitor.set()
@@ -3006,7 +3006,7 @@ def _tui_main(stdscr, config: dict):
     show_costs = cfg_get(config, "monitor", "show_costs", default=False)
 
     # Compute all-time historical cost once at startup
-    claude_config_dir = get_claude_config_dir(config)
+    claude_config_dir = get_isolated_config_dir(config)
     historical_cost = compute_historical_cost(pricing, claude_config_dir) if show_costs else 0.0
     # Track session-accumulated costs (persists across agent deaths)
     session_agent_costs: dict[str, float] = {}  # agent short_id -> last known cost
@@ -3735,7 +3735,7 @@ def cmd_status(config: dict, args):
     print(f"Total tokens:   {fmt_tokens(total_in)} in / {fmt_tokens(total_out)} out")
     if show_costs:
         session_cost = sum(a.cost(pricing) for a in alive)
-        claude_config_dir = get_claude_config_dir(config)
+        claude_config_dir = get_isolated_config_dir(config)
         historical_cost = compute_historical_cost(pricing, claude_config_dir)
         print(f"Running cost:   ${session_cost:.2f}")
         print(f"All-time cost:  ${historical_cost:.2f}")
@@ -3845,14 +3845,14 @@ def cmd_cleanup(config: dict, args):
 # ---------------------------------------------------------------------------
 
 
-def _populate_claude_config():
-    """Copy bundled claude-config/ into .pod/claude-config/.
+def _populate_agent_config():
+    """Copy bundled agent-config/claude into .pod/claude-config/.
 
     Only copies credentials/settings files — commands/ and skills/ are
     installed directly into each worktree's .claude/ by install_agent_config,
     not into the isolated config dir.
     """
-    src = _data_dir() / "claude-config"
+    src = _data_dir() / "agent-config" / "claude"
     dst = ISOLATED_CONFIG_DIR
     dst.mkdir(parents=True, exist_ok=True)
     EXCLUDE = {"commands", "skills", "CLAUDE.md"}
@@ -3944,7 +3944,7 @@ def cmd_init(args):
 
     # .gitignore for .pod/
     gitignore = pod_dir / ".gitignore"
-    gitignore.write_text("agents/\npod.log\nclaim-history.*\nclaude-config/\nforce-quota\n")
+    gitignore.write_text("agents/\npod.log\nclaim-history.*\nclaude-config/\ncodex-home/\nforce-quota\n")
 
     # Ensure .claude/.pod-checksums is gitignored in the project root
     proj_gitignore = git_root / ".gitignore"
@@ -3968,7 +3968,7 @@ def cmd_init(args):
     # claude-config from package data
     global ISOLATED_CONFIG_DIR
     ISOLATED_CONFIG_DIR = pod_dir / "claude-config"
-    _populate_claude_config()
+    _populate_agent_config()
     print(f"  populated {ISOLATED_CONFIG_DIR.relative_to(git_root)}/")
 
     # Ensure required GitHub labels exist
@@ -3985,7 +3985,7 @@ def cmd_update(args):
     if not POD_DIR.is_dir():
         print("No .pod/ directory found. Run 'pod init' first.", file=sys.stderr)
         sys.exit(1)
-    _populate_claude_config()
+    _populate_agent_config()
     print("Updated .pod/claude-config/ from installed package.")
 
 
