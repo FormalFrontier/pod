@@ -1168,7 +1168,8 @@ def fetch_blocked_deps() -> dict[int, list[int]]:
 # JSONL Monitor (runs as a thread inside agent process)
 # ---------------------------------------------------------------------------
 
-def jsonl_monitor(jsonl_path: str, state: AgentState, stop: threading.Event):
+def jsonl_monitor(jsonl_path: str, state: AgentState, stop: threading.Event,
+                  backend: str = "claude"):
     """Poll JSONL file and update agent state. Runs in a daemon thread."""
     pos = 0
     while not stop.is_set():
@@ -1185,13 +1186,73 @@ def jsonl_monitor(jsonl_path: str, state: AgentState, stop: threading.Event):
                     if not line.endswith(b"\n"):
                         break  # Partial line — retry next poll
                     pos += len(line)
-                    _parse_jsonl_line(line, state)
+                    _parse_jsonl_line(line, state, backend)
         except OSError:
             pass
         stop.wait(1)
 
 
-def _parse_jsonl_line(line: bytes, state: AgentState):
+def _parse_jsonl_line(line: bytes, state: AgentState, backend: str = "claude"):
+    """Dispatch JSONL parsing to the appropriate backend parser."""
+    if backend == "codex":
+        _parse_codex_jsonl_line(line, state)
+    else:
+        _parse_claude_jsonl_line(line, state)
+
+
+def _parse_codex_jsonl_line(line: bytes, state: AgentState):
+    """Parse one JSONL line from Codex --json stdout and update state.
+
+    Codex stdout event types (verified from codex exec --json v0.104.0):
+      thread.started   → capture backend_session_id for resume
+      turn.completed   → token usage
+      item.completed   → agent_message (text), command_execution (tool output)
+    """
+    try:
+        d = json.loads(line)
+    except json.JSONDecodeError:
+        return
+
+    t = d.get("type")
+
+    if t == "thread.started":
+        # Capture Codex thread id for resume; do NOT overwrite state.uuid
+        if not state.backend_session_id:
+            state.backend_session_id = d.get("thread_id", "")
+        state.last_activity = time.time()
+
+    elif t == "turn.completed":
+        usage = d.get("usage", {})
+        state.tokens_in += usage.get("input_tokens", 0)
+        state.cache_read += usage.get("cached_input_tokens", 0)
+        state.tokens_out += usage.get("output_tokens", 0)
+        # Codex has no cache_creation_input_tokens equivalent
+        state.last_activity = time.time()
+
+    elif t == "item.completed":
+        item = d.get("item", {})
+        itype = item.get("type")
+        if itype == "agent_message":
+            text = item.get("text", "").strip()
+            if text:
+                state.last_text = text[:200]
+                state.last_activity = time.time()
+        elif itype == "command_execution":
+            cmd = item.get("command", "")[:120]
+            state.last_text = f"[exec] {cmd}"
+            state.last_activity = time.time()
+            # Detect claim from coordination script output
+            output = item.get("aggregated_output", "")
+            m = re.search(r"Claimed issue #(\d+)", output)
+            if m:
+                state.claimed_issue = int(m.group(1))
+            # Detect PR creation from coordination create-pr
+            m2 = re.search(r"(?:coordination\s+create-pr\s+(?:--\S+\s+)*)(\d+)", cmd)
+            if m2:
+                state.pr_number = int(m2.group(1))
+
+
+def _parse_claude_jsonl_line(line: bytes, state: AgentState):
     """Parse one JSONL line and update state."""
     try:
         d = json.loads(line)
@@ -2671,7 +2732,8 @@ def agent_process_main(config: dict, agent_id: str | None = None,
         jsonl_path = get_jsonl_path(wt_dir, session_uuid, claude_config_dir)
         stop_monitor = threading.Event()
         monitor_thread = threading.Thread(
-            target=jsonl_monitor, args=(jsonl_path, state, stop_monitor),
+            target=jsonl_monitor,
+            args=(jsonl_path, state, stop_monitor, _backend(config)),
             daemon=True,
         )
         monitor_thread.start()
