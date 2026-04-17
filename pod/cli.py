@@ -110,7 +110,7 @@ quota_retry_seconds = 60           # Sleep duration when quota unavailable
 isolated_config = true             # Use isolated CLAUDE_CONFIG_DIR for agents
 
 [agent.codex]
-model = "gpt-5"                    # Codex model to use
+model = "gpt-5.4"                  # Codex model to use
 quota_check = "~/.claude/skills/claude-usage/codex-available-model"
 quota_check_required = false       # Proceed if quota cache missing/stale
 quota_retry_seconds = 60           # Sleep duration when quota unavailable
@@ -896,7 +896,7 @@ def _reload_config_value(*keys, default=None):
 
 _MODEL_TIER: dict[str, dict[str, int]] = {
     "claude": {"opus": 2, "sonnet": 1, "haiku": 0},
-    "codex": {"gpt-5": 2, "gpt-5-codex": 2, "gpt-5-mini": 1, "o3": 2, "o3-mini": 1},
+    "codex": {"gpt-5.4": 2, "gpt-5.3-codex": 2, "gpt-5.4-mini": 1, "gpt-5": 2},
 }
 
 
