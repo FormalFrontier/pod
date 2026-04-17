@@ -281,7 +281,13 @@ def ensure_config() -> dict:
 
 
 def get_isolated_config_dir(config: dict) -> Path | None:
-    """Return isolated CLAUDE_CONFIG_DIR path, or None if disabled. No side effects."""
+    """Return isolated CLAUDE_CONFIG_DIR path, or None if disabled/not Claude.
+
+    Only used for Claude backend. Codex isolation is handled by
+    _setup_codex_home() inside launch_agent() via CODEX_HOME env var.
+    """
+    if _backend(config) != "claude":
+        return None
     if not _backend_cfg(config, "isolated_config", default=False):
         return None
     return ISOLATED_CONFIG_DIR
@@ -2682,6 +2688,8 @@ def agent_process_main(config: dict, agent_id: str | None = None,
     claude_config_dir = ensure_isolated_config(config)
     if claude_config_dir:
         log(f"Agent {short_id}: using isolated CLAUDE_CONFIG_DIR={claude_config_dir}")
+    elif _backend(config) == "codex":
+        log(f"Agent {short_id}: using codex backend (CODEX_HOME set per session)")
 
     log(f"Agent {short_id} started (PID {os.getpid()})")
 
