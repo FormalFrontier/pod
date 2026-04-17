@@ -1190,9 +1190,11 @@ def jsonl_monitor(jsonl_path: str, state: AgentState, stop: threading.Event,
                   backend: str = "claude"):
     """Poll JSONL file and update agent state. Runs in a daemon thread."""
     pos = 0
-    while not stop.is_set():
+    while True:
         try:
             if not os.path.exists(jsonl_path):
+                if stop.is_set():
+                    break
                 stop.wait(1)
                 continue
             with open(jsonl_path, "rb") as f:
@@ -1207,6 +1209,8 @@ def jsonl_monitor(jsonl_path: str, state: AgentState, stop: threading.Event,
                     _parse_jsonl_line(line, state, backend)
         except OSError:
             pass
+        if stop.is_set():
+            break  # Final read done — exit
         stop.wait(1)
 
 
@@ -2973,6 +2977,8 @@ def agent_process_main(config: dict, agent_id: str | None = None,
         # --- Session ended ---
         stop_monitor.set()
         monitor_thread.join(timeout=5)
+
+        # (Final JSONL drain handled by the monitor thread's exit path.)
 
         elapsed = time.time() - state.session_start
         git_end = _git_rev(wt_dir)
