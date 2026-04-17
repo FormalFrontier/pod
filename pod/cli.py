@@ -166,6 +166,9 @@ def _sha256(path: Path) -> str:
 def _agent_config_sync_check():
     """Compare pod template commands/skills with the project .claude/ and report/update.
 
+    Only runs for Claude backend — Codex config is installed per-session
+    into CODEX_HOME, not into the project tree.
+
     Uses .claude/.pod-checksums to track what pod last installed, enabling
     three-way detection:
       - pod updated, project unchanged  → auto-overwrite
@@ -174,6 +177,15 @@ def _agent_config_sync_check():
       - no checksums file yet            → bootstrap: record current hashes,
                                            warn on any differences
     """
+    # Only meaningful for Claude backend — Codex installs per-session
+    if CONFIG_PATH.exists():
+        try:
+            with open(CONFIG_PATH, "rb") as f:
+                cfg = tomllib.load(f)
+            if cfg.get("agent", {}).get("backend", "claude") != "claude":
+                return
+        except (OSError, tomllib.TOMLDecodeError):
+            pass
     data_config = _data_dir() / "agent-config" / "claude"
     proj_claude = PROJECT_DIR / ".claude"
     checksums_file = proj_claude / ".pod-checksums"
@@ -4155,11 +4167,20 @@ def cmd_init(args):
     else:
         print(f"  {config_path.relative_to(git_root)} already exists (use --force to overwrite)")
 
-    # claude-config from package data
-    global ISOLATED_CONFIG_DIR
-    ISOLATED_CONFIG_DIR = pod_dir / "claude-config"
-    _populate_agent_config()
-    print(f"  populated {ISOLATED_CONFIG_DIR.relative_to(git_root)}/")
+    # Backend-specific config setup
+    # Read backend from the just-written config
+    with open(config_path, "rb") as f:
+        init_config = tomllib.load(f)
+    init_config = _migrate_legacy_config(init_config)
+    init_backend = _backend(init_config)
+
+    if init_backend == "claude":
+        global ISOLATED_CONFIG_DIR
+        ISOLATED_CONFIG_DIR = pod_dir / "claude-config"
+        _populate_agent_config()
+        print(f"  populated {ISOLATED_CONFIG_DIR.relative_to(git_root)}/")
+    else:
+        print(f"  {init_backend} backend — agent config installed per-session via CODEX_HOME")
 
     # Ensure required GitHub labels exist
     _ensure_github_labels()
@@ -4171,12 +4192,17 @@ def cmd_init(args):
 
 
 def cmd_update(args):
-    """Re-populate .pod/claude-config/ from installed package."""
+    """Re-populate agent config from installed package."""
     if not POD_DIR.is_dir():
         print("No .pod/ directory found. Run 'pod init' first.", file=sys.stderr)
         sys.exit(1)
-    _populate_agent_config()
-    print("Updated .pod/claude-config/ from installed package.")
+    config = ensure_config()
+    backend = _backend(config)
+    if backend == "claude":
+        _populate_agent_config()
+        print("Updated .pod/claude-config/ from installed package.")
+    else:
+        print(f"{backend} backend — agent config is installed per-session, nothing to update.")
 
 
 def cmd_coordination(args):
