@@ -846,7 +846,11 @@ cmd_set_target() {
         echo "error: .pod/ not found at $pod_dir" >&2
         return 1
     fi
-    printf '%d' "$n" > "$pod_dir/planner-target"
+    cat > "$pod_dir/planner-target" <<EOF
+# Planner advisory: cap effective target to this many agents.
+# Effective target is min(target, planner-target).
+$n
+EOF
     echo "Planner target set to $n"
 }
 
@@ -862,7 +866,11 @@ cmd_set_min_queue() {
         echo "error: .pod/ not found at $pod_dir" >&2
         return 1
     fi
-    printf '%d' "$n" > "$pod_dir/planner-min-queue"
+    cat > "$pod_dir/planner-min-queue" <<EOF
+# Planner advisory: lower queue_balance min_queue threshold.
+# Effective min_queue is max(1, min(config min_queue, planner-min-queue)).
+$n
+EOF
     echo "Planner min_queue set to $n"
 }
 
