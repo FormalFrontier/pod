@@ -2194,11 +2194,25 @@ def copy_build_cache(wt_dir: str, config: dict):
     """rsync build cache directory into worktree for faster builds."""
     cache_dir = cfg_get(config, "project", "build_cache_dir", default=".lake")
     cache_src = PROJECT_DIR / cache_dir
+    timeout = cfg_get(config, "project", "build_cache_timeout", default=600)
     if cache_src.is_dir():
-        subprocess.run(
-            ["rsync", "-a", "--quiet", f"{cache_src}/", f"{wt_dir}/{cache_dir}/"],
-            capture_output=True, timeout=120,
-        )
+        try:
+            r = subprocess.run(
+                ["rsync", "-a", "--quiet", f"{cache_src}/", f"{wt_dir}/{cache_dir}/"],
+                capture_output=True, timeout=timeout,
+            )
+            if r.returncode != 0:
+                log(f"Warning: rsync of {cache_dir} failed (exit {r.returncode}): "
+                    f"{r.stderr.decode(errors='replace').strip()[:200]}")
+        except subprocess.TimeoutExpired:
+            log(f"Warning: rsync of {cache_dir} timed out after {timeout}s "
+                f"(source may be too large)")
+            # Remove partial copy to avoid corrupt cache
+            dest = Path(wt_dir) / cache_dir
+            if dest.is_dir():
+                shutil.rmtree(str(dest), ignore_errors=True)
+        except OSError as e:
+            log(f"Warning: rsync of {cache_dir} failed: {e}")
 
 
 def cleanup_worktree(wt_dir: str, branch: str):
@@ -3012,6 +3026,34 @@ def agent_process_main(config: dict, agent_id: str | None = None,
                 # Leave in claim-history so check_dead_claimed_issues or
                 # reconcile_untracked_github_claims can clean it up later.
                 log(f"Agent {short_id}: keeping claim #{state.claimed_issue} in history (skip failed, will retry via housekeeping)")
+
+        # --- Quota exhaustion detection from stdout ---
+        if exit_code != 0:
+            try:
+                _stdout_path = (PROJECT_DIR
+                    / cfg_get(config, "project", "session_dir", default="sessions")
+                    / f"{session_uuid}.stdout")
+                with open(_stdout_path, "rb") as f:
+                    f.seek(0, 2)  # end
+                    tail_start = max(0, f.tell() - 4096)
+                    f.seek(tail_start)
+                    tail = f.read().decode(errors="replace").lower()
+                if "hit your limit" in tail:
+                    log(f"Agent {short_id}: session stdout indicates quota exhaustion, "
+                        f"will re-check quota before next dispatch")
+                    cleanup_worktree(wt_dir, branch)
+                    state.worktree = ""
+                    state.branch = ""
+                    if lock_name:
+                        try:
+                            coordination(config, f"unlock-{lock_name}")
+                        except Exception:
+                            pass
+                        state.lock_held = ""
+                    state.write()
+                    continue  # loops back to top-of-loop quota check
+            except OSError:
+                pass
 
         # --- Circuit breaker: sessions that exit too quickly are broken ---
         if elapsed < 15 and state.tokens_in == 0 and state.tokens_out == 0:
