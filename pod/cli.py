@@ -2204,6 +2204,10 @@ def copy_build_cache(wt_dir: str, config: dict):
             if r.returncode != 0:
                 log(f"Warning: rsync of {cache_dir} failed (exit {r.returncode}): "
                     f"{r.stderr.decode(errors='replace').strip()[:200]}")
+                # Remove partial copy to avoid corrupt cache
+                dest = Path(wt_dir) / cache_dir
+                if dest.is_dir():
+                    shutil.rmtree(str(dest), ignore_errors=True)
         except subprocess.TimeoutExpired:
             log(f"Warning: rsync of {cache_dir} timed out after {timeout}s "
                 f"(source may be too large)")
@@ -3001,6 +3005,47 @@ def agent_process_main(config: dict, agent_id: str | None = None,
             f"duration={human_duration(elapsed)} {tok} "
             f"git:{state.git_start}..{git_end}")
 
+        # --- Quota exhaustion detection from stdout ---
+        # Must run BEFORE claim cleanup: coordination skip marks issues as
+        # "replan", but quota exhaustion is temporary — the issue is fine,
+        # only the quota is depleted.  Release the claim without replan.
+        _is_quota_exhausted = False
+        if exit_code != 0:
+            try:
+                _stdout_path = (PROJECT_DIR
+                    / cfg_get(config, "project", "session_dir", default="sessions")
+                    / f"{session_uuid}.stdout")
+                with open(_stdout_path, "rb") as f:
+                    f.seek(0, 2)  # end
+                    tail_start = max(0, f.tell() - 4096)
+                    f.seek(tail_start)
+                    tail = f.read().decode(errors="replace").lower()
+                if ("hit your limit" in tail
+                        or "rate limit" in tail
+                        or "quota exceeded" in tail):
+                    _is_quota_exhausted = True
+            except OSError:
+                pass
+
+        if _is_quota_exhausted:
+            log(f"Agent {short_id}: session stdout indicates quota exhaustion, "
+                f"will re-check quota before next dispatch")
+            # Release claim without replan — issue is fine, just quota-gated
+            if state.claimed_issue > 0 and state.pr_number == 0:
+                clear_claim(state.claimed_issue, session_uuid=state.uuid)
+                log(f"Agent {short_id}: released claim on #{state.claimed_issue} (quota exhaustion, not replan)")
+            cleanup_worktree(wt_dir, branch)
+            state.worktree = ""
+            state.branch = ""
+            if lock_name:
+                try:
+                    coordination(config, f"unlock-{lock_name}")
+                except Exception:
+                    pass
+                state.lock_held = ""
+            state.write()
+            continue  # loops back to top-of-loop quota check
+
         # --- Clear uncompleted claims so check_dead_claimed_issues doesn't
         #     mistake our finished session for a dead one and spawn a new agent.
         #     Without this, every session that ends without a PR leaves a stale
@@ -3026,34 +3071,6 @@ def agent_process_main(config: dict, agent_id: str | None = None,
                 # Leave in claim-history so check_dead_claimed_issues or
                 # reconcile_untracked_github_claims can clean it up later.
                 log(f"Agent {short_id}: keeping claim #{state.claimed_issue} in history (skip failed, will retry via housekeeping)")
-
-        # --- Quota exhaustion detection from stdout ---
-        if exit_code != 0:
-            try:
-                _stdout_path = (PROJECT_DIR
-                    / cfg_get(config, "project", "session_dir", default="sessions")
-                    / f"{session_uuid}.stdout")
-                with open(_stdout_path, "rb") as f:
-                    f.seek(0, 2)  # end
-                    tail_start = max(0, f.tell() - 4096)
-                    f.seek(tail_start)
-                    tail = f.read().decode(errors="replace").lower()
-                if "hit your limit" in tail:
-                    log(f"Agent {short_id}: session stdout indicates quota exhaustion, "
-                        f"will re-check quota before next dispatch")
-                    cleanup_worktree(wt_dir, branch)
-                    state.worktree = ""
-                    state.branch = ""
-                    if lock_name:
-                        try:
-                            coordination(config, f"unlock-{lock_name}")
-                        except Exception:
-                            pass
-                        state.lock_held = ""
-                    state.write()
-                    continue  # loops back to top-of-loop quota check
-            except OSError:
-                pass
 
         # --- Circuit breaker: sessions that exit too quickly are broken ---
         if elapsed < 15 and state.tokens_in == 0 and state.tokens_out == 0:
