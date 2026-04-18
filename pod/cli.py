@@ -99,6 +99,19 @@ session_dir = "sessions"           # Session stdout capture directory
 build_cache_dir = ".lake"          # Build cache to rsync into worktrees
 protected_files = ["PLAN.md"]      # Files agents may not modify in PRs
 
+[merge]
+# Status check contexts that must pass before a PR can auto-merge.
+# These are the `name:` field of jobs in .github/workflows/*.yml.
+# Leave empty to skip branch-protection setup.
+#
+# Why this matters: `coordination create-pr` runs `gh pr merge --auto` on
+# every PR it opens, but GitHub only honours --auto when the default branch
+# has branch protection with at least one required status check. Without
+# that, PRs go green but never merge.
+#
+# Example: required_checks = ["build-and-test"]
+required_checks = []
+
 [agent]
 backend = "claude"                 # "claude" or "codex"
 
@@ -4207,6 +4220,72 @@ def _ensure_repo_merge_settings():
         print("  warning: could not configure repo merge settings (gh CLI not available)")
 
 
+def _ensure_branch_protection(init_config):
+    """Configure branch protection on the default branch (best effort).
+
+    Required for `gh pr merge --auto` to actually queue PRs — without a
+    required status check on the default branch, --auto silently no-ops
+    and green PRs sit unmerged.
+    """
+    required = init_config.get("merge", {}).get("required_checks", []) or []
+    if not required:
+        print("  branch protection: skipped (empty [merge] required_checks)")
+        print("    → Auto-merge on PRs will NOT work until you configure this.")
+        print("    → Edit .pod/config.toml, set e.g.:")
+        print("        [merge]")
+        print("        required_checks = [\"build-and-test\"]")
+        print("      using the `name:` of your CI job(s) in .github/workflows/,")
+        print("      then re-run `pod init`.")
+        return
+
+    try:
+        r = subprocess.run(
+            ["gh", "repo", "view", "--json", "defaultBranchRef",
+             "--jq", ".defaultBranchRef.name"],
+            capture_output=True, text=True, timeout=15,
+            cwd=str(PROJECT_DIR),
+        )
+        if r.returncode != 0 or not r.stdout.strip():
+            print("  warning: could not detect default branch (gh CLI issue)")
+            return
+        default_branch = r.stdout.strip()
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        print("  warning: could not detect default branch (gh CLI not available)")
+        return
+
+    payload = {
+        "required_status_checks": {
+            "strict": False,
+            "contexts": list(required),
+        },
+        "enforce_admins": False,
+        "required_pull_request_reviews": None,
+        "restrictions": None,
+        "allow_force_pushes": False,
+        "allow_deletions": False,
+    }
+
+    try:
+        r = subprocess.run(
+            ["gh", "api",
+             f"repos/{{owner}}/{{repo}}/branches/{default_branch}/protection",
+             "-X", "PUT", "--input", "-"],
+            input=json.dumps(payload),
+            capture_output=True, text=True, timeout=15,
+            cwd=str(PROJECT_DIR),
+        )
+        if r.returncode == 0:
+            print(f"  configured branch protection on `{default_branch}` "
+                  f"(required: {', '.join(required)})")
+        else:
+            print(f"  warning: could not set branch protection on `{default_branch}` "
+                  f"(may need admin access)")
+            print(f"    → Settings → Branches → add rule for `{default_branch}`")
+            print(f"      with required status checks: {', '.join(required)}")
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        print("  warning: could not configure branch protection (gh CLI not available)")
+
+
 def cmd_init(args):
     """Bootstrap .pod/ in the current git repo."""
     # Verify we're in a git repo
@@ -4265,6 +4344,9 @@ def cmd_init(args):
 
     # GitHub repo merge settings (required for coordination create-pr auto-merge to work)
     _ensure_repo_merge_settings()
+
+    # Branch protection (also required for --auto on `gh pr merge` to take effect)
+    _ensure_branch_protection(init_config)
 
     print("pod init complete.")
 
