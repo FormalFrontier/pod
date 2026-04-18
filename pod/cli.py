@@ -578,33 +578,46 @@ def read_all_agents() -> list[AgentState]:
     return agents
 
 
-def read_target() -> int | None:
-    """Read target agent count from .pod/target, or None if not set."""
+def _read_commented_int(path: Path) -> int | None:
+    """Read the first non-comment integer from a small state file."""
     try:
-        return int(TARGET_FILE.read_text().strip())
+        for line in path.read_text().splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            return int(stripped)
     except (OSError, ValueError):
         return None
+    return None
+
+
+def _write_commented_int(path: Path, value: int, comments: list[str]):
+    """Write a small state file with comment headers plus a numeric payload."""
+    header = "\n".join(f"# {comment}" for comment in comments)
+    path.write_text(f"{header}\n{max(0, value)}\n")
+
+
+def read_target() -> int | None:
+    """Read target agent count from .pod/target, or None if not set."""
+    return _read_commented_int(TARGET_FILE)
 
 
 def write_target(n: int):
     """Write target agent count to .pod/target."""
-    TARGET_FILE.write_text(str(max(0, n)))
+    _write_commented_int(TARGET_FILE, n, [
+        "User target agent count.",
+        "pod tries to keep this many agents running.",
+    ])
 
 
 def read_planner_target() -> int | None:
     """Read planner-recommended target from .pod/planner-target, or None if not set."""
-    try:
-        return int(PLANNER_TARGET_FILE.read_text().strip())
-    except (OSError, ValueError):
-        return None
+    return _read_commented_int(PLANNER_TARGET_FILE)
 
 
 def read_planner_min_queue() -> int | None:
     """Read planner-recommended min_queue from .pod/planner-min-queue, or None if not set."""
-    try:
-        return int(PLANNER_MIN_QUEUE_FILE.read_text().strip())
-    except (OSError, ValueError):
-        return None
+    return _read_commented_int(PLANNER_MIN_QUEUE_FILE)
 
 
 def get_effective_target() -> int | None:
