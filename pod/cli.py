@@ -120,14 +120,14 @@ model = "opus"                     # Claude model to use
 quota_check = "~/.claude/skills/claude-usage/claude-available-model"
 quota_check_required = true        # Hard-fail if quota unavailable
 quota_retry_seconds = 60           # Sleep duration when quota unavailable
-isolated_config = true             # Use isolated CLAUDE_CONFIG_DIR for agents
+isolated_config = true             # Use pod-managed isolated CLAUDE_CONFIG_DIR for agents
 
 [agent.codex]
 model = "gpt-5.4"                  # Codex model to use
 quota_check = "~/.claude/skills/claude-usage/codex-available-model"
 quota_check_required = false       # Proceed if quota cache missing/stale
 quota_retry_seconds = 60           # Sleep duration when quota unavailable
-isolated_config = true             # Use isolated CODEX_HOME for agents
+isolated_config = true             # Use strict pod-managed CODEX_HOME (no ~/.codex state except auth.json)
 
 [pricing]
 # Dollars per million tokens
@@ -349,6 +349,46 @@ def ensure_isolated_config(config: dict) -> Path | None:
     (config_dir / "projects").mkdir(exist_ok=True)
 
     return config_dir
+
+
+def _instruction_file_warning(git_root: Path, backend: str) -> str | None:
+    """Return a warning if instruction files are inconsistent for the backend."""
+    agents = git_root / "AGENTS.md"
+    claude = git_root / ".claude" / "CLAUDE.md"
+
+    agents_exists = agents.exists() or agents.is_symlink()
+    claude_exists = claude.exists() or claude.is_symlink()
+
+    if not agents_exists and not claude_exists:
+        return None
+    if agents_exists and not claude_exists:
+        if backend == "claude":
+            return ("warning: repo has AGENTS.md but no .claude/CLAUDE.md, "
+                    "while pod is configured for Claude\n"
+                    "    → Prefer AGENTS.md -> .claude/CLAUDE.md for cross-backend parity.")
+        else:
+            return None
+    if claude_exists and not agents_exists:
+        if backend == "codex":
+            return ("warning: repo has .claude/CLAUDE.md but no AGENTS.md, "
+                    "while pod is configured for Codex\n"
+                    "    → Prefer AGENTS.md -> .claude/CLAUDE.md for cross-backend parity.")
+        else:
+            return None
+
+    try:
+        if agents.is_symlink() and agents.resolve() == claude.resolve():
+            return None
+    except OSError:
+        pass
+    try:
+        if claude.is_symlink() and claude.resolve() == agents.resolve():
+            return None
+    except OSError:
+        pass
+
+    return ("warning: AGENTS.md and .claude/CLAUDE.md both exist but are not symlinked together\n"
+            "    → Prefer AGENTS.md -> .claude/CLAUDE.md for cross-backend parity.")
 
 
 def _claude_projects_dir(claude_config_dir: Path | None = None) -> Path:
@@ -2125,7 +2165,7 @@ def setup_worktree(config: dict, short_id: str) -> tuple[str, str]:
 
 
 def _pod_installed_files() -> list[str]:
-    """Return list of .claude/ relative paths that pod delivers.
+    """Return list of relative paths that pod delivers into a worktree.
 
     Scans the bundled agent-config/claude for commands and skills files.
     These are automatically added to the protected-files list so agents
@@ -2139,7 +2179,36 @@ def _pod_installed_files() -> list[str]:
             for item in src.rglob("*"):
                 if item.is_file():
                     result.append(f".claude/{subdir}/{item.relative_to(src)}")
+    result.append("AGENTS.md")
     return result
+
+
+_POD_CODEX_AGENTS_SENTINEL = "<!-- pod-managed-codex-agents -->"
+
+
+def _read_text(path: Path) -> str:
+    return path.read_text() if path.is_file() else ""
+
+
+def _codex_project_guidance(wt_dir: str) -> tuple[str, str]:
+    """Return repo AGENTS.md and project .claude/CLAUDE.md text."""
+    root = Path(wt_dir)
+    repo_agents = _read_text(root / "AGENTS.md")
+    if _POD_CODEX_AGENTS_SENTINEL in repo_agents:
+        repo_agents = ""
+    project_claude = _read_text(root / ".claude" / "CLAUDE.md")
+    return repo_agents, project_claude
+
+
+def _compose_pod_codex_agents(wt_dir: str) -> str:
+    """Build the pod-managed AGENTS.md payload for Codex worktrees."""
+    repo_agents, project_claude = _codex_project_guidance(wt_dir)
+    pod_agents = (_data_dir() / "agent-config" / "codex" / "AGENTS.md").read_text()
+    sections = [_POD_CODEX_AGENTS_SENTINEL]
+    if project_claude.strip():
+        sections.append("# Project .claude/CLAUDE.md\n\n" + project_claude.strip())
+    sections.append("# Pod Codex Guidance\n\n" + pod_agents.strip())
+    return "\n\n".join(sections) + "\n"
 
 
 def install_agent_config(wt_dir: str, backend: str = "claude"):
@@ -2147,22 +2216,30 @@ def install_agent_config(wt_dir: str, backend: str = "claude"):
 
     For Claude: merges agent-config/claude into .claude/ (commands, skills,
     CLAUDE.md).
-    For Codex: installs AGENTS.md at worktree root. Skills are installed
-    into CODEX_HOME by _setup_codex_home(). Commands are read at launch
-    time by _worker_prompt() and delivered via stdin.
+    For Codex: appends pod-managed guidance to the worktree's root AGENTS.md,
+    creating it when needed. Skills are installed into CODEX_HOME by
+    _setup_codex_home(). Commands are read at launch time by _worker_prompt()
+    and delivered via stdin.
     """
     data_config = _data_dir() / "agent-config" / backend
 
     if backend == "codex":
-        # Install AGENTS.md at worktree root
-        agent_md = data_config / "AGENTS.md"
-        if agent_md.is_file():
-            dst_md = Path(wt_dir) / "AGENTS.md"
-            existing = dst_md.read_text() if dst_md.is_file() else ""
-            agent_text = agent_md.read_text()
-            if agent_text not in existing:
-                with open(dst_md, "a") as f:
-                    f.write("\n\n" + agent_text)
+        # Mirror Claude's .claude/CLAUDE.md behavior: append pod guidance to
+        # the repo's AGENTS.md in-place, creating it when absent.
+        dst_md = Path(wt_dir) / "AGENTS.md"
+        existing = _read_text(dst_md)
+        agent_text = _compose_pod_codex_agents(wt_dir)
+        if _POD_CODEX_AGENTS_SENTINEL in existing:
+            base_text = existing.split(_POD_CODEX_AGENTS_SENTINEL, 1)[0].rstrip()
+            if base_text:
+                dst_md.write_text(base_text + "\n\n" + agent_text)
+            else:
+                dst_md.write_text(agent_text)
+        elif agent_text not in existing:
+            if existing.strip():
+                dst_md.write_text(existing.rstrip() + "\n\n" + agent_text)
+            else:
+                dst_md.write_text(agent_text)
         # Skills and commands are handled by _setup_codex_home and
         # _worker_prompt respectively — nothing else to install here.
     else:
@@ -2210,9 +2287,10 @@ def _worker_prompt(config: dict, worker_type: str) -> str:
         cmd_name = prompt.lstrip("/")
         cmd_file = _data_dir() / "agent-config" / "codex" / "commands" / f"{cmd_name}.md"
         if cmd_file.is_file():
-            return cmd_file.read_text()
+            prompt = cmd_file.read_text()
         # Fallback: use the command name as-is
-        log(f"Warning: no Codex command template for '{cmd_name}', using raw prompt")
+        else:
+            log(f"Warning: no Codex command template for '{cmd_name}', using raw prompt")
     return prompt
 
 
@@ -2522,6 +2600,7 @@ def launch_agent(config: dict, session_uuid: str, prompt: str,
         codex_home = _setup_codex_home(config, wt_dir)
         if codex_home:
             env["CODEX_HOME"] = str(codex_home)
+            log(f"Using strict pod-managed CODEX_HOME={codex_home}")
 
         stdin_pipe = subprocess.PIPE
         agent_args = codex_args
@@ -2575,14 +2654,16 @@ def launch_agent(config: dict, session_uuid: str, prompt: str,
 def _setup_codex_home(config: dict, wt_dir: str) -> Path | None:
     """Create an isolated CODEX_HOME directory for a Codex agent.
 
-    Sets up skills from the bundled agent-config/codex/ and symlinks
-    auth from ~/.codex/auth.json so the agent uses the user's login.
+    Sets up a strict pod-managed home: bundled skills, a minimal pod-owned
+    config.toml, and an auth symlink to ~/.codex/auth.json for login reuse.
     Returns the CODEX_HOME path, or None if isolation is disabled.
     """
     if not _backend_cfg(config, "isolated_config", default=True):
         return None
 
     codex_home = Path(wt_dir) / ".pod-codex-home"
+    if codex_home.exists():
+        shutil.rmtree(codex_home)
     codex_home.mkdir(parents=True, exist_ok=True)
 
     # Symlink auth from user's global Codex config
@@ -2596,18 +2677,19 @@ def _setup_codex_home(config: dict, wt_dir: str) -> Path | None:
         except FileExistsError:
             pass
 
-    # Copy config.toml from user's global config if it exists
-    user_config = real_codex / "config.toml"
-    if user_config.exists():
-        dest_config = codex_home / "config.toml"
-        if not dest_config.exists():
-            shutil.copy2(str(user_config), str(dest_config))
+    # Write pod-owned minimal config for non-interactive execution.
+    model = _reload_config_value("agent", "codex", "model", default="gpt-5.4")
+    (codex_home / "config.toml").write_text(
+        f'model = "{model}"\n'
+        'approval_policy = "never"\n'
+        'sandbox_mode = "danger-full-access"\n'
+    )
 
     # Install bundled skills
     data_skills = _data_dir() / "agent-config" / "codex" / "skills"
     if data_skills.is_dir():
         dst_skills = codex_home / "skills"
-        shutil.copytree(str(data_skills), str(dst_skills), dirs_exist_ok=True)
+        shutil.copytree(str(data_skills), str(dst_skills))
 
     return codex_home
 
@@ -2841,7 +2923,6 @@ def agent_process_main(config: dict, agent_id: str | None = None,
 
             consecutive_wait = 0  # Reset backoff on successful dispatch
             wt_config = worker_types.get(chosen_type, {})
-            prompt = _worker_prompt(config, chosen_type)
             lock_name = wt_config.get("lock", "")
 
             state.worker_type = chosen_type
@@ -2911,6 +2992,9 @@ def agent_process_main(config: dict, agent_id: str | None = None,
         state.git_start = _git_rev(wt_dir)
 
         install_agent_config(wt_dir, backend=_backend(config))
+
+        if not _resume_uuid:
+            prompt = _worker_prompt(config, chosen_type)
 
         if wt_config.get("copy_build_cache", wt_config.get("copy_lake_cache", False)):
             copy_build_cache(wt_dir, config)
@@ -4330,6 +4414,10 @@ def cmd_init(args):
         init_config = tomllib.load(f)
     init_config = _migrate_legacy_config(init_config)
     init_backend = _backend(init_config)
+
+    warning = _instruction_file_warning(git_root, init_backend)
+    if warning:
+        print(f"  {warning}")
 
     if init_backend == "claude":
         global ISOLATED_CONFIG_DIR

@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if ! command -v claude >/dev/null 2>&1; then
+    echo "Error: claude CLI not found." >&2
+    exit 1
+fi
+
+PROMPT="${1:-Provide your analysis of this context}"
+WORKDIR="${2:-$(pwd)}"
+CONTEXT=""
+CODEX_HISTORY="${CODEX_HISTORY:-$HOME/.codex/history.jsonl}"
+
+if [ ! -t 0 ]; then
+    CONTEXT=$(cat)
+fi
+
+FULL_PROMPT="$PROMPT"
+
+if [ -n "$CONTEXT" ]; then
+    FULL_PROMPT="$FULL_PROMPT
+
+Context provided:
+$CONTEXT"
+fi
+
+if [ -f "$CODEX_HISTORY" ]; then
+    FULL_PROMPT="$FULL_PROMPT
+
+If you need prior Codex user prompts for context, they are available in: $CODEX_HISTORY"
+fi
+
+FULL_PROMPT="$FULL_PROMPT
+
+Work from the repository at: $WORKDIR
+
+Please provide a concise second opinion. Prioritize concrete risks, edge cases, regressions, and better alternatives over agreement."
+
+cd "$WORKDIR"
+claude -p \
+    --permission-mode dontAsk \
+    --allowedTools "Read,Grep,Glob,Bash" \
+    -- \
+    "$FULL_PROMPT"

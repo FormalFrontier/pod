@@ -1,7 +1,7 @@
 # pod
 
-Multi-agent manager for Claude Code. Launches and monitors concurrent
-autonomous Claude sessions, coordinating via GitHub issues, labels, and PRs.
+Multi-agent manager for Claude Code and Codex. Launches and monitors concurrent
+autonomous agent sessions, coordinating via GitHub issues, labels, and PRs.
 
 ## Quick Start
 
@@ -28,7 +28,7 @@ pod list         # show running agents
 
 ## How It Works
 
-Pod manages a pool of autonomous Claude Code agents, each running in its
+Pod manages a pool of autonomous agents, each running in its
 own git worktree on its own branch. Agents coordinate through GitHub
 issues and PRs:
 
@@ -44,7 +44,7 @@ itself; update it directly when you want to steer the project.
 ## Requirements
 
 - Python 3.10+
-- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) (`claude`)
+- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) (`claude`) or OpenAI Codex (`codex`)
 - [GitHub CLI](https://cli.github.com/) (`gh`), authenticated
 - Git
 
@@ -74,9 +74,18 @@ After `pod init`, edit `.pod/config.toml` to customize:
 - **Build cache**: directory to rsync into worktrees
 - **Protected files**: files agents may not modify in PRs
 
-Agent session config (commands, skills) lives in `.pod/claude-config/`
-and is managed by pod -- run `pod update` after upgrading pod to get
-the latest agent prompts.
+For Claude, agent session config (commands, skills) lives in
+`.pod/claude-config/` and is managed by pod -- run `pod update` after
+upgrading pod to get the latest agent prompts.
+
+For Codex, `isolated_config = true` creates a strict pod-managed
+`CODEX_HOME` per worktree. It contains only pod-managed Codex skills, a
+minimal pod-owned `config.toml`, and an `auth.json` symlink for login
+reuse. Pod does not inherit global `~/.codex` prompts, skills, plugins,
+or session state into isolated homes. This intentionally drops user
+Codex configuration such as custom providers, base URLs, MCP settings,
+and other global config; isolated Codex sessions use only pod-managed
+configuration plus the shared auth token.
 
 ## Coordination
 

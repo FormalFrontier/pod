@@ -37,6 +37,40 @@ class StateFileTests(unittest.TestCase):
             path.write_text("# comment only\nnot-an-int\n")
             self.assertIsNone(cli._read_commented_int(path))
 
+    def test_instruction_file_warning_when_claude_exists_without_agents_for_codex(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".claude").mkdir()
+            (root / ".claude" / "CLAUDE.md").write_text("x")
+            warning = cli._instruction_file_warning(root, "codex")
+            self.assertIsNotNone(warning)
+            self.assertIn("no AGENTS.md", warning)
+
+    def test_instruction_file_warning_suppressed_when_claude_exists_for_claude_backend(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".claude").mkdir()
+            (root / ".claude" / "CLAUDE.md").write_text("x")
+            self.assertIsNone(cli._instruction_file_warning(root, "claude"))
+
+    def test_instruction_file_warning_when_agents_not_symlinked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".claude").mkdir()
+            (root / ".claude" / "CLAUDE.md").write_text("x")
+            (root / "AGENTS.md").write_text("y")
+            warning = cli._instruction_file_warning(root, "codex")
+            self.assertIsNotNone(warning)
+            self.assertIn("not symlinked together", warning)
+
+    def test_instruction_file_warning_suppressed_for_canonical_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".claude").mkdir()
+            (root / ".claude" / "CLAUDE.md").write_text("x")
+            (root / "AGENTS.md").symlink_to(".claude/CLAUDE.md")
+            self.assertIsNone(cli._instruction_file_warning(root, "codex"))
+
 
 if __name__ == "__main__":
     unittest.main()
