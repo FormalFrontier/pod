@@ -16,9 +16,14 @@ Session UUID is available as `$POD_SESSION_ID`.
 - **Planners** (`/plan`): create work items as GitHub issues, then exit
 - **Workers** (`/feature`, `/review`, `/summarize`, `/meditate`): claim
   and execute issues using the `agent-worker-flow` skill
+- **Repair** (`/repair`): salvage unhealthy PRs (merge conflicts, failed
+  CI, stuck CI) using the `pr-repair-flow` skill. Dispatched by pod ahead
+  of planners and workers whenever `coordination list-pr-repair` reports
+  candidates. Two outcomes only: salvaged or abandoned (→ `replan` on the
+  linked issue). No escalation to humans.
 
-See your `/command` file and the `agent-worker-flow` skill for the full
-workflow.
+See your `/command` file and the relevant skill (`agent-worker-flow` or
+`pr-repair-flow`) for the full workflow.
 
 ## Off-limits Files
 

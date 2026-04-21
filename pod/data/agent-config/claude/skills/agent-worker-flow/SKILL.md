@@ -74,13 +74,15 @@ coordination orient
    comment explaining a genuine technical blocker (e.g. a missing dependency), then
    using `coordination skip` with that reason. Do not `skip` because you think a
    different approach is better — that is the owner's call, not yours.
-1. **PRs needing attention**: merge conflicts or failing CI. Check if any
-   unclaimed issue references that PR (title containing "rebase PR #N" or "fix PR #N").
-   Claim that first — unblocking broken PRs beats starting new work.
-2. **Oldest unclaimed issue** of your type:
+1. **Oldest unclaimed issue** of your type:
    ```
    coordination list-unclaimed --label <your-label>
    ```
+
+**Don't repair PRs from a worker session.** PR health (merge conflicts,
+failed CI, stuck CI) is the `repair` agent's responsibility; pod dispatches
+`/repair` automatically when `coordination list-pr-repair` reports
+candidates, ahead of `/plan` / `/work`. Focus on fresh issue work.
 
 If the queue is empty, write a brief progress note and exit.
 

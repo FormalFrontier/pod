@@ -10,6 +10,11 @@
 #   coordination create-pr N [--partial] ["title"] — push branch, create PR closing issue #N, enable auto-merge; rejects PRs touching protected files
 #   coordination claim-fix N                  — comment on failing PR #N claiming fix (30min cooldown)
 #   coordination close-pr N "reason"          — comment reason and close PR #N
+#   coordination list-pr-repair               — read-only: list PRs needing repair (conflict | failed CI | stuck CI)
+#   coordination claim-pr-repair N            — claim PR #N for repair (repair-claimed label + comment, 30min cooldown)
+#   coordination mark-pr-salvaged N           — clear repair-claimed on PR #N after a successful push
+#   coordination close-pr-unsalvageable N "reason"
+#                                              — close PR #N, mark linked issue replan (removes has-pr)
 #   coordination list-unclaimed [--label L]   — list unclaimed agent-plan issues (FIFO order); optional label filter
 #   coordination queue-depth [L]              — count of unclaimed agent-plan issues; optional label filter
 #   coordination critical-path-depth          — count of unclaimed critical-path issues
@@ -132,7 +137,7 @@ _ensure_labels() {
     local existing
     existing="$(gh label list --repo "$REPO" --limit 100 --json name --jq '.[].name')"
     local label color
-    for pair in agent-plan:1D76DB claimed:FBCA04 blocked:B60205 has-pr:5319E7 replan:D93F0B coordination:0E8A16 human-oversight:CC317C return-to-human:E4A400 critical-path:FF6600; do
+    for pair in agent-plan:1D76DB claimed:FBCA04 blocked:B60205 has-pr:5319E7 replan:D93F0B coordination:0E8A16 human-oversight:CC317C return-to-human:E4A400 critical-path:FF6600 repair-claimed:7057FF unsalvageable:5C5C5C; do
         label="${pair%%:*}"
         color="${pair##*:}"
         if ! echo "$existing" | grep -qx "$label"; then
@@ -460,6 +465,161 @@ cmd_close_pr() {
         grep -oE 'Closes #[0-9]+' | grep -oE '[0-9]+' | head -1)"
     if [[ -n "$linked_issue" ]]; then
         gh issue edit "$linked_issue" --repo "$REPO" --remove-label has-pr 2>/dev/null || true
+    fi
+}
+
+# --- PR repair ------------------------------------------------------------
+#
+# Repair commands operate on PRs (not issues) and use a claim namespace
+# distinct from issue `claimed`. See plans/repair-agent-type.md for the
+# overall design. The stuck-CI threshold is read from POD_STUCK_CI_MINUTES
+# (set by `pod` from `[repair].stuck_ci_minutes`, default 120).
+
+# --- list-pr-repair ---
+# Read-only enumerator of open PRs that need repair, in priority order:
+#   conflict → failed CI → stuck CI
+# Output: one PR per line as `#<num> [<reason>] <title>`.
+# Does NOT mutate any labels. Callers (claim-pr-repair / mark-pr-salvaged /
+# close-pr-unsalvageable) are responsible for any label writes.
+cmd_list_pr_repair() {
+    local stuck_minutes="${POD_STUCK_CI_MINUTES:-120}"
+    local stuck_seconds=$(( stuck_minutes * 60 ))
+    local now
+    now="$(date -u +%s)"
+
+    # One cheap list pass: mergeable + statusCheckRollup (without per-check
+    # ages). We'll fetch per-PR check ages only for PRs that already look
+    # suspect from this pass.
+    local prs_json
+    prs_json="$(gh pr list --repo "$REPO" --state open --limit 50 \
+        --json number,title,mergeable,statusCheckRollup,labels)"
+
+    # Conflicts (mergeable == CONFLICTING)
+    echo "$prs_json" | jq -r --arg reason conflict '
+        [.[] | select(.mergeable == "CONFLICTING")
+             | select((.labels // []) | all(.name != "repair-claimed"))]
+        | sort_by(.number)
+        | .[]
+        | "#\(.number) [\($reason)] \(.title)"
+    '
+
+    # Failed CI (any statusCheckRollup conclusion == FAILURE)
+    echo "$prs_json" | jq -r --arg reason failed '
+        [.[] | select(.mergeable != "CONFLICTING")
+             | select((.statusCheckRollup // []) | any(.conclusion == "FAILURE"))
+             | select((.labels // []) | all(.name != "repair-claimed"))]
+        | sort_by(.number)
+        | .[]
+        | "#\(.number) [\($reason)] \(.title)"
+    '
+
+    # Stuck CI: any IN_PROGRESS check older than stuck_seconds.
+    # Only considered for PRs that are otherwise healthy (not conflicting,
+    # no failed checks already).
+    local suspect_prs
+    suspect_prs="$(echo "$prs_json" | jq -r '
+        [.[] | select(.mergeable != "CONFLICTING")
+             | select((.statusCheckRollup // []) | all(.conclusion != "FAILURE"))
+             | select((.statusCheckRollup // []) | any(.status == "IN_PROGRESS"))
+             | select((.labels // []) | all(.name != "repair-claimed"))
+             | {number, title}]
+        | .[] | "\(.number)\t\(.title)"
+    ')"
+
+    if [[ -n "$suspect_prs" ]]; then
+        while IFS=$'\t' read -r pr_num pr_title; do
+            [[ -z "$pr_num" ]] && continue
+            # GraphQL for CheckRun.startedAt — it's the only rollup variant
+            # with a reliable start timestamp. StatusContext entries don't
+            # carry one; we treat them as not-stuck.
+            local started_json
+            started_json="$(gh api graphql \
+                -f query='query($owner:String!,$name:String!,$pr:Int!){
+                    repository(owner:$owner,name:$name){
+                        pullRequest(number:$pr){
+                            commits(last:1){nodes{commit{
+                                checkSuites(first:20){nodes{
+                                    checkRuns(first:50){nodes{status conclusion startedAt}}
+                                }}
+                            }}}
+                        }
+                    }
+                }' \
+                -F owner="${REPO%%/*}" -F name="${REPO##*/}" -F pr="$pr_num" \
+                --jq '[.data.repository.pullRequest.commits.nodes[0].commit.checkSuites.nodes[].checkRuns.nodes[]
+                       | select(.status == "IN_PROGRESS" and .startedAt != null)
+                       | .startedAt]' 2>/dev/null || echo "[]")"
+            local is_stuck
+            is_stuck="$(echo "$started_json" | jq -r --argjson now "$now" --argjson threshold "$stuck_seconds" '
+                any(. as $s | ($now - ($s | fromdateiso8601)) > $threshold)
+            ' 2>/dev/null || echo false)"
+            if [[ "$is_stuck" == "true" ]]; then
+                echo "#$pr_num [stuck] $pr_title"
+            fi
+        done <<< "$suspect_prs"
+    fi
+}
+
+# --- claim-pr-repair ---
+# Claim a PR for repair work. Comment + repair-claimed label; 30min cooldown
+# guard against another repair agent stomping in immediately.
+cmd_claim_pr_repair() {
+    local pr_num="${1:?usage: coordination claim-pr-repair N}"
+
+    # Cooldown: refuse if another session claimed this PR for repair in the last 30min
+    local recent_claim
+    recent_claim="$(gh api --paginate "repos/$REPO/issues/$pr_num/comments" \
+        --jq '[.[] | select(.body | test("Claimed PR repair by session")) |
+               select(.created_at > (now - 1800 | strftime("%Y-%m-%dT%H:%M:%SZ")))] |
+               length')"
+    if [[ "$recent_claim" -gt 0 ]]; then
+        echo "Another session claimed this PR for repair in the last 30 minutes. Skipping."
+        return 1
+    fi
+
+    # Add label BEFORE comment so `list-pr-repair` stops offering it promptly
+    gh pr edit "$pr_num" --repo "$REPO" --add-label repair-claimed 2>/dev/null || true
+    gh issue comment "$pr_num" --repo "$REPO" \
+        --body "Claimed PR repair by session \`$SESSION_ID\` on branch \`$BRANCH\`"
+}
+
+# --- mark-pr-salvaged ---
+# Clear the repair claim after a successful push. Does not close the PR —
+# auto-merge handles that once CI passes.
+cmd_mark_pr_salvaged() {
+    local pr_num="${1:?usage: coordination mark-pr-salvaged N}"
+    gh pr edit "$pr_num" --repo "$REPO" --remove-label repair-claimed 2>/dev/null || true
+    gh issue comment "$pr_num" --repo "$REPO" \
+        --body "Repair complete (session \`$SESSION_ID\`). Verification passed; pushed."
+}
+
+# --- close-pr-unsalvageable ---
+# Close PR with reason, remove has-pr from linked issue, add replan.
+# Clears the repair-claimed label and adds `unsalvageable` for observability.
+cmd_close_pr_unsalvageable() {
+    local pr_num="${1:?usage: coordination close-pr-unsalvageable N \"reason\"}"
+    local reason="${2:?usage: coordination close-pr-unsalvageable N \"reason\"}"
+
+    # Close with the reason as the closing comment
+    gh pr close "$pr_num" --repo "$REPO" \
+        --comment "Closing as unsalvageable: $reason (Session: \`$SESSION_ID\`)"
+
+    gh pr edit "$pr_num" --repo "$REPO" --add-label unsalvageable 2>/dev/null || true
+    gh pr edit "$pr_num" --repo "$REPO" --remove-label repair-claimed 2>/dev/null || true
+
+    # Restore linked issue to the planning queue. Add replan BEFORE removing
+    # has-pr so the issue is always labelled as something meaningful.
+    local linked_issue
+    linked_issue="$(gh pr view "$pr_num" --repo "$REPO" --json body --jq '.body' | \
+        grep -oE 'Closes #[0-9]+' | grep -oE '[0-9]+' | head -1)"
+    if [[ -n "$linked_issue" ]]; then
+        gh issue edit "$linked_issue" --repo "$REPO" --add-label replan 2>/dev/null || true
+        gh issue edit "$linked_issue" --repo "$REPO" --remove-label has-pr 2>/dev/null || true
+        gh issue comment "$linked_issue" --repo "$REPO" \
+            --body "PR #$pr_num closed as unsalvageable: $reason. Marked replan so a new plan can be produced."
+        echo "PR #$pr_num closed; linked issue #$linked_issue marked replan."
+    else
+        echo "PR #$pr_num closed; no linked issue found in PR body (looked for 'Closes #N')."
     fi
 }
 
@@ -888,6 +1048,10 @@ case "${1:-}" in
     create-pr)       shift; cmd_create_pr "$@" ;;
     claim-fix)       shift; cmd_claim_fix "$@" ;;
     close-pr)        shift; cmd_close_pr "$@" ;;
+    list-pr-repair)           cmd_list_pr_repair ;;
+    claim-pr-repair)          shift; cmd_claim_pr_repair "$@" ;;
+    mark-pr-salvaged)         shift; cmd_mark_pr_salvaged "$@" ;;
+    close-pr-unsalvageable)   shift; cmd_close_pr_unsalvageable "$@" ;;
     list-unclaimed)  shift; cmd_list_unclaimed "$@" ;;
     queue-depth)     shift; cmd_queue_depth "$@" ;;
     critical-path-depth)  shift; cmd_critical_path_depth "$@" ;;
@@ -907,5 +1071,5 @@ case "${1:-}" in
     set-target)          shift; cmd_set_target "$@" ;;
     set-min-queue)       shift; cmd_set_min_queue "$@" ;;
     *)               die "unknown command: ${1:-}
-Usage: coordination {orient|plan [--label L] [--critical-path]|create-pr|claim-fix|close-pr|list-unclaimed [--label L]|queue-depth [L]|critical-path-depth|claim|skip|add-dep|check-blocked|release-stale-claims|lock-planner|unlock-planner|lock-status|force-unlock-planner|return-to-human|check-return-to-human|clear-return-to-human|nothing-to-plan|set-target|set-min-queue}" ;;
+Usage: coordination {orient|plan [--label L] [--critical-path]|create-pr|claim-fix|close-pr|list-pr-repair|claim-pr-repair|mark-pr-salvaged|close-pr-unsalvageable|list-unclaimed [--label L]|queue-depth [L]|critical-path-depth|claim|skip|add-dep|check-blocked|release-stale-claims|lock-planner|unlock-planner|lock-status|force-unlock-planner|return-to-human|check-return-to-human|clear-return-to-human|nothing-to-plan|set-target|set-min-queue}" ;;
 esac

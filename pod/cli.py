@@ -79,6 +79,7 @@ AGENTS_DIR = POD_DIR / "agents"
 CONFIG_PATH = POD_DIR / "config.toml"
 LOG_PATH = POD_DIR / "pod.log"
 CLAIM_HISTORY_PATH = POD_DIR / "claim-history.json"
+PR_CLAIM_HISTORY_PATH = POD_DIR / "pr-claim-history.json"
 ISOLATED_CONFIG_DIR = POD_DIR / "claude-config"
 TARGET_FILE = POD_DIR / "target"  # Target agent count (int, one per line)
 PLANNER_TARGET_FILE = POD_DIR / "planner-target"  # Planner-recommended target agent count
@@ -142,6 +143,13 @@ cache_create = 6.25
 strategy = "queue_balance"
 min_queue = 3                      # queue_balance: below this → planner-type
 
+[repair]
+# A PR is considered "stuck" if a required check has been IN_PROGRESS
+# longer than this many minutes. Used by `coordination list-pr-repair`.
+stuck_ci_minutes = 120
+# Maximum concurrent repair agents (spawned regardless of planner_target).
+concurrency_cap = 2
+
 [monitor]
 poll_interval = 2                  # Seconds between status updates
 jsonl_stale_warning = 300          # Warn if JSONL unchanged for this many seconds
@@ -163,6 +171,14 @@ copy_build_cache = false
 
 [worker_types.work]
 prompt = "/work"
+copy_build_cache = true
+
+# Repair agent: handles unhealthy PRs (merge conflicts, failed CI, stuck CI).
+# Only selected when `coordination list-pr-repair` reports candidates (see
+# `dispatch_queue_balance`). `copy_build_cache` is enabled so repair agents
+# can run the project's verification before pushing.
+[worker_types.repair]
+prompt = "/repair"
 copy_build_cache = true
 
 # Example additional worker type:
@@ -540,6 +556,58 @@ def clear_claim(issue: int, session_uuid: str | None = None):
             return  # Entry belongs to a different session — don't clobber
         entry["released"] = True
         _save_claim_history(history)
+
+
+# ---------------------------------------------------------------------------
+# PR claim history (for repair agents)
+# ---------------------------------------------------------------------------
+# Mirrors issue-claim-history but keyed by PR number. A repair agent claims
+# a PR via `coordination claim-pr-repair`, which records an entry here. The
+# housekeeping loop (check_dead_pr_claimed_prs) releases stale claims whose
+# owning session has died, to keep the `repair-claimed` label from leaking.
+
+def load_pr_claim_history() -> dict:
+    """Load {pr_num_str -> {session_uuid, short_id, claimed_at}}."""
+    try:
+        return json.loads(PR_CLAIM_HISTORY_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _save_pr_claim_history(history: dict):
+    tmp = PR_CLAIM_HISTORY_PATH.with_suffix(".tmp")
+    try:
+        tmp.write_text(json.dumps(history, indent=2) + "\n")
+        tmp.rename(PR_CLAIM_HISTORY_PATH)
+    except OSError as e:
+        log(f"Failed to save PR claim history: {e}")
+
+
+def record_pr_claim(pr: int, session_uuid: str, short_id: str):
+    """Record that our session is repairing PR #pr. Reuses the issue-claim
+    filelock since writes are rare and concurrency is low."""
+    with _claim_history_filelock():
+        history = load_pr_claim_history()
+        history[str(pr)] = {
+            "session_uuid": session_uuid,
+            "short_id": short_id,
+            "claimed_at": time.time(),
+        }
+        _save_pr_claim_history(history)
+
+
+def clear_pr_claim(pr: int, session_uuid: str | None = None):
+    """Remove the PR-claim entry, compare-and-swap on session_uuid if given."""
+    with _claim_history_filelock():
+        history = load_pr_claim_history()
+        key = str(pr)
+        entry = history.get(key)
+        if not entry:
+            return
+        if session_uuid and entry.get("session_uuid") != session_uuid:
+            return
+        history.pop(key, None)
+        _save_pr_claim_history(history)
 
 
 # ---------------------------------------------------------------------------
@@ -1107,6 +1175,11 @@ def coordination(config: dict, *args, env_extra: dict | None = None,
         if rel not in pf:
             pf.append(rel)
     env["POD_PROTECTED_FILES"] = ":".join(pf)
+    # Pass repair-agent thresholds so the coordination script doesn't have to
+    # re-parse config.toml. Treated as advisory defaults — script may override
+    # for local testing by exporting these before calling.
+    stuck_ci_minutes = cfg_get(config, "repair", "stuck_ci_minutes", default=120)
+    env.setdefault("POD_STUCK_CI_MINUTES", str(stuck_ci_minutes))
     if env_extra:
         env.update(env_extra)
     return subprocess.run(
@@ -1496,18 +1569,47 @@ def _tool_detail(name: str, inp: dict, state: AgentState) -> str:
 # Dispatch Strategies
 # ---------------------------------------------------------------------------
 
+def _count_running_repair_agents(agents: list | None = None) -> int:
+    """Count live agents whose worker_type is 'repair'."""
+    if agents is None:
+        agents = read_all_agents()
+    return sum(1 for a in agents
+               if a.worker_type == "repair"
+               and a.status not in ("dead", "stopped", "killed"))
+
+
+def _list_pr_repair_count(config: dict) -> int:
+    """Return the number of PR-repair candidates, or 0 on error.
+
+    Calls `coordination list-pr-repair` and counts output lines.
+    """
+    try:
+        r = coordination(config, "list-pr-repair")
+    except (subprocess.TimeoutExpired, OSError):
+        return 0
+    if r.returncode != 0:
+        return 0
+    return sum(1 for line in r.stdout.splitlines() if line.strip())
+
+
 def _choose_draining(config: dict, draining: dict) -> str | None:
     """Pick a random draining worker type that has available work.
 
     For types with issue_label, check per-label queue depth via
     `coordination queue-depth <label>`. Shuffled so no type is
     systematically starved.
-    For types without issue_label, always consider them available.
+    For types without issue_label, always consider them available — except
+    `repair`, which is excluded here; repair dispatch is handled by the
+    short-circuit at the top of dispatch_queue_balance so that a generic
+    draining pass does not pick `repair` when no PRs need it.
     Returns None if no draining type has work.
     """
     items = list(draining.items())
     random.shuffle(items)
     for name, wt in items:
+        if name == "repair":
+            log("_choose_draining: skipping repair (handled by top-level short-circuit)")
+            continue
         issue_label = wt.get("issue_label", "")
         if issue_label:
             try:
@@ -1546,10 +1648,13 @@ def _choose_critical_path_draining(config: dict, draining: dict) -> str | None:
     Like _choose_draining but only considers critical-path issues.
     For typed workers (with issue_label), checks per-label critical-path depth.
     For untyped workers, checks global critical-path depth.
+    `repair` is excluded — it handles PRs, not critical-path issues.
     """
     items = list(draining.items())
     random.shuffle(items)
     for name, wt in items:
+        if name == "repair":
+            continue
         issue_label = wt.get("issue_label", "")
         if issue_label:
             if _get_critical_path_depth(config, issue_label) > 0:
@@ -1564,7 +1669,27 @@ def _choose_critical_path_draining(config: dict, draining: dict) -> str | None:
 def dispatch_queue_balance(config: dict, queue_depth: int,
                            worker_types: dict,
                            state: AgentState | None = None) -> str | None:
-    """Low queue → locked types (queue-filling), high queue → unlocked types (queue-draining)."""
+    """Low queue → locked types (queue-filling), high queue → unlocked types (queue-draining).
+
+    **Repair short-circuit**: before any filling/draining logic, if the
+    `repair` worker type is configured and `coordination list-pr-repair`
+    reports PR candidates with spare repair concurrency, dispatch `repair`.
+    This keeps repair orthogonal to `planner_target` and to queue depth.
+    """
+    # Repair short-circuit. Runs first so that unhealthy PRs are always
+    # addressed before new feature work is planned or drained.
+    if "repair" in worker_types:
+        candidates = _list_pr_repair_count(config)
+        running_repair = _count_running_repair_agents()
+        cap = cfg_get(config, "repair", "concurrency_cap", default=2)
+        if candidates > running_repair and running_repair < cap:
+            log(f"dispatch: repair short-circuit (candidates={candidates}, "
+                f"running_repair={running_repair}, cap={cap})")
+            return "repair"
+        elif candidates > 0:
+            log(f"dispatch: repair candidates={candidates} but running_repair={running_repair} "
+                f"already at/near cap={cap}, falling through")
+
     config_min_queue = cfg_get(config, "dispatch", "min_queue", default=3)
     planner_min_queue = read_planner_min_queue()
     if planner_min_queue is not None:
@@ -1572,7 +1697,9 @@ def dispatch_queue_balance(config: dict, queue_depth: int,
     else:
         min_queue = max(1, config_min_queue)
 
-    # Separate types into queue-filling (have locks) and queue-draining (no locks)
+    # Separate types into queue-filling (have locks) and queue-draining (no locks).
+    # `repair` is draining in principle but is handled exclusively by the
+    # short-circuit above, so _choose_draining skips it.
     filling = {k: v for k, v in worker_types.items() if v.get("lock")}
     draining = {k: v for k, v in worker_types.items() if not v.get("lock")}
 
@@ -2192,6 +2319,110 @@ def reconcile_untracked_github_claims():
 
     if released_count or backfilled_count:
         log(f"Reconcile: {backfilled_count} backfilled, {released_count} released")
+
+
+def check_dead_pr_claimed_prs(config: dict):
+    """Release `repair-claimed` labels on PRs whose owning session is dead.
+
+    Counterpart to check_dead_claimed_issues, but for the PR-claim namespace
+    used by repair agents. Unlike issue claims, repair claims are never
+    restarted — if the session died, we clear the claim and let a fresh
+    repair agent pick the PR up next time.
+
+    Also reconciles untracked `repair-claimed` labels (label present on GitHub
+    but no local history entry) and stale-by-time claims where the PID cannot
+    be resolved. Stale threshold defaults to 2× `repair.stuck_ci_minutes`.
+
+    Fail-closed: any gh / parsing error on a specific PR skips it.
+    """
+    repo = _get_repo()
+    cwd = str(PROJECT_DIR)
+    stuck_minutes = cfg_get(config, "repair", "stuck_ci_minutes", default=120)
+    stale_seconds = int(stuck_minutes) * 60 * 2
+
+    # 1. Find all open PRs carrying repair-claimed.
+    try:
+        r = subprocess.run(
+            ["gh", "pr", "list", "--repo", repo, "--state", "open",
+             "--label", "repair-claimed", "--limit", "100",
+             "--json", "number"],
+            capture_output=True, text=True, timeout=30, cwd=cwd,
+        )
+        if r.returncode != 0:
+            return
+        labelled = {pr["number"] for pr in json.loads(r.stdout)}
+    except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError):
+        return
+
+    history = load_pr_claim_history()
+    agents = read_all_agents()
+    live_uuids = {a.uuid for a in agents if a.status not in ("dead", "stopped", "killed")}
+
+    now_epoch = time.time()
+    to_release: list[tuple[int, str]] = []  # (pr_num, reason)
+
+    # 2. Labelled PRs: check live-session liveness via history + agent state.
+    for pr_num in labelled:
+        entry = history.get(str(pr_num))
+        if not entry:
+            # Untracked: no local history. Release if no live agent is
+            # actively working on this PR (best-effort: we can't match agent
+            # to PR without pr_number in AgentState, so just release
+            # after a grace window). For safety, require the label to be
+            # older than the stale_seconds threshold — which we don't have
+            # without a claim comment, so just release immediately. The
+            # coordination script only adds the label via claim-pr-repair,
+            # which always writes history, so untracked label ⇒ leak.
+            to_release.append((pr_num, "untracked: no local claim history"))
+            continue
+
+        owner_uuid = entry.get("session_uuid", "")
+        if owner_uuid in live_uuids:
+            continue  # Still being worked on
+
+        claimed_at = entry.get("claimed_at", 0)
+        age = now_epoch - claimed_at if claimed_at else stale_seconds + 1
+        if age < 300:  # 5 minute grace window for races
+            continue
+        to_release.append((pr_num, f"owner {owner_uuid[:8]} no longer live (age {int(age)}s)"))
+
+    # 3. Issue the releases.
+    released = 0
+    for pr_num, reason in to_release:
+        try:
+            r = subprocess.run(
+                ["gh", "pr", "edit", str(pr_num), "--repo", repo,
+                 "--remove-label", "repair-claimed"],
+                capture_output=True, timeout=30, cwd=cwd,
+            )
+            if r.returncode != 0:
+                continue
+            subprocess.run(
+                ["gh", "pr", "comment", str(pr_num), "--repo", repo,
+                 "--body", f"Repair claim released by reconciler: {reason}."],
+                capture_output=True, timeout=30, cwd=cwd,
+            )
+            clear_pr_claim(pr_num)
+            released += 1
+            log(f"check_dead_pr_claimed_prs: released repair claim on PR #{pr_num} ({reason})")
+        except (subprocess.TimeoutExpired, OSError):
+            continue
+
+    # 4. Clean history entries for PRs that no longer have the label
+    #    (claim was cleared by claim-pr-repair itself, or the PR merged/closed).
+    stale_history_keys = [
+        k for k in history
+        if int(k) not in labelled and (now_epoch - history[k].get("claimed_at", 0)) > 60
+    ]
+    if stale_history_keys:
+        with _claim_history_filelock():
+            h = load_pr_claim_history()
+            for k in stale_history_keys:
+                h.pop(k, None)
+            _save_pr_claim_history(h)
+
+    if released:
+        log(f"check_dead_pr_claimed_prs: released {released} stale repair claim(s)")
 
 
 # ---------------------------------------------------------------------------
@@ -2941,6 +3172,10 @@ def agent_process_main(config: dict, agent_id: str | None = None,
             except Exception:
                 pass
             try:
+                check_dead_pr_claimed_prs(config)
+            except Exception:
+                pass
+            try:
                 cleanup_stale_worktrees(config, verbose=True)
             except Exception:
                 pass
@@ -3390,6 +3625,10 @@ def _tui_main(stdscr, config: dict):
     blocked_deps_fetch_time = 0.0
     cached_lock_status: str | None = None  # "locked" or "unlocked"
     lock_fetch_time = 0.0
+    cached_repair_candidates: int = 0
+    repair_candidates_fetch_time = 0.0
+    # Whether the repair worker type is configured (avoid recomputing each tick).
+    repair_configured = "repair" in cfg_get(config, "worker_types", default={})
     # Check for pre-existing return-to-human signal synchronously at startup.
     # If it was already set before this TUI session, we honour it (target=0, banner)
     # but do NOT send SIGUSR1 — the human restarted pod intentionally.
@@ -3409,7 +3648,7 @@ def _tui_main(stdscr, config: dict):
     # Background fetch infrastructure: all GH/coordination calls run in daemon
     # threads so the TUI never blocks on network I/O.
     _bg_data: dict = {"queue": None, "items": None, "blocked_deps": None, "lock_status": None,
-                      "return_to_human": None}
+                      "return_to_human": None, "repair_candidates": None}
     _bg_active: set = set()
     _bg_mutex = threading.Lock()
 
@@ -3498,6 +3737,12 @@ def _tui_main(stdscr, config: dict):
         if not _acted_on_return_to_human and now - return_to_human_fetch_time > CACHE_SECS:
             _bg_fetch("return_to_human", get_return_to_human, config)
             return_to_human_fetch_time = now
+        # Repair candidates: count of PRs needing repair. Used by the
+        # auto-spawn override to expand `desired` beyond `target` when
+        # unhealthy PRs are present.
+        if repair_configured and now - repair_candidates_fetch_time > CACHE_SECS_SLOW:
+            _bg_fetch("repair_candidates", _list_pr_repair_count, config)
+            repair_candidates_fetch_time = now
         # Lock status: check agent state first (cheap), fall back to background API
         if now - lock_fetch_time > CACHE_SECS_SLOW:
             lock_fetch_time = now
@@ -3520,6 +3765,8 @@ def _tui_main(stdscr, config: dict):
                 cached_lock_status = _bg_data["lock_status"]
             if _bg_data["return_to_human"] is not None:
                 cached_return_to_human = _bg_data["return_to_human"]
+            if _bg_data["repair_candidates"] is not None:
+                cached_repair_candidates = _bg_data["repair_candidates"]
 
         # React to return-to-human signal: set target=0 and gracefully finish all agents.
         # Only act once per TUI session (idempotent).
@@ -3536,8 +3783,25 @@ def _tui_main(stdscr, config: dict):
             message_time = now
 
         # Auto-spawn agents to maintain target (only if no agents are finishing).
+        # Repair overflow: if there are PR repair candidates with spare
+        # concurrency, expand `desired` beyond `target` so a repair agent can
+        # spawn even when `planner_target` is 0. All spawns go through the
+        # same crash-loop guard below.
         target = get_effective_target()
-        if target is not None and running < target and now - last_auto_spawn_time > 5.0:
+        if target is None:
+            desired = 0
+        else:
+            desired = target
+            if repair_configured:
+                running_repair = _count_running_repair_agents(agents)
+                cap = cfg_get(config, "repair", "concurrency_cap", default=2)
+                repair_overflow = max(
+                    0,
+                    min(cached_repair_candidates - running_repair, cap - running_repair),
+                )
+                if repair_overflow > 0:
+                    desired = max(desired, running + repair_overflow)
+        if target is not None and running < desired and now - last_auto_spawn_time > 5.0:
             finishing_count = sum(1 for a in agents if a.status == "finishing")
             if finishing_count == 0:
                 if auto_spawn_paused:
@@ -3554,7 +3818,7 @@ def _tui_main(stdscr, config: dict):
                             "Pausing auto-spawn. Press 'a' to retry.")
                         auto_spawn_paused = True
                     else:
-                        n_to_spawn = target - running
+                        n_to_spawn = desired - running
                         for _ in range(n_to_spawn):
                             spawn_agent(config)
                         last_auto_spawn_time = now
@@ -4313,6 +4577,8 @@ REQUIRED_LABELS = {
     "replan": "D93F0B",
     "coordination": "0E8A16",
     "critical-path": "E11D48",
+    "repair-claimed": "7057FF",   # PR is claimed by a repair agent
+    "unsalvageable": "5C5C5C",    # PR closed by a repair agent as unsalvageable
 }
 
 
