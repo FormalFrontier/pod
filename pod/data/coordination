@@ -561,26 +561,62 @@ cmd_list_pr_repair() {
 }
 
 # --- claim-pr-repair ---
-# Claim a PR for repair work. Comment + repair-claimed label; 30min cooldown
-# guard against another repair agent stomping in immediately.
+# Claim a PR for repair work. Atomic: label + comment + race-detect, mirroring
+# cmd_claim's pattern. A 30-min cooldown catches repeat attempts by a different
+# session that hasn't seen the salvage/abandon outcome yet.
 cmd_claim_pr_repair() {
     local pr_num="${1:?usage: coordination claim-pr-repair N}"
 
-    # Cooldown: refuse if another session claimed this PR for repair in the last 30min
+    # Reject PRs already carrying repair-claimed by another session.
+    # (Label + recent comment means a live repair is in progress.)
+    local labels
+    labels="$(gh pr view "$pr_num" --repo "$REPO" --json labels --jq '[.labels[].name] | join(",")' 2>/dev/null || echo "")"
+    if echo "$labels" | grep -qw 'repair-claimed'; then
+        echo "CLAIM FAILED: PR #$pr_num is already repair-claimed."
+        return 1
+    fi
+
+    # Cooldown: refuse if another session claimed this PR for repair in the
+    # last 30 min (successful or not — avoids stampede on a flaky PR).
     local recent_claim
     recent_claim="$(gh api --paginate "repos/$REPO/issues/$pr_num/comments" \
         --jq '[.[] | select(.body | test("Claimed PR repair by session")) |
                select(.created_at > (now - 1800 | strftime("%Y-%m-%dT%H:%M:%SZ")))] |
                length')"
     if [[ "$recent_claim" -gt 0 ]]; then
-        echo "Another session claimed this PR for repair in the last 30 minutes. Skipping."
+        echo "CLAIM FAILED: PR #$pr_num was claimed for repair within the last 30 minutes."
         return 1
     fi
 
-    # Add label BEFORE comment so `list-pr-repair` stops offering it promptly
+    # Add label BEFORE comment so `list-pr-repair` stops offering it promptly.
     gh pr edit "$pr_num" --repo "$REPO" --add-label repair-claimed 2>/dev/null || true
     gh issue comment "$pr_num" --repo "$REPO" \
         --body "Claimed PR repair by session \`$SESSION_ID\` on branch \`$BRANCH\`"
+
+    # Race detection: wait briefly, then check for multiple recent claim
+    # comments. Lowest UUID wins — losers remove the label and exit.
+    sleep 2
+    local recent_claims
+    recent_claims="$(gh api --paginate "repos/$REPO/issues/$pr_num/comments" \
+        --jq '[.[] | select(.body | test("Claimed PR repair by session")) |
+               select(.created_at > (now - 60 | strftime("%Y-%m-%dT%H:%M:%SZ")))] |
+               length')"
+    if [[ "$recent_claims" -gt 1 ]]; then
+        local winner
+        winner="$(gh api --paginate "repos/$REPO/issues/$pr_num/comments" \
+            --jq '[.[] | select(.body | test("Claimed PR repair by session")) |
+                   select(.created_at > (now - 60 | strftime("%Y-%m-%dT%H:%M:%SZ")))] |
+                   sort_by(.body) | .[0].body |
+                   match("session `([^`]+)`") | .captures[0].string')"
+        if [[ "$winner" != "$SESSION_ID" ]]; then
+            echo "CLAIM FAILED: Race lost on PR #$pr_num — another session won."
+            # Don't remove the label — the winner needs it.
+            return 1
+        fi
+        echo "Race detected on PR #$pr_num — this session won."
+    fi
+
+    echo "Claimed PR #$pr_num for repair"
 }
 
 # --- mark-pr-salvaged ---
@@ -600,26 +636,54 @@ cmd_close_pr_unsalvageable() {
     local pr_num="${1:?usage: coordination close-pr-unsalvageable N \"reason\"}"
     local reason="${2:?usage: coordination close-pr-unsalvageable N \"reason\"}"
 
-    # Close with the reason as the closing comment
+    # Resolve linked issues BEFORE closing the PR. GitHub's
+    # `closingIssuesReferences` list handles every close-keyword variant
+    # (Closes/Fixes/Resolves, any case, same-repo and cross-repo), which a
+    # regex on the body does not.
+    local linked_issues
+    linked_issues="$(gh pr view "$pr_num" --repo "$REPO" \
+        --json closingIssuesReferences \
+        --jq '[.closingIssuesReferences[] | select(.number != null) | .number] | .[]' 2>/dev/null || echo "")"
+
+    # Close with the reason as the closing comment.
     gh pr close "$pr_num" --repo "$REPO" \
         --comment "Closing as unsalvageable: $reason (Session: \`$SESSION_ID\`)"
 
     gh pr edit "$pr_num" --repo "$REPO" --add-label unsalvageable 2>/dev/null || true
     gh pr edit "$pr_num" --repo "$REPO" --remove-label repair-claimed 2>/dev/null || true
 
-    # Restore linked issue to the planning queue. Add replan BEFORE removing
-    # has-pr so the issue is always labelled as something meaningful.
-    local linked_issue
-    linked_issue="$(gh pr view "$pr_num" --repo "$REPO" --json body --jq '.body' | \
-        grep -oE 'Closes #[0-9]+' | grep -oE '[0-9]+' | head -1)"
-    if [[ -n "$linked_issue" ]]; then
-        gh issue edit "$linked_issue" --repo "$REPO" --add-label replan 2>/dev/null || true
-        gh issue edit "$linked_issue" --repo "$REPO" --remove-label has-pr 2>/dev/null || true
-        gh issue comment "$linked_issue" --repo "$REPO" \
-            --body "PR #$pr_num closed as unsalvageable: $reason. Marked replan so a new plan can be produced."
-        echo "PR #$pr_num closed; linked issue #$linked_issue marked replan."
+    if [[ -n "$linked_issues" ]]; then
+        local updated=()
+        while IFS= read -r issue_num; do
+            [[ -z "$issue_num" ]] && continue
+            # Add replan BEFORE removing has-pr so the issue is always
+            # carrying a meaningful label.
+            gh issue edit "$issue_num" --repo "$REPO" --add-label replan 2>/dev/null || true
+            gh issue edit "$issue_num" --repo "$REPO" --remove-label has-pr 2>/dev/null || true
+            gh issue comment "$issue_num" --repo "$REPO" \
+                --body "PR #$pr_num closed as unsalvageable: $reason. Marked replan so a new plan can be produced."
+            updated+=("#$issue_num")
+        done <<< "$linked_issues"
+        echo "PR #$pr_num closed; linked issue(s) marked replan: ${updated[*]}"
     else
-        echo "PR #$pr_num closed; no linked issue found in PR body (looked for 'Closes #N')."
+        # Fallback: grep the body for close-keywords if the GraphQL list was
+        # empty (some PRs reference issues in ways GitHub's parser misses).
+        local fallback_issues
+        fallback_issues="$(gh pr view "$pr_num" --repo "$REPO" --json body --jq '.body' \
+            | grep -oiE '(closes|closed|close|fixes|fixed|fix|resolves|resolved|resolve)[[:space:]]+#[0-9]+' \
+            | grep -oE '[0-9]+' | sort -u)"
+        if [[ -n "$fallback_issues" ]]; then
+            while IFS= read -r issue_num; do
+                [[ -z "$issue_num" ]] && continue
+                gh issue edit "$issue_num" --repo "$REPO" --add-label replan 2>/dev/null || true
+                gh issue edit "$issue_num" --repo "$REPO" --remove-label has-pr 2>/dev/null || true
+                gh issue comment "$issue_num" --repo "$REPO" \
+                    --body "PR #$pr_num closed as unsalvageable: $reason. Marked replan so a new plan can be produced."
+            done <<< "$fallback_issues"
+            echo "PR #$pr_num closed; fallback-resolved issue(s) marked replan: $fallback_issues"
+        else
+            echo "PR #$pr_num closed; no linked issue found (closingIssuesReferences empty, body grep empty)."
+        fi
     fi
 }
 

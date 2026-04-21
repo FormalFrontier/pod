@@ -627,6 +627,7 @@ class AgentState:
     session_start: float = 0.0
     claimed_issue: int = 0
     pr_number: int = 0
+    repair_pr: int = 0             # PR currently claimed by this agent for repair
     git_start: str = ""
     tokens_in: int = 0
     tokens_out: int = 0
@@ -1482,15 +1483,27 @@ def _parse_codex_jsonl_line(line: bytes, state: AgentState):
             cmd = item.get("command", "")[:120]
             state.last_text = f"[exec] {cmd}"
             state.last_activity = time.time()
-            # Detect claim from coordination script output
+            # Detect issue claim from coordination script output
             output = item.get("aggregated_output", "")
             m = re.search(r"Claimed issue #(\d+)", output)
             if m:
                 state.claimed_issue = int(m.group(1))
+            # Detect PR repair claim from output (only on success — the command
+            # emits "Claimed PR #N for repair" only after race-detect passes)
+            m_pr_claim = re.search(r"Claimed PR #(\d+) for repair", output)
+            if m_pr_claim:
+                state.repair_pr = int(m_pr_claim.group(1))
             # Detect PR creation from coordination create-pr
             m2 = re.search(r"(?:coordination\s+create-pr\s+(?:--\S+\s+)*)(\d+)", cmd)
             if m2:
                 state.pr_number = int(m2.group(1))
+            # Detect repair-claim release (mark-pr-salvaged / close-pr-unsalvageable)
+            m_rel = re.search(
+                r"coordination\s+(?:mark-pr-salvaged|close-pr-unsalvageable)\s+(\d+)",
+                cmd,
+            )
+            if m_rel:
+                state.repair_pr = 0
 
 
 def _parse_claude_jsonl_line(line: bytes, state: AgentState):
@@ -1513,6 +1526,9 @@ def _parse_claude_jsonl_line(line: bytes, state: AgentState):
                         m = re.search(r"Claimed issue #(\d+)", result_text)
                         if m:
                             state.claimed_issue = int(m.group(1))
+                        m_pr = re.search(r"Claimed PR #(\d+) for repair", result_text)
+                        if m_pr:
+                            state.repair_pr = int(m_pr.group(1))
         return
 
     if msg_type != "assistant":
@@ -1541,10 +1557,19 @@ def _tool_detail(name: str, inp: dict, state: AgentState) -> str:
     if name == "Bash":
         desc = inp.get("description", "")
         cmd = inp.get("command", "")
-        # Detect coordination create-pr (claim is detected from tool results instead)
+        # Detect coordination create-pr (issue-claim is detected from tool results instead)
         m = re.search(r"(?:^|&&\s*|;\s*)(?:\./)?coordination\s+create-pr\s+(?:--\S+\s+)*(\d+)", cmd)
         if m:
             state.pr_number = int(m.group(1))
+        # Repair-claim release: mark-pr-salvaged / close-pr-unsalvageable
+        # clear the repair-claimed label, so we should clear our own tracking
+        # as soon as we see the command fire.
+        m_rel = re.search(
+            r"(?:^|&&\s*|;\s*)(?:\./)?coordination\s+(?:mark-pr-salvaged|close-pr-unsalvageable)\s+(\d+)",
+            cmd,
+        )
+        if m_rel:
+            state.repair_pr = 0
         if desc and cmd:
             return f"{desc}: {cmd}"
         return desc or cmd
@@ -2357,23 +2382,64 @@ def check_dead_pr_claimed_prs(config: dict):
     history = load_pr_claim_history()
     agents = read_all_agents()
     live_uuids = {a.uuid for a in agents if a.status not in ("dead", "stopped", "killed")}
+    # Also treat any PR actively tracked by a live agent's state.repair_pr as
+    # owned, even if the local history hasn't caught up yet (e.g. within the
+    # few-second window between label write and record_pr_claim).
+    live_repair_prs = {a.repair_pr for a in agents
+                        if a.repair_pr > 0 and a.uuid in live_uuids}
 
     now_epoch = time.time()
+    grace_seconds = 300  # 5 min — don't yank labels out from under fresh claims
     to_release: list[tuple[int, str]] = []  # (pr_num, reason)
 
     # 2. Labelled PRs: check live-session liveness via history + agent state.
     for pr_num in labelled:
+        if pr_num in live_repair_prs:
+            continue  # A live agent reports this PR as its repair_pr
         entry = history.get(str(pr_num))
         if not entry:
-            # Untracked: no local history. Release if no live agent is
-            # actively working on this PR (best-effort: we can't match agent
-            # to PR without pr_number in AgentState, so just release
-            # after a grace window). For safety, require the label to be
-            # older than the stale_seconds threshold — which we don't have
-            # without a claim comment, so just release immediately. The
-            # coordination script only adds the label via claim-pr-repair,
-            # which always writes history, so untracked label ⇒ leak.
-            to_release.append((pr_num, "untracked: no local claim history"))
+            # Untracked label. Could be a leak (label added by a failed
+            # claim run that died before record_pr_claim) or a very fresh
+            # claim whose record hasn't been written yet. Fetch the latest
+            # claim comment to distinguish, and only release if:
+            #  - the comment is older than the grace window, AND
+            #  - its owner session is not live.
+            try:
+                r = subprocess.run(
+                    ["gh", "api", "--paginate", f"repos/{repo}/issues/{pr_num}/comments",
+                     "--jq",
+                     '[.[] | select(.body | startswith("Claimed PR repair by session"))] '
+                     '| sort_by(.created_at) | last | {body, created_at}'],
+                    capture_output=True, text=True, timeout=30, cwd=cwd,
+                )
+                if r.returncode != 0:
+                    continue
+                blob = r.stdout.strip()
+                if not blob or blob == "null":
+                    # No claim comment at all — label is orphaned from a
+                    # failed claim attempt. Grace-release.
+                    to_release.append((pr_num, "orphaned label: no claim comment"))
+                    continue
+                cdata = json.loads(blob)
+            except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError):
+                continue
+            import re as _re
+            m = _re.search(r'Claimed PR repair by session `([^`]+)`', cdata.get("body", ""))
+            if not m:
+                continue
+            owner_uuid = m.group(1)
+            try:
+                from datetime import datetime
+                created_at = cdata.get("created_at", "")
+                claim_ts = datetime.fromisoformat(created_at.replace("Z", "+00:00")).timestamp()
+            except (ValueError, TypeError):
+                continue
+            age = now_epoch - claim_ts
+            if age < grace_seconds:
+                continue  # Too fresh, might be a claim mid-write
+            if owner_uuid in live_uuids:
+                continue  # Owner is alive — leave their label alone
+            to_release.append((pr_num, f"untracked: owner {owner_uuid[:8]} not live (age {int(age)}s)"))
             continue
 
         owner_uuid = entry.get("session_uuid", "")
@@ -2382,7 +2448,7 @@ def check_dead_pr_claimed_prs(config: dict):
 
         claimed_at = entry.get("claimed_at", 0)
         age = now_epoch - claimed_at if claimed_at else stale_seconds + 1
-        if age < 300:  # 5 minute grace window for races
+        if age < grace_seconds:
             continue
         to_release.append((pr_num, f"owner {owner_uuid[:8]} no longer live (age {int(age)}s)"))
 
@@ -3327,6 +3393,7 @@ def agent_process_main(config: dict, agent_id: str | None = None,
 
         # --- Monitor until claude exits ---
         _last_tracked_issue = 0
+        _last_tracked_repair_pr = 0
         _stuck_first_detected = 0.0   # monotonic time of first stuck detection
         _stuck_kill_pending = False    # True after phase-1 detection, waiting for confirm
         _last_stuck_check = 0.0       # monotonic time of last health check
@@ -3341,6 +3408,15 @@ def agent_process_main(config: dict, agent_id: str | None = None,
             elif state.pr_number > 0 and state.claimed_issue > 0:
                 clear_claim(state.claimed_issue, session_uuid=state.uuid)
                 _last_tracked_issue = 0
+            # Track repair-PR claim lifecycle (parallel to issue-claim). A
+            # repair agent never has a claimed_issue, so these live on a
+            # separate branch keyed by state.repair_pr.
+            if state.repair_pr > 0 and state.repair_pr != _last_tracked_repair_pr:
+                record_pr_claim(state.repair_pr, state.uuid, state.short_id)
+                _last_tracked_repair_pr = state.repair_pr
+            elif state.repair_pr == 0 and _last_tracked_repair_pr > 0:
+                clear_pr_claim(_last_tracked_repair_pr, session_uuid=state.uuid)
+                _last_tracked_repair_pr = 0
 
             # --- Stuck-agent detection ---
             stuck_initial = _reload_config_value(
