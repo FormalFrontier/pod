@@ -146,18 +146,55 @@ in a single session. Warning signs it doesn't:
 - The work naturally splits into independent sub-lemmas or sub-tasks
 - Difficulty feels higher than the issue says
 
-**If so, decompose immediately** — don't attempt the whole thing first.
+If the issue is too large, **decomposing it into smaller sub-issues is a
+normal success path**, not a failure mode. You have the freshest codebase
+context and can usually scope sub-tasks more accurately than a planner could
+in advance. A good decomposition is more valuable than a failed heroic
+attempt — and far better than overrunning the session trying to salvage it.
+
+You may decompose when any of these is true:
+- the claimed issue is too large for one session,
+- the work naturally splits into independent sub-tasks,
+- you can write self-contained successor issues without further investigation.
 
 ```bash
-# Create sub-issues, then skip the parent
+# Create self-contained sub-issues. Use `coordination plan` exactly as a
+# planner would — same body template (Current state / Deliverables /
+# Context / Verification), same label, same overlap-warning protection.
 echo "body..." | coordination plan --label feature "Sub-task 1: ..."
 echo "body..." | coordination plan --label feature "Sub-task 2: ..."
-coordination add-dep <sub2> <sub1>   # if ordering matters
-coordination skip <parent> "Decomposed into #X, #Y — too large for single session"
+
+# Link ordering dependencies if any sub-task must precede another.
+coordination add-dep <sub2> <sub1>
 ```
 
-Then claim one of the sub-issues and work on that instead.
-A good decomposition is more valuable than a failed heroic attempt.
+Then resolve the parent issue. Pick whichever fits:
+
+- **Sub-issues fully cover the parent** (no residual scope): close the
+  parent, linking forward so the planner doesn't re-triage it.
+  ```bash
+  gh issue close <parent> --comment "Decomposed into #X, #Y — superseded."
+  gh issue edit <parent> --remove-label claimed
+  ```
+- **Parent still has residual scope or needs re-scoping**: skip it so the
+  planner narrows the body to what's left.
+  ```bash
+  coordination skip <parent> "Decomposed into #X, #Y — narrow this to <residual>"
+  ```
+
+After decomposing, you have two options:
+
+1. **Continue on one of the sub-issues**: claim it via `coordination claim`,
+   then return to Step 2 with the sub-issue. Common case when the parent
+   was just two work items glued together.
+2. **Stop and exit**: if you've used most of your session orienting, write a
+   brief progress entry and exit. The next worker will claim a sub-issue.
+
+If you've already done a coherent subset of the parent's work *before*
+deciding to decompose, prefer the partial-PR path instead: create sub-issues
+for the remaining work, then `coordination create-pr <parent> --partial`.
+That marks the parent `replan`; the next planner sees the sub-issues in the
+issue's comments and closes the parent with a forward link.
 
 ## Step 5: Execute
 
