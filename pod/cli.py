@@ -983,17 +983,97 @@ def _model_tier(backend: str, model: str) -> int:
     return _MODEL_TIER.get(backend, {}).get(model, 0)
 
 
-def check_quota(config: dict, force: bool = False) -> bool:
-    """Check if agent quota is available. Returns True if OK."""
+def _claude_keychain_service(claude_config_dir: Path | None) -> str:
+    """Compute the macOS keychain service name Claude Code uses for credentials.
+
+    Mirrors @anthropic-ai/claude-code's lookup: the service is
+    "Claude Code-credentials" for the default ~/.claude config dir, or
+    "Claude Code-credentials-<sha256(NFC(config_dir))[:8]>" when
+    CLAUDE_CONFIG_DIR is set.
+    """
+    import hashlib
+    import unicodedata
+    if claude_config_dir is None:
+        return "Claude Code-credentials"
+    normalized = unicodedata.normalize("NFC", str(claude_config_dir))
+    suffix = hashlib.sha256(normalized.encode()).hexdigest()[:8]
+    return f"Claude Code-credentials-{suffix}"
+
+
+def resolve_claude_credential(claude_config_dir: Path | None) -> dict:
+    """Resolve the credential Claude Code will actually use at launch time.
+
+    Mirrors Claude Code's lookup order: the macOS keychain entry keyed by
+    sha256(CLAUDE_CONFIG_DIR) first, then the plaintext
+    ``$CLAUDE_CONFIG_DIR/.credentials.json`` fallback.
+
+    Returns {accountLabel, tokenPrefix, source}.
+    """
+    import json as _json
+    service = _claude_keychain_service(claude_config_dir)
+
+    try:
+        r = subprocess.run(
+            ["security", "find-generic-password",
+             "-s", service, "-a", os.getenv("USER", ""), "-w"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            kc = _json.loads(r.stdout.strip())
+            return {
+                "accountLabel": kc.get("accountLabel", "?"),
+                "tokenPrefix": kc.get("claudeAiOauth", {}).get("accessToken", "")[:20],
+                "source": f"keychain[{service}]",
+            }
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError, ValueError):
+        pass
+
+    if claude_config_dir is not None:
+        creds_path = claude_config_dir / ".credentials.json"
+    else:
+        creds_path = Path.home() / ".claude" / ".credentials.json"
+    try:
+        with open(creds_path) as f:
+            creds = _json.load(f)
+        symlink = ""
+        if creds_path.is_symlink():
+            symlink = f" -> {os.readlink(creds_path)}"
+        return {
+            "accountLabel": creds.get("accountLabel", "?"),
+            "tokenPrefix": creds.get("claudeAiOauth", {}).get("accessToken", "")[:20],
+            "source": f"file[{creds_path}]{symlink}",
+        }
+    except (OSError, ValueError):
+        pass
+
+    return {"accountLabel": "?", "tokenPrefix": "", "source": "none"}
+
+
+def check_quota(config: dict, force: bool = False,
+                claude_config_dir: Path | None = None) -> bool:
+    """Check if agent quota is available. Returns True if OK.
+
+    For the Claude backend, resolves the credential Claude Code will actually
+    use for ``claude_config_dir`` and asks the quota helper about *that*
+    account specifically — otherwise the helper inspects whichever account
+    owns the default keychain entry, which may differ from the one launched
+    sessions actually hit.
+    """
     if force or FORCE_QUOTA_FILE.exists():
         return True
     cmd = os.path.expanduser(_backend_cfg(config, "quota_check", default=""))
     if not cmd:
         return True
     quota_required = _backend_cfg(config, "quota_check_required", default=True)
+    args = [cmd]
+    if _backend(config) == "claude":
+        resolved = resolve_claude_credential(claude_config_dir)
+        label = resolved.get("accountLabel", "")
+        if label and label != "?":
+            args += ["--account", label]
     try:
         result = subprocess.run(
-            [cmd], capture_output=True, text=True, timeout=30
+            args, capture_output=True, text=True, timeout=30
         )
         if result.returncode == 2 and not quota_required:
             # Exit 2 = cache missing/stale; proceed if quota check is optional
@@ -2520,49 +2600,28 @@ def _cleanup_stale_worktrees_locked(
 
 
 def _log_credential_state(session_uuid: str, claude_config_dir: Path | None = None):
-    """Log which credential sources are available at agent launch time.
+    """Log which credential Claude Code will actually use at agent launch time.
 
-    Records the account label and token prefix from both the credentials.json
-    file and the macOS keychain, so we can diagnose account-swap issues.
+    Reports the resolved credential (the one Claude Code reads from the
+    suffixed keychain entry, or the credentials.json fallback) and warns
+    when the isolated config dir diverges from the default keychain entry
+    — that divergence is the canonical sign of the "wrong account" bug.
     """
-    import json as _json
-
     parts = [f"session={session_uuid[:8]}"]
 
-    # Check credentials.json (or symlink target)
-    if claude_config_dir is not None:
-        creds_path = claude_config_dir / ".credentials.json"
-    else:
-        creds_path = Path.home() / ".claude" / ".credentials.json"
-    try:
-        with open(creds_path) as f:
-            creds = _json.load(f)
-        label = creds.get("accountLabel", "?")
-        token = creds.get("claudeAiOauth", {}).get("accessToken", "")
-        symlink_target = ""
-        if creds_path.is_symlink():
-            symlink_target = f" -> {os.readlink(creds_path)}"
-        parts.append(f"file=[{label}] token={token[:20]}...{symlink_target}")
-    except Exception as e:
-        parts.append(f"file=error({e})")
+    resolved = resolve_claude_credential(claude_config_dir)
+    parts.append(
+        f"resolved=[{resolved['accountLabel']}] "
+        f"token={resolved['tokenPrefix']}... via {resolved['source']}"
+    )
 
-    # Check macOS keychain
-    try:
-        import subprocess as _sp
-        r = _sp.run(
-            ["security", "find-generic-password",
-             "-s", "Claude Code-credentials", "-a", os.getenv("USER", "kim"), "-w"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if r.returncode == 0 and r.stdout.strip():
-            kc = _json.loads(r.stdout.strip())
-            kc_label = kc.get("accountLabel", "?")
-            kc_token = kc.get("claudeAiOauth", {}).get("accessToken", "")
-            parts.append(f"keychain=[{kc_label}] token={kc_token[:20]}...")
-        else:
-            parts.append("keychain=empty")
-    except Exception as e:
-        parts.append(f"keychain=error({e})")
+    if claude_config_dir is not None:
+        default_resolved = resolve_claude_credential(None)
+        if default_resolved["accountLabel"] != resolved["accountLabel"]:
+            parts.append(
+                f"WARNING default keychain has [{default_resolved['accountLabel']}] "
+                f"-- isolated config diverges"
+            )
 
     log(f"Credential state at launch: {' | '.join(parts)}")
 
@@ -2846,7 +2905,8 @@ def agent_process_main(config: dict, agent_id: str | None = None,
         # --- Quota check ---
         state.status = "waiting_quota"
         state.write()
-        while not check_quota(config, force=state.force_quota):
+        while not check_quota(config, force=state.force_quota,
+                               claude_config_dir=claude_config_dir):
             if state.finishing:
                 break
             # Re-read state file to pick up force_quota toggled by TUI
