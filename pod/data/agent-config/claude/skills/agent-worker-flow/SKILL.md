@@ -38,12 +38,19 @@ The `gh` CLI defaults to the current repo, so `--repo` is not needed.
 **Issue lifecycle**: planner creates issue (label: `agent-plan`) →
 worker claims it (adds label: `claimed`) → worker creates PR closing it
 (label swaps to `has-pr`) → auto-merge squash-merges.
-Issues marked `replan` (by skip or partial completion) are handled by the next planner.
-Issues with `has-pr` are excluded from `list-unclaimed` and `queue-depth`.
+Issues marked `replan` (by skip, partial completion, or worker-led
+decomposition) are handled by the next planner. Issues with `has-pr` are
+excluded from `list-unclaimed` and `queue-depth`.
 
 **Partial completion**: worker uses `--partial` → label swaps to
 `replan`. A planner creates a new issue for remaining work, then closes
 the `replan` issue with a link to the new one.
+
+**Worker-led decomposition**: if the claimed issue is too large for one
+session, worker creates sub-issues and `coordination skip`s the parent
+with a `Decomposed into #X, #Y` breadcrumb comment. The next planner
+either closes the parent (sub-issues fully cover it) or narrows it to the
+residual scope. See "Assess Scope" (Step 4b) for the full procedure.
 
 **Dependencies**: Issues can declare `depends-on: #N` in their body.
 `coordination plan` auto-adds the `blocked` label if any dependency is
@@ -158,29 +165,40 @@ You may decompose when any of these is true:
 - you can write self-contained successor issues without further investigation.
 
 ```bash
-# Create self-contained sub-issues. Use `coordination plan` exactly as a
-# planner would — same body template (Current state / Deliverables /
-# Context / Verification), same label, same overlap-warning protection.
+# 1. Create self-contained sub-issues. Use `coordination plan` exactly as a
+#    planner would — same body template (Current state / Deliverables /
+#    Context / Verification), same label. Note: `coordination plan` does
+#    only best-effort title-keyword overlap warnings; it does not hold the
+#    planner lock and cannot atomically dedupe against concurrent creators.
+#    If you see open issues that look related, link or coordinate
+#    explicitly in the sub-issue body rather than relying on the warning.
 echo "body..." | coordination plan --label feature "Sub-task 1: ..."
 echo "body..." | coordination plan --label feature "Sub-task 2: ..."
 
-# Link ordering dependencies if any sub-task must precede another.
+# 2. Link ordering dependencies if any sub-task must precede another.
+#    Do NOT add `depends-on: #<parent>` — the parent is about to be
+#    superseded; depend on real predecessor sub-issues instead.
 coordination add-dep <sub2> <sub1>
+
+# 3. Leave a machine-readable breadcrumb on the parent. The planner's
+#    replan-triage step keys off this exact `Decomposed into #X, #Y`
+#    phrasing — keep it on a single line at the start of the comment.
+gh issue comment <parent> --body "Decomposed into #<sub1>, #<sub2>
+
+(reason: <one-line scope assessment>)"
+
+# 4. Release the claim by marking the parent for planner triage. This
+#    routes through pod's claim-state machinery and clears the in-process
+#    `state.claimed_issue` correctly. Do NOT use `gh issue close` directly:
+#    it leaves pod's session-end cleanup thinking the issue is still
+#    claimed and will attempt a stray `coordination skip` on a closed
+#    issue at exit.
+coordination skip <parent> "Decomposed into #<sub1>, #<sub2> — see comment"
 ```
 
-Then resolve the parent issue. Pick whichever fits:
-
-- **Sub-issues fully cover the parent** (no residual scope): close the
-  parent, linking forward so the planner doesn't re-triage it.
-  ```bash
-  gh issue close <parent> --comment "Decomposed into #X, #Y — superseded."
-  gh issue edit <parent> --remove-label claimed
-  ```
-- **Parent still has residual scope or needs re-scoping**: skip it so the
-  planner narrows the body to what's left.
-  ```bash
-  coordination skip <parent> "Decomposed into #X, #Y — narrow this to <residual>"
-  ```
+The planner's next replan-triage cycle picks the parent up and either
+closes it (if the sub-issues fully cover it) or narrows the body to the
+residual scope (if not).
 
 After decomposing, you have two options:
 
@@ -191,10 +209,18 @@ After decomposing, you have two options:
    brief progress entry and exit. The next worker will claim a sub-issue.
 
 If you've already done a coherent subset of the parent's work *before*
-deciding to decompose, prefer the partial-PR path instead: create sub-issues
-for the remaining work, then `coordination create-pr <parent> --partial`.
-That marks the parent `replan`; the next planner sees the sub-issues in the
-issue's comments and closes the parent with a forward link.
+deciding to decompose, prefer the partial-PR path:
+
+```bash
+# Steps 1-3 above (create sub-issues for the remaining work, leave the
+# `Decomposed into #X, #Y` breadcrumb on the parent).
+
+# Then land your coherent subset. `--partial` marks the parent `replan`.
+coordination create-pr <parent> --partial "feat: <what landed>"
+```
+
+The next planner sees the breadcrumb on the parent and closes it with a
+forward link to the sub-issues.
 
 ## Step 5: Execute
 

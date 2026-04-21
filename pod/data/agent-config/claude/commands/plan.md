@@ -56,10 +56,18 @@ For each, exactly one of:
 - **Work already done** (a subsequent PR merged it): close with a note
 - **Plan stale / approach changed**: create a corrected replacement issue, close original linking forward
 - **Partial progress**: create issue for remaining deliverables, close original linking forward
-- **Worker-decomposed**: the worker already created sub-issues (look for a
-  `Decomposed into #X, #Y` comment). If the sub-issues fully cover the parent,
-  just close it linking forward — do NOT re-create them. If residual scope
-  remains, narrow the body to that residual and remove the `replan` label.
+- **Worker-decomposed**: the worker created sub-issues before releasing
+  the claim. Detect via a comment that starts with `Decomposed into #` and
+  lists the sub-issue numbers (workers must leave this breadcrumb before
+  `coordination skip` or `coordination create-pr --partial`). Read the
+  sub-issues and decide:
+  - sub-issues fully cover the parent → close the parent with a forward
+    link (do NOT re-create the sub-issues);
+  - residual scope remains → narrow the body to that residual and remove
+    the `replan` label so workers can claim it again.
+  In the partial-PR variant the parent will also have a merged or open PR
+  reference; treat it the same way and rely on the merged PR to record the
+  partial work.
 - **Still valid, body still accurate**: remove the `replan` label (`gh issue edit N --remove-label replan`) to re-open for workers
 - **Still valid, body stale**: update the issue body with current state, then remove the `replan` label
 
