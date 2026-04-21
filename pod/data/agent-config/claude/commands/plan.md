@@ -56,6 +56,18 @@ For each, exactly one of:
 - **Work already done** (a subsequent PR merged it): close with a note
 - **Plan stale / approach changed**: create a corrected replacement issue, close original linking forward
 - **Partial progress**: create issue for remaining deliverables, close original linking forward
+- **Worker-decomposed**: the worker created sub-issues before releasing
+  the claim. Detect via a comment that starts with `Decomposed into #` and
+  lists the sub-issue numbers (workers must leave this breadcrumb before
+  `coordination skip` or `coordination create-pr --partial`). Read the
+  sub-issues and decide:
+  - sub-issues fully cover the parent → close the parent with a forward
+    link (do NOT re-create the sub-issues);
+  - residual scope remains → narrow the body to that residual and remove
+    the `replan` label so workers can claim it again.
+  In the partial-PR variant the parent will also have a merged or open PR
+  reference; treat it the same way and rely on the merged PR to record the
+  partial work.
 - **Still valid, body still accurate**: remove the `replan` label (`gh issue edit N --remove-label replan`) to re-open for workers
 - **Still valid, body stale**: update the issue body with current state, then remove the `replan` label
 
@@ -118,12 +130,18 @@ stage, follow them. The goal is many small, independent issues — not one large
 issue per stage.
 
 If you cannot yet determine the scope of a stage because it depends on earlier
-output (e.g., item discovery), create the issue for the whole stage but include
-a note in the body: **"This issue needs decomposition: once the prerequisite is
-complete, the claiming worker should
-`coordination skip N 'needs decomposition into per-item sub-issues'` so the
-planner can create properly-scoped sub-issues."** This keeps issue creation under
-planner locking and overlap protection. Never ask workers to create issues directly.
+output (e.g., item discovery), it is fine to create the issue for the whole
+stage. **Workers are allowed and encouraged to decompose oversized issues
+themselves** — they have the freshest codebase context and can usually scope
+sub-tasks more accurately than you can in advance. See the `agent-worker-flow`
+skill's "Assess Scope" step for the worker-side mechanics.
+
+If you specifically want planner-led decomposition (e.g., the split needs
+cross-issue coordination you can see and the worker cannot), include a note in
+the body asking the claiming worker to
+`coordination skip N 'needs planner decomposition: <reason>'` instead of
+splitting it themselves. Default is worker-led decomposition; require
+planner-led only when there is a clear reason.
 
 **Critical-path issues**: When you create an issue that blocks all other planned
 work (e.g., the first issue in a sequential pipeline, or a bottleneck that many
