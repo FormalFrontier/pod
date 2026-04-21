@@ -15,8 +15,12 @@ Session UUID is available as `$POD_SESSION_ID`.
 
 - **Planners**: create work items as GitHub issues, then exit
 - **Workers**: claim and execute issues using the `agent-worker-flow` skill
+- **Repair**: salvage unhealthy PRs (merge conflicts, failed CI, stuck CI).
+  Two outcomes only: salvaged or abandoned via
+  `coordination close-pr-unsalvageable`. No escalation to humans.
 
-See the `agent-worker-flow` skill for the full workflow.
+See the `agent-worker-flow` skill (for workers) or the `/repair` command
+(for repair sessions) for the full workflow.
 
 ## Off-limits Files
 
