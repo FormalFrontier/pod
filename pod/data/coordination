@@ -481,17 +481,23 @@ cmd_close_pr() {
 # Output: one PR per line as `#<num> [<reason>] <title>`.
 # Does NOT mutate any labels. Callers (claim-pr-repair / mark-pr-salvaged /
 # close-pr-unsalvageable) are responsible for any label writes.
+#
+# Covers both rollup variants:
+#   - CheckRun       (GitHub Actions etc.)   uses `.status` / `.conclusion` / `.startedAt`
+#   - StatusContext  (external CI via status API)  uses `.state` / `.createdAt`
+# so external-CI PRs aren't silently ignored.
 cmd_list_pr_repair() {
     local stuck_minutes="${POD_STUCK_CI_MINUTES:-120}"
     local stuck_seconds=$(( stuck_minutes * 60 ))
     local now
     now="$(date -u +%s)"
 
-    # One cheap list pass: mergeable + statusCheckRollup (without per-check
-    # ages). We'll fetch per-PR check ages only for PRs that already look
-    # suspect from this pass.
+    # One cheap list pass. `gh pr list` has no `--paginate`, so we bump
+    # `--limit` to a value high enough to cover any reasonable active repo.
+    # For repos with 500+ simultaneously-open PRs, the repair loop would
+    # probably need rethinking anyway.
     local prs_json
-    prs_json="$(gh pr list --repo "$REPO" --state open --limit 50 \
+    prs_json="$(gh pr list --repo "$REPO" --state open --limit 500 \
         --json number,title,mergeable,statusCheckRollup,labels)"
 
     # Conflicts (mergeable == CONFLICTING)
@@ -503,24 +509,32 @@ cmd_list_pr_repair() {
         | "#\(.number) [\($reason)] \(.title)"
     '
 
-    # Failed CI (any statusCheckRollup conclusion == FAILURE)
+    # Failed CI: either a CheckRun with conclusion FAILURE, or a
+    # StatusContext in state FAILURE / ERROR.
     echo "$prs_json" | jq -r --arg reason failed '
         [.[] | select(.mergeable != "CONFLICTING")
-             | select((.statusCheckRollup // []) | any(.conclusion == "FAILURE"))
+             | select(
+                 ((.statusCheckRollup // []) | any(.conclusion == "FAILURE"))
+                 or ((.statusCheckRollup // []) | any(.state == "FAILURE" or .state == "ERROR"))
+               )
              | select((.labels // []) | all(.name != "repair-claimed"))]
         | sort_by(.number)
         | .[]
         | "#\(.number) [\($reason)] \(.title)"
     '
 
-    # Stuck CI: any IN_PROGRESS check older than stuck_seconds.
-    # Only considered for PRs that are otherwise healthy (not conflicting,
-    # no failed checks already).
+    # Stuck CI: any IN_PROGRESS CheckRun or PENDING StatusContext older than
+    # stuck_seconds. Only considered for PRs that aren't already flagged as
+    # conflicting or failed by the cheap pass above.
     local suspect_prs
     suspect_prs="$(echo "$prs_json" | jq -r '
         [.[] | select(.mergeable != "CONFLICTING")
              | select((.statusCheckRollup // []) | all(.conclusion != "FAILURE"))
-             | select((.statusCheckRollup // []) | any(.status == "IN_PROGRESS"))
+             | select((.statusCheckRollup // []) | all(.state != "FAILURE" and .state != "ERROR"))
+             | select(
+                 ((.statusCheckRollup // []) | any(.status == "IN_PROGRESS"))
+                 or ((.statusCheckRollup // []) | any(.state == "PENDING" or .state == "EXPECTED"))
+               )
              | select((.labels // []) | all(.name != "repair-claimed"))
              | {number, title}]
         | .[] | "\(.number)\t\(.title)"
@@ -529,9 +543,11 @@ cmd_list_pr_repair() {
     if [[ -n "$suspect_prs" ]]; then
         while IFS=$'\t' read -r pr_num pr_title; do
             [[ -z "$pr_num" ]] && continue
-            # GraphQL for CheckRun.startedAt — it's the only rollup variant
-            # with a reliable start timestamp. StatusContext entries don't
-            # carry one; we treat them as not-stuck.
+            # GraphQL to get ages for BOTH rollup variants:
+            #  - CheckRun.startedAt (when the run began)
+            #  - StatusContext.createdAt (when the status was last reported)
+            # StatusContext has no "updated" field on the schema; createdAt is
+            # the closest proxy for "this has been pending since ...".
             local started_json
             started_json="$(gh api graphql \
                 -f query='query($owner:String!,$name:String!,$pr:Int!){
@@ -541,14 +557,22 @@ cmd_list_pr_repair() {
                                 checkSuites(first:20){nodes{
                                     checkRuns(first:50){nodes{status conclusion startedAt}}
                                 }}
+                                status{
+                                    contexts{ state createdAt }
+                                }
                             }}}
                         }
                     }
                 }' \
                 -F owner="${REPO%%/*}" -F name="${REPO##*/}" -F pr="$pr_num" \
-                --jq '[.data.repository.pullRequest.commits.nodes[0].commit.checkSuites.nodes[].checkRuns.nodes[]
-                       | select(.status == "IN_PROGRESS" and .startedAt != null)
-                       | .startedAt]' 2>/dev/null || echo "[]")"
+                --jq '[
+                    (.data.repository.pullRequest.commits.nodes[0].commit.checkSuites.nodes[].checkRuns.nodes[]
+                     | select(.status == "IN_PROGRESS" and .startedAt != null)
+                     | .startedAt),
+                    (.data.repository.pullRequest.commits.nodes[0].commit.status.contexts[]?
+                     | select((.state == "PENDING" or .state == "EXPECTED") and .createdAt != null)
+                     | .createdAt)
+                ]' 2>/dev/null || echo "[]")"
             local is_stuck
             is_stuck="$(echo "$started_json" | jq -r --argjson now "$now" --argjson threshold "$stuck_seconds" '
                 any(. as $s | ($now - ($s | fromdateiso8601)) > $threshold)
