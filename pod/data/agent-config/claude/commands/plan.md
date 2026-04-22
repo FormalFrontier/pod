@@ -106,11 +106,10 @@ Your work item MUST NOT overlap with any existing issue's deliverables.
 
 ## Step 6: Write new issues
 
-Work types: **`feature`**, **`review`**, **`summarize`**, **`meditate`**.
+Work types: **`feature`**, **`review`**, **`summarize`**.
 Target roughly 2:1 feature:review during implementation; 1:1 during cleanup.
 
 **Summarize trigger**: when 10+ PRs merged since last summarize issue closed.
-**Meditate trigger**: when 15+ PRs merged since last meditate issue closed.
 
 Each issue body MUST be **self-contained**:
 - **Current state**, **Deliverables**, **Context**, **Verification**
@@ -166,7 +165,7 @@ gh issue list --label agent-plan --state open --limit 20 \
 
 For each issue, write the plan body to `plans/<UUID-prefix>-N.md`, then post:
 ```
-coordination plan --label <feature|review|summarize|meditate> "title" < plans/<UUID-prefix>-N.md
+coordination plan --label <feature|review|summarize> "title" < plans/<UUID-prefix>-N.md
 ```
 
 **Adjusting agent pool size**: After assessing the project state, use these
