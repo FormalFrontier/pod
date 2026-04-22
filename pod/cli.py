@@ -130,12 +130,37 @@ quota_check_required = false       # Proceed if quota cache missing/stale
 quota_retry_seconds = 60           # Sleep duration when quota unavailable
 isolated_config = true             # Use strict pod-managed CODEX_HOME (no ~/.codex state except auth.json)
 
-[pricing]
-# Dollars per million tokens
+# Dollars per million tokens.
+# Resolution order when pricing an agent (see `_pricing_for`):
+#   [pricing.<backend>.<model>]
+#   → [pricing.<backend>.default]
+#   → legacy flat [pricing]
+#   → baked-in Claude Opus constants
+# Legacy flat [pricing] remains honoured for backward compatibility.
+
+[pricing.claude.opus]
 input = 5.00
 output = 25.00
 cache_read = 0.50
 cache_create = 6.25
+
+[pricing.claude.default]
+input = 5.00
+output = 25.00
+cache_read = 0.50
+cache_create = 6.25
+
+[pricing.codex."gpt-5.4"]
+input = 2.50
+output = 15.00
+cache_read = 0.25
+cache_create = 0.0
+
+[pricing.codex.default]
+input = 2.50
+output = 15.00
+cache_read = 0.25
+cache_create = 0.0
 
 [dispatch]
 # Built-in strategies: "queue_balance", "round_robin"
@@ -155,7 +180,7 @@ poll_interval = 2                  # Seconds between status updates
 jsonl_stale_warning = 300          # Warn if JSONL unchanged for this many seconds
 jsonl_missing_warning = 60         # Warn if JSONL not created after this many seconds
 max_claim_restarts = 1             # Max times to auto-restart a dead session before releasing claim
-show_costs = false                 # Show estimated API costs in TUI and status
+show_costs = true                  # Show estimated API costs in TUI and status
 stuck_initial_timeout = 3600       # Seconds since last assistant output before first stuck check
 stuck_confirm_timeout = 1200       # Seconds to wait before confirming kill (after first detection)
 stuck_check_interval = 30          # Seconds between process health checks during stuck detection
@@ -642,9 +667,12 @@ class AgentState:
     worktree: str = ""
     branch: str = ""
     resume_session_uuid: str = ""  # If set, first iteration uses this UUID (to resume conversation)
+    backend: str = "claude"        # "claude" or "codex" (for per-backend pricing lookup)
+    model: str = ""                # e.g. "opus", "gpt-5.4" (for per-model pricing lookup)
 
-    def cost(self, pricing: dict) -> float:
-        """Calculate cost in dollars."""
+    def cost(self, config: dict) -> float:
+        """Calculate cost in dollars using backend/model-aware pricing."""
+        pricing = _pricing_for(config, self.backend, self.model)
         return (
             self.tokens_in * pricing.get("input", 5.0) / 1e6
             + self.cache_create * pricing.get("cache_create", 6.25) / 1e6
@@ -948,23 +976,63 @@ def fmt_tokens(n: int) -> str:
     return str(n)
 
 
-def token_summary(state: AgentState, pricing: dict, show_costs: bool = True) -> str:
+_BAKED_IN_PRICING = {
+    "input": 5.00,
+    "output": 25.00,
+    "cache_read": 0.50,
+    "cache_create": 6.25,
+}
+
+
+def _pricing_for(config: dict, backend: str, model: str) -> dict:
+    """Resolve the pricing dict for a (backend, model) pair.
+
+    Fallback order:
+      pricing.<backend>.<model>
+        → pricing.<backend>.default
+        → legacy flat [pricing]
+        → baked-in Claude Opus constants
+    """
+    pricing_root = (config or {}).get("pricing") or {}
+    backend_table = pricing_root.get(backend) if isinstance(pricing_root, dict) else None
+    if isinstance(backend_table, dict):
+        specific = backend_table.get(model) if model else None
+        if isinstance(specific, dict):
+            return specific
+        default = backend_table.get("default")
+        if isinstance(default, dict):
+            return default
+    # Legacy flat [pricing] = {"input": ..., "output": ..., ...}
+    if isinstance(pricing_root, dict) and all(
+        isinstance(v, (int, float)) for v in pricing_root.values()
+    ) and pricing_root:
+        return pricing_root
+    return _BAKED_IN_PRICING
+
+
+def token_summary(state: AgentState, config: dict, show_costs: bool = True) -> str:
     total_in = state.tokens_in + state.cache_read + state.cache_create
     if total_in == 0 and state.tokens_out == 0:
         return ""
     if show_costs:
-        cost = state.cost(pricing)
+        cost = state.cost(config)
         return f"{fmt_tokens(total_in)}/{fmt_tokens(state.tokens_out)}~${cost:.2f}"
     return f"{fmt_tokens(total_in)}/{fmt_tokens(state.tokens_out)}"
 
 
-def compute_historical_cost(pricing: dict,
-                            claude_config_dir: Path | None = None) -> float:
-    """Scan JSONL files for this project and return total estimated cost.
+def _price_tokens(pricing: dict, tokens_in: int, tokens_out: int,
+                  cache_read: int, cache_create: int) -> float:
+    return (
+        tokens_in * pricing.get("input", 5.0) / 1e6
+        + cache_create * pricing.get("cache_create", 6.25) / 1e6
+        + cache_read * pricing.get("cache_read", 0.50) / 1e6
+        + tokens_out * pricing.get("output", 25.0) / 1e6
+    )
 
-    Uses the same counting methodology as the JSONL monitor (sum all
-    assistant records) for consistency with per-agent cost display.
-    """
+
+def _claude_historical_cost(config: dict,
+                             claude_config_dir: Path | None) -> float:
+    """Scan Claude JSONL rollouts for this project and return total $."""
     # Compute the Claude projects-dir prefix for this project.
     # Claude Code munges paths: replace / with -, strip leading dots from components.
     def _claude_dir_name(p: Path) -> str:
@@ -1017,11 +1085,149 @@ def compute_historical_cost(pricing: dict,
                 except OSError:
                     continue
 
+    # Historical Claude runs predate the per-session backend/model manifest,
+    # so price them at the Claude default tier.
+    pricing = _pricing_for(config, "claude", "")
+    return _price_tokens(pricing, total_in, total_out, total_cache_read, total_cache_create)
+
+
+def _read_codex_manifest(session_uuid: str) -> dict | None:
+    path = _codex_manifest_dir() / f"{session_uuid}.json"
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _session_uuid_from_rollout(rollout_path: Path) -> str | None:
+    """Extract the session UUID from a Codex rollout filename.
+
+    Codex names rollouts `rollout-<ISO-timestamp>-<session-uuid>.jsonl`.
+    When pod is the launcher, the session-uuid matches the pod session_uuid
+    used for the captured stdout file and the manifest sidecar.
+    """
+    name = rollout_path.name
+    # Expected form: rollout-2026-04-22T02-30-18-<uuid>.jsonl
+    if not name.startswith("rollout-") or not name.endswith(".jsonl"):
+        return None
+    stem = name[len("rollout-"):-len(".jsonl")]
+    # The UUID is the last 5 dash-separated groups (8-4-4-4-12).
+    parts = stem.rsplit("-", 5)
+    if len(parts) < 6:
+        return None
+    return "-".join(parts[1:])
+
+
+def _rollout_final_token_count(path: Path) -> tuple[int, int, int]:
+    """Return (input_tokens, cached_input_tokens, output_tokens) from the
+    last token_count event in a Codex rollout.
+
+    `total_token_usage` is cumulative, so the last value is the full-session
+    total. Returns (0, 0, 0) if the file has no token_count events.
+    """
+    last = (0, 0, 0)
+    try:
+        with open(path) as fh:
+            for line in fh:
+                if '"token_count"' not in line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                payload = rec.get("payload", {})
+                if payload.get("type") != "token_count":
+                    continue
+                info = payload.get("info") or {}
+                total = info.get("total_token_usage") or {}
+                last = (
+                    total.get("input_tokens", 0),
+                    total.get("cached_input_tokens", 0),
+                    total.get("output_tokens", 0),
+                )
+    except OSError:
+        return (0, 0, 0)
+    return last
+
+
+def _codex_historical_cost(config: dict) -> float:
+    """Scan project-local Codex rollouts and stdout captures.
+
+    Rollouts are authoritative; for any session_uuid with both a rollout
+    and a .stdout, the .stdout is skipped to avoid double counting. This
+    covers pre-relocation sessions (where only .stdout exists) and
+    post-relocation sessions (where the rollout exists).
+    """
+    # 1. Rollouts (post-relocation, plus any legacy files that got moved in).
+    rollout_root = _codex_rollouts_dir()
+    seen_uuids: set[str] = set()
+    total = 0.0
+    if rollout_root.is_dir():
+        for rollout in rollout_root.rglob("rollout-*.jsonl"):
+            sid = _session_uuid_from_rollout(rollout)
+            if sid:
+                seen_uuids.add(sid)
+            tokens_in, cached, tokens_out = _rollout_final_token_count(rollout)
+            if tokens_in == 0 and tokens_out == 0:
+                continue
+            manifest = _read_codex_manifest(sid) if sid else None
+            model = (manifest or {}).get("model", "")
+            pricing = _pricing_for(config, "codex", model)
+            # Codex's `input_tokens` is total input; `cached_input_tokens`
+            # is a subset that is also counted under input. Price the
+            # cached portion at the cache_read rate and the rest at the
+            # full input rate.
+            non_cached_in = max(0, tokens_in - cached)
+            total += _price_tokens(pricing, non_cached_in, tokens_out, cached, 0)
+
+    # 2. Pre-relocation `.stdout` captures: sum per-turn deltas, skip any
+    # uuid already covered by a rollout.
+    stdout_dir = PROJECT_DIR / cfg_get(config, "project", "session_dir", default="sessions")
+    if stdout_dir.is_dir():
+        for stdout_path in stdout_dir.glob("*.stdout"):
+            sid = stdout_path.stem
+            if sid in seen_uuids:
+                continue
+            s_in = s_cached = s_out = 0
+            try:
+                with open(stdout_path) as fh:
+                    for line in fh:
+                        if '"turn.completed"' not in line:
+                            continue
+                        try:
+                            rec = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if rec.get("type") != "turn.completed":
+                            continue
+                        usage = rec.get("usage", {})
+                        s_in += usage.get("input_tokens", 0)
+                        s_cached += usage.get("cached_input_tokens", 0)
+                        s_out += usage.get("output_tokens", 0)
+            except OSError:
+                continue
+            if s_in == 0 and s_out == 0:
+                continue
+            manifest = _read_codex_manifest(sid)
+            model = (manifest or {}).get("model", "")
+            pricing = _pricing_for(config, "codex", model)
+            non_cached_in = max(0, s_in - s_cached)
+            total += _price_tokens(pricing, non_cached_in, s_out, s_cached, 0)
+
+    return total
+
+
+def compute_historical_cost(config: dict,
+                            claude_config_dir: Path | None = None) -> float:
+    """Scan project rollouts (Claude + Codex) and return total estimated cost.
+
+    Uses the same counting methodology as the JSONL monitor (sum all
+    assistant records for Claude; sum final token_count for Codex rollouts
+    or per-turn `turn.completed` for legacy stdout captures).
+    """
     return (
-        total_in * pricing.get("input", 5.0) / 1e6
-        + total_cache_create * pricing.get("cache_create", 6.25) / 1e6
-        + total_cache_read * pricing.get("cache_read", 0.50) / 1e6
-        + total_out * pricing.get("output", 25.0) / 1e6
+        _claude_historical_cost(config, claude_config_dir)
+        + _codex_historical_cost(config)
     )
 
 
@@ -1465,8 +1671,14 @@ def _parse_codex_jsonl_line(line: bytes, state: AgentState):
 
     elif t == "turn.completed":
         usage = d.get("usage", {})
-        state.tokens_in += usage.get("input_tokens", 0)
-        state.cache_read += usage.get("cached_input_tokens", 0)
+        # Codex reports `input_tokens` inclusive of the cached portion
+        # (verified: input_tokens + output_tokens == total_tokens in
+        # Codex rollouts). Normalize to the same convention as Claude:
+        # `tokens_in` = non-cached input, `cache_read` = cached input.
+        in_total = usage.get("input_tokens", 0)
+        cached = usage.get("cached_input_tokens", 0)
+        state.tokens_in += max(0, in_total - cached)
+        state.cache_read += cached
         state.tokens_out += usage.get("output_tokens", 0)
         # Codex has no cache_creation_input_tokens equivalent
         state.last_activity = time.time()
@@ -2958,6 +3170,11 @@ def launch_agent(config: dict, session_uuid: str, prompt: str,
             env["CODEX_HOME"] = str(codex_home)
             log(f"Using strict pod-managed CODEX_HOME={codex_home}")
 
+        # Write a sidecar manifest so the historical-cost scanner knows
+        # which pricing table to use for rollouts of this session
+        # (rollout JSONLs do not carry a stable model-name field).
+        _write_codex_manifest(session_uuid, backend, model, wt_dir)
+
         stdin_pipe = subprocess.PIPE
         agent_args = codex_args
     else:
@@ -3007,31 +3224,84 @@ def launch_agent(config: dict, session_uuid: str, prompt: str,
     return proc
 
 
+def _codex_rollouts_dir() -> Path:
+    """Project-level directory where all Codex rollouts land, via CODEX_HOME symlink."""
+    return PROJECT_DIR / ".pod" / "codex-sessions"
+
+
+def _codex_manifest_dir() -> Path:
+    """Directory for per-session sidecar manifests (backend, model, wt_dir, started_at)."""
+    return _codex_rollouts_dir() / "manifests"
+
+
+def _write_codex_manifest(session_uuid: str, backend: str, model: str, wt_dir: str) -> None:
+    """Persist a tiny sidecar so the historical scanner can price rollouts.
+
+    The rollout JSONL does not carry a stable model-name field; we write
+    `<project>/.pod/codex-sessions/manifests/<uuid>.json` with the info
+    known at launch time.
+    """
+    try:
+        mdir = _codex_manifest_dir()
+        mdir.mkdir(parents=True, exist_ok=True)
+        mpath = mdir / f"{session_uuid}.json"
+        tmp = mpath.with_suffix(".tmp")
+        tmp.write_text(json.dumps({
+            "session_id": session_uuid,
+            "backend": backend,
+            "model": model,
+            "wt_dir": wt_dir,
+            "started_at": time.time(),
+        }) + "\n")
+        tmp.replace(mpath)
+    except OSError as e:
+        log(f"Warning: failed to write Codex manifest for {session_uuid}: {e}")
+
+
 def _setup_codex_home(config: dict, wt_dir: str) -> Path | None:
     """Create an isolated CODEX_HOME directory for a Codex agent.
 
     Sets up a strict pod-managed home: bundled skills, a minimal pod-owned
-    config.toml, and an auth symlink to ~/.codex/auth.json for login reuse.
+    config.toml, an auth symlink to ~/.codex/auth.json for login reuse, and
+    a `sessions` symlink to `<project>/.pod/codex-sessions/` so Codex rollout
+    JSONLs land in the project (scannable by historical cost, shared across
+    worktrees) rather than being lost when the home is rebuilt.
+
+    Refreshes only pod-owned paths in place rather than wiping the whole
+    home. Wiping would race with any concurrent launch and would also blow
+    away Codex-managed state (cache, logs, sqlite dbs) that has no business
+    being pod-owned. Pod-owned paths: `auth.json`, `config.toml`, `skills/`,
+    `sessions` (symlink). Everything else is Codex's to manage.
+
     Returns the CODEX_HOME path, or None if isolation is disabled.
     """
     if not _backend_cfg(config, "isolated_config", default=True):
         return None
 
     codex_home = Path(wt_dir) / ".pod-codex-home"
-    if codex_home.exists():
-        shutil.rmtree(codex_home)
     codex_home.mkdir(parents=True, exist_ok=True)
+
+    def _replace_symlink(link: Path, target: Path) -> None:
+        """Atomically point `link` at `target` regardless of prior state."""
+        tmp = link.with_name(link.name + ".tmp")
+        try:
+            if tmp.is_symlink() or tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+        tmp.symlink_to(target)
+        os.replace(tmp, link)  # atomic on POSIX
+
+    # Ensure the rollout dir lives in the project, not in the worktree.
+    shared_sessions = PROJECT_DIR / ".pod" / "codex-sessions"
+    shared_sessions.mkdir(parents=True, exist_ok=True)
+    _replace_symlink(codex_home / "sessions", shared_sessions)
 
     # Symlink auth from user's global Codex config
     real_codex = Path.home() / ".codex"
-    auth_link = codex_home / "auth.json"
     auth_target = real_codex / "auth.json"
     if auth_target.exists():
-        try:
-            auth_link.unlink(missing_ok=True)
-            auth_link.symlink_to(auth_target)
-        except FileExistsError:
-            pass
+        _replace_symlink(codex_home / "auth.json", auth_target)
 
     # Write pod-owned minimal config for non-interactive execution.
     model = _reload_config_value("agent", "codex", "model", default="gpt-5.4")
@@ -3041,10 +3311,12 @@ def _setup_codex_home(config: dict, wt_dir: str) -> Path | None:
         'sandbox_mode = "danger-full-access"\n'
     )
 
-    # Install bundled skills
+    # Install bundled skills (refresh to match current package).
     data_skills = _data_dir() / "agent-config" / "codex" / "skills"
     if data_skills.is_dir():
         dst_skills = codex_home / "skills"
+        if dst_skills.exists():
+            shutil.rmtree(dst_skills)
         shutil.copytree(str(data_skills), str(dst_skills))
 
     return codex_home
@@ -3164,12 +3436,15 @@ def agent_process_main(config: dict, agent_id: str | None = None,
     short_id = agent_id or uuid.uuid4().hex[:8]
 
     my_pid = os.getpid()
+    _backend_name = _backend(config)
     state = AgentState(
         short_id=short_id,
         pid=my_pid,
         pid_start_time=_get_pid_start_time(my_pid),
         status="starting",
         resume_session_uuid=resume_uuid or "",
+        backend=_backend_name,
+        model=_backend_cfg(config, "model", default="") or "",
     )
     _agent_state = state
     state.write()
@@ -3181,7 +3456,6 @@ def agent_process_main(config: dict, agent_id: str | None = None,
     poll_interval = cfg_get(config, "monitor", "poll_interval", default=2)
     quota_retry = _backend_cfg(config, "quota_retry_seconds", default=60)
     worker_types = cfg_get(config, "worker_types", default={})
-    pricing = cfg_get(config, "pricing", default={})
 
     claude_config_dir = ensure_isolated_config(config)
     if claude_config_dir:
@@ -3481,7 +3755,7 @@ def agent_process_main(config: dict, agent_id: str | None = None,
 
         elapsed = time.time() - state.session_start
         git_end = _git_rev(wt_dir)
-        tok = token_summary(state, pricing)
+        tok = token_summary(state, config)
         log(f"Agent {short_id}: session finished exit={exit_code} "
             f"duration={human_duration(elapsed)} {tok} "
             f"git:{state.git_start}..{git_end}")
@@ -3754,12 +4028,11 @@ def _tui_main(stdscr, config: dict):
     auto_spawn_failures = 0     # Consecutive auto-spawns where agents died instantly
     auto_spawn_paused = False   # True when crash-loop detected
 
-    pricing = cfg_get(config, "pricing", default={})
     show_costs = cfg_get(config, "monitor", "show_costs", default=False)
 
     # Compute all-time historical cost once at startup
     claude_config_dir = get_isolated_config_dir(config)
-    historical_cost = compute_historical_cost(pricing, claude_config_dir) if show_costs else 0.0
+    historical_cost = compute_historical_cost(config, claude_config_dir) if show_costs else 0.0
     # Track session-accumulated costs (persists across agent deaths)
     session_agent_costs: dict[str, float] = {}  # agent short_id -> last known cost
     # Accumulated cost from previous iterations (when token counters reset)
@@ -3768,13 +4041,13 @@ def _tui_main(stdscr, config: dict):
     baseline_costs: dict[str, float] = {}
     for a in read_all_agents():
         if a.status not in ("stopped", "dead"):
-            baseline_costs[a.short_id] = a.cost(pricing)
+            baseline_costs[a.short_id] = a.cost(config)
 
     while True:
         agents = read_all_agents()
         # Accumulate costs from all agents (including dying ones) before cleanup
         for a in agents:
-            current = a.cost(pricing)
+            current = a.cost(config)
             prev = session_agent_costs.get(a.short_id)
             if prev is not None and current < prev:
                 # Token counters were reset (new loop iteration) — accumulate previous cost
@@ -3965,7 +4238,7 @@ def _tui_main(stdscr, config: dict):
                 elapsed = human_duration(time.time() - agent.session_start)
 
             # Tokens
-            tok = token_summary(agent, pricing, show_costs)
+            tok = token_summary(agent, config, show_costs)
 
             # Activity text: for non-running states show status, not stale last_text
             if agent.status in ("running", "finishing"):
@@ -4374,7 +4647,6 @@ def _kill_agent(config: dict, agent: AgentState):
 def cmd_list(config: dict, args):
     """Show running agents."""
     agents = read_all_agents()
-    pricing = cfg_get(config, "pricing", default={})
 
     if not agents:
         print("No agents running.")
@@ -4405,7 +4677,7 @@ def cmd_list(config: dict, args):
             mode += " (fin)"
 
         elapsed = human_duration(time.time() - a.session_start) if a.session_start > 0 else ""
-        tok = token_summary(a, pricing)
+        tok = token_summary(a, config)
         if a.status in ("running", "finishing"):
             activity = a.last_text or a.status
         else:
@@ -4487,7 +4759,6 @@ def cmd_status(config: dict, args):
     """Show aggregate status."""
     agents = read_all_agents()
     alive = [a for a in agents if a.status not in ("stopped", "dead")]
-    pricing = cfg_get(config, "pricing", default={})
     show_costs = cfg_get(config, "monitor", "show_costs", default=False)
 
     total_in = sum(a.tokens_in + a.cache_read + a.cache_create for a in alive)
@@ -4511,9 +4782,9 @@ def cmd_status(config: dict, args):
 
     print(f"Total tokens:   {fmt_tokens(total_in)} in / {fmt_tokens(total_out)} out")
     if show_costs:
-        session_cost = sum(a.cost(pricing) for a in alive)
+        session_cost = sum(a.cost(config) for a in alive)
         claude_config_dir = get_isolated_config_dir(config)
-        historical_cost = compute_historical_cost(pricing, claude_config_dir)
+        historical_cost = compute_historical_cost(config, claude_config_dir)
         print(f"Running cost:   ${session_cost:.2f}")
         print(f"All-time cost:  ${historical_cost:.2f}")
 
@@ -4789,7 +5060,15 @@ def cmd_init(args):
 
     # .gitignore for .pod/
     gitignore = pod_dir / ".gitignore"
-    gitignore.write_text("agents/\npod.log\nclaim-history.*\nclaude-config/\ncodex-home/\nforce-quota\n")
+    gitignore.write_text(
+        "agents/\n"
+        "pod.log\n"
+        "claim-history.*\n"
+        "claude-config/\n"
+        "codex-home/\n"
+        "codex-sessions/\n"
+        "force-quota\n"
+    )
 
     # Ensure .claude/.pod-checksums is gitignored in the project root
     proj_gitignore = git_root / ".gitignore"

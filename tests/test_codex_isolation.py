@@ -58,24 +58,97 @@ class CodexIsolationTests(unittest.TestCase):
             self.assertFalse((codex_home / "history.jsonl").exists())
             self.assertFalse((codex_home / "models_cache.json").exists())
 
-    def test_setup_codex_home_removes_stale_files(self):
+    def test_setup_codex_home_refreshes_pod_owned_skills_but_preserves_codex_state(self):
+        # Pod-owned skills/ must be refreshed from the bundled data each
+        # launch; Codex-owned state (plugins/, sqlite dbs, sessions, etc.)
+        # must NOT be wiped — previous runs' rollouts and caches should
+        # survive.
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp) / "home"
             worktree = Path(tmp) / "wt"
+            project_dir = Path(tmp) / "project"
             real_codex = home / ".codex"
             real_codex.mkdir(parents=True)
             (real_codex / "auth.json").write_text("{}")
             stale_home = worktree / ".pod-codex-home"
+            # Stale pod-owned content (should be refreshed)
+            (stale_home / "skills").mkdir(parents=True)
+            (stale_home / "skills" / "stale-skill.md").write_text("should go")
+            # Codex-owned state that must be preserved across launches
             (stale_home / "plugins").mkdir(parents=True)
-            (stale_home / "plugins" / "bad").write_text("stale")
+            (stale_home / "plugins" / "bundled").write_text("codex-owned")
+            (stale_home / "cache").mkdir()
+            (stale_home / "cache" / "c").write_text("keep me")
             worktree.mkdir(exist_ok=True)
+            project_dir.mkdir(exist_ok=True)
 
             with mock.patch("pathlib.Path.home", return_value=home), \
-                 mock.patch.object(cli, "_reload_config_value", return_value="gpt-5.4"):
+                 mock.patch.object(cli, "_reload_config_value", return_value="gpt-5.4"), \
+                 mock.patch.object(cli, "PROJECT_DIR", project_dir):
                 codex_home = Path(cli._setup_codex_home(self._config(), str(worktree)))
 
-            self.assertFalse((codex_home / "plugins").exists())
+            # Pod-owned: refreshed
             self.assertTrue((codex_home / "skills").is_dir())
+            self.assertFalse((codex_home / "skills" / "stale-skill.md").exists())
+            # Codex-owned: preserved
+            self.assertTrue((codex_home / "plugins" / "bundled").exists())
+            self.assertTrue((codex_home / "cache" / "c").exists())
+
+    def test_setup_codex_home_symlinks_sessions_into_project(self):
+        # Codex writes rollouts to $CODEX_HOME/sessions/YYYY/MM/DD/*.jsonl;
+        # pod redirects that subtree into the project so rollouts persist
+        # across worktrees and agents.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            worktree = Path(tmp) / "wt"
+            project_dir = Path(tmp) / "project"
+            real_codex = home / ".codex"
+            real_codex.mkdir(parents=True)
+            (real_codex / "auth.json").write_text("{}")
+            worktree.mkdir()
+            project_dir.mkdir()
+
+            with mock.patch("pathlib.Path.home", return_value=home), \
+                 mock.patch.object(cli, "_reload_config_value", return_value="gpt-5.4"), \
+                 mock.patch.object(cli, "PROJECT_DIR", project_dir):
+                codex_home = Path(cli._setup_codex_home(self._config(), str(worktree)))
+
+            sessions_link = codex_home / "sessions"
+            self.assertTrue(sessions_link.is_symlink())
+            self.assertEqual(
+                sessions_link.resolve(),
+                (project_dir / ".pod" / "codex-sessions").resolve(),
+            )
+
+    def test_setup_codex_home_preserves_rollouts_across_relaunches(self):
+        # A rollout written by a previous launch must still be readable after
+        # a fresh _setup_codex_home — the whole point of not wiping the home
+        # and symlinking sessions to a project-level dir.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            worktree = Path(tmp) / "wt"
+            project_dir = Path(tmp) / "project"
+            (home / ".codex").mkdir(parents=True)
+            (home / ".codex" / "auth.json").write_text("{}")
+            worktree.mkdir()
+            project_dir.mkdir()
+
+            with mock.patch("pathlib.Path.home", return_value=home), \
+                 mock.patch.object(cli, "_reload_config_value", return_value="gpt-5.4"), \
+                 mock.patch.object(cli, "PROJECT_DIR", project_dir):
+                # First launch
+                codex_home = Path(cli._setup_codex_home(self._config(), str(worktree)))
+                dated = codex_home / "sessions" / "2026" / "04" / "22"
+                dated.mkdir(parents=True)
+                rollout = dated / "rollout-2026-04-22T03-00-00-000abcde-0000-0000-0000-000000000000.jsonl"
+                rollout.write_text('{"type":"session_meta"}\n')
+
+                # Second launch
+                cli._setup_codex_home(self._config(), str(worktree))
+
+                # Rollout should still be there via the project-shared dir
+                shared = project_dir / ".pod" / "codex-sessions" / "2026" / "04" / "22"
+                self.assertTrue(list(shared.glob("rollout-*.jsonl")))
 
     def test_install_codex_config_writes_managed_agents_when_repo_has_none(self):
         with tempfile.TemporaryDirectory() as tmp:
