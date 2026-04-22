@@ -4047,7 +4047,13 @@ def _tui_main(stdscr, config: dict):
         try:
             result = fn(*args)
             with _bg_mutex:
-                _bg_data[key] = result
+                # Only commit if we weren't cancelled while the call was in
+                # flight.  A synchronous handler (e.g. 'r' clearing
+                # return-to-human, see #30) cancels a pending fetch by
+                # discarding the key from _bg_active so its sampled-before-
+                # clear result can't race back in and re-set stale state.
+                if key in _bg_active:
+                    _bg_data[key] = result
         except Exception:
             pass
         finally:
@@ -4615,6 +4621,15 @@ def _tui_main(stdscr, config: dict):
                     cached_return_to_human = False
                     _acted_on_return_to_human = False
                     _grandfathered_agents = set()
+                    # Invalidate the background cache so the next main-loop
+                    # iteration doesn't re-apply a stale True and re-fire the
+                    # one-shot side effects before the next poll (see #30).
+                    # Also cancel any in-flight fetch whose result (sampled
+                    # before the label was cleared) would otherwise race back
+                    # in and re-latch True.
+                    with _bg_mutex:
+                        _bg_data["return_to_human"] = False
+                        _bg_active.discard("return_to_human")
                     message = "Return-to-human signal cleared. Press [a] to add an agent."
                 except Exception as e:
                     message = f"Failed to clear signal: {e}"
