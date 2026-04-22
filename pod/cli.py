@@ -1914,7 +1914,9 @@ def dispatch_queue_balance(config: dict, queue_depth: int,
     This keeps repair orthogonal to `planner_target` and to queue depth.
     """
     # Repair short-circuit. Runs first so that unhealthy PRs are always
-    # addressed before new feature work is planned or drained.
+    # addressed before new feature work is planned or drained.  Repair is
+    # intentionally orthogonal to `effective_target`: an unhealthy PR may
+    # need attention even after the planner has called return-to-human.
     if "repair" in worker_types:
         candidates = _list_pr_repair_count(config)
         running_repair = _count_running_repair_agents()
@@ -1927,12 +1929,23 @@ def dispatch_queue_balance(config: dict, queue_depth: int,
             log(f"dispatch: repair candidates={candidates} but running_repair={running_repair} "
                 f"already at/near cap={cap}, falling through")
 
+    # Honour an effective target of 0.  `get_effective_target()` returns 0
+    # whenever the user or the planner has set their respective target to 0
+    # (e.g. via `coordination return-to-human`).  Without this check the
+    # per-session dispatch loop would keep handing prompts to an existing
+    # agent forever, because target=0 is only consulted by the auto-spawn
+    # and restart paths.
+    effective_target = get_effective_target()
+    if effective_target == 0:
+        log("dispatch: effective_target=0, no dispatch (return-to-human or user target=0)")
+        return None
+
     config_min_queue = cfg_get(config, "dispatch", "min_queue", default=3)
     planner_min_queue = read_planner_min_queue()
     if planner_min_queue is not None:
-        min_queue = max(1, min(config_min_queue, planner_min_queue))
+        min_queue = max(0, min(config_min_queue, planner_min_queue))
     else:
-        min_queue = max(1, config_min_queue)
+        min_queue = max(0, config_min_queue)
 
     # Separate types into queue-filling (have locks) and queue-draining (no locks).
     # `repair` is draining in principle but is handled exclusively by the
@@ -1954,7 +1967,7 @@ def dispatch_queue_balance(config: dict, queue_depth: int,
             log(f"dispatch: critical-path override → {chosen}")
             return chosen
 
-    if queue_depth < min_queue and filling:
+    if min_queue > 0 and queue_depth < min_queue and filling:
         log(f"dispatch: queue low ({queue_depth} < {min_queue}), trying filling types")
         # Try to acquire lock for a filling type
         for name, wt in filling.items():
@@ -2022,6 +2035,11 @@ def dispatch_round_robin(config: dict, queue_depth: int,
                           state: AgentState | None = None) -> str | None:
     """Cycle through worker types, skipping locked ones."""
     global _round_robin_idx
+    # Honour effective_target=0 (issue #27) so the per-session dispatch loop
+    # doesn't keep handing prompts to a running agent after return-to-human.
+    if get_effective_target() == 0:
+        log("dispatch: effective_target=0, no dispatch (round_robin)")
+        return None
     names = list(worker_types.keys())
     if not names:
         return None
@@ -2045,6 +2063,13 @@ def dispatch_custom(config: dict, queue_depth: int,
                      worker_types: dict,
                      state: AgentState | None = None) -> str | None:
     """Run a custom dispatch script."""
+    # Honour effective_target=0 (issue #27).  We could pass it to the script
+    # via env, but the safer default is to never invoke the script at all
+    # when shutdown has been requested — there's nothing the script could
+    # legitimately return that we'd want to act on.
+    if get_effective_target() == 0:
+        log("dispatch: effective_target=0, no dispatch (custom)")
+        return None
     strategy = cfg_get(config, "dispatch", "strategy", default="")
     script = os.path.expanduser(strategy)
     env = dict(os.environ)
@@ -3987,11 +4012,27 @@ def _tui_main(stdscr, config: dict):
     except Exception:
         cached_return_to_human = False
     return_to_human_fetch_time = 0.0
-    # _acted_on_return_to_human: True once this session has already sent SIGUSR1.
-    # Set True at startup when signal was pre-existing so we skip the SIGUSR1 burst.
+    # _acted_on_return_to_human: True once this session has already taken the
+    # one-shot side effects (write_target=0, banner) for the current label
+    # presence.  Reset to False when the label disappears so a re-application
+    # re-fires those side effects.
     _acted_on_return_to_human = cached_return_to_human
+    # Agents alive when this TUI started up while the label was already set
+    # are "grandfathered": we won't send them SIGUSR1, on the assumption that
+    # the operator restarted pod intentionally and wants to keep observing
+    # them.  Any agent that appears after startup (including a stale orphan
+    # TUI's looping agent that was missed by the original one-shot fire) is
+    # signalled normally.  Identified by (short_id, pid_start_time) so a
+    # recycled short_id with a different process can't accidentally inherit
+    # grandfather status.
+    _grandfathered_agents: set[tuple[str, float]] = set()
     if cached_return_to_human:
         write_target(0)
+        _grandfathered_agents = {
+            (a.short_id, a.pid_start_time)
+            for a in read_all_agents()
+            if a.status not in ("stopped", "dead") and a.pid > 0
+        }
     CACHE_SECS = 60           # Refresh interval for primary GitHub API data (queue, items)
     CACHE_SECS_SLOW = 120     # Refresh interval for less-critical data (blocked deps, lock, return-to-human)
 
@@ -4083,7 +4124,9 @@ def _tui_main(stdscr, config: dict):
             _bg_fetch("blocked_deps", fetch_blocked_deps)
             blocked_deps_fetch_time = now
         # Return-to-human signal: planner labels sentinel issue when no work remains.
-        if not _acted_on_return_to_human and now - return_to_human_fetch_time > CACHE_SECS:
+        # Poll continuously so we observe both label re-applications (planner re-fires
+        # after each empty-queue tick) and external clears (`gh issue edit --remove-label`).
+        if now - return_to_human_fetch_time > CACHE_SECS:
             _bg_fetch("return_to_human", get_return_to_human, config)
             return_to_human_fetch_time = now
         # Repair candidates: count of PRs needing repair. Used by the
@@ -4117,19 +4160,37 @@ def _tui_main(stdscr, config: dict):
             if _bg_data["repair_candidates"] is not None:
                 cached_repair_candidates = _bg_data["repair_candidates"]
 
-        # React to return-to-human signal: set target=0 and gracefully finish all agents.
-        # Only act once per TUI session (idempotent).
-        if cached_return_to_human and not _acted_on_return_to_human:
-            _acted_on_return_to_human = True
-            write_target(0)
+        # React to return-to-human signal: set target=0 and gracefully finish agents.
+        # The latched flag (`_acted_on_return_to_human`) gates one-shot side effects —
+        # writing target=0 and showing the status banner — so they don't repeat each tick.
+        # The per-agent re-signal loop runs on every tick whenever the label is present,
+        # so any running agent that hasn't already received SIGUSR1 (including a stale
+        # orphan TUI's looping agent that the original one-shot fire missed) gets stopped.
+        # `_grandfathered_agents` exempts agents present at startup-with-label-present so
+        # an intentional restart doesn't kill agents the operator is observing.
+        if cached_return_to_human:
+            if not _acted_on_return_to_human:
+                _acted_on_return_to_human = True
+                write_target(0)
+                message = "Return-to-human: planner found no remaining work. Target set to 0; agents finishing."
+                message_time = now
             for a in agents:
-                if a.pid > 0 and a.status not in ("stopped", "dead") and _pid_is_valid(a.pid, a.pid_start_time):
+                if (a.short_id, a.pid_start_time) in _grandfathered_agents:
+                    continue
+                if (a.pid > 0
+                        and not a.finishing
+                        and a.status not in ("stopped", "dead", "finishing")
+                        and _pid_is_valid(a.pid, a.pid_start_time)):
                     try:
                         os.kill(a.pid, signal.SIGUSR1)
                     except (ProcessLookupError, OSError):
                         pass
-            message = "Return-to-human: planner found no remaining work. Target set to 0; agents finishing."
-            message_time = now
+        elif _acted_on_return_to_human:
+            # Label cleared (externally or via 'r' keypress path below).  Reset the
+            # latch and the grandfather set so a future re-application starts fresh:
+            # any agents still alive at re-application time will be signalled.
+            _acted_on_return_to_human = False
+            _grandfathered_agents = set()
 
         # Auto-spawn agents to maintain target (only if no agents are finishing).
         # Repair overflow: if there are PR repair candidates with spare
@@ -4553,6 +4614,7 @@ def _tui_main(stdscr, config: dict):
                     clear_return_to_human(config)
                     cached_return_to_human = False
                     _acted_on_return_to_human = False
+                    _grandfathered_agents = set()
                     message = "Return-to-human signal cleared. Press [a] to add an agent."
                 except Exception as e:
                     message = f"Failed to clear signal: {e}"
