@@ -29,7 +29,7 @@
 #   coordination check-return-to-human        — check if return-to-human signal is set on sentinel (exits 0 if set)
 #   coordination clear-return-to-human        — remove return-to-human signal (e.g. to resume work after completion)
 #   coordination set-target N                 — planner sets recommended target agent count (pod uses min of this and user target)
-#   coordination set-min-queue N              — planner sets recommended min_queue (pod uses min of this and config value, floored at 1)
+#   coordination set-min-queue N              — planner sets recommended min_queue (pod uses min of this and config value; 0 disables backfill)
 #   coordination nothing-to-plan              — planner signals queue saturated; decrements target by 1 (deprecated: use set-target/set-min-queue instead)
 
 set -euo pipefail
@@ -1104,7 +1104,8 @@ EOF
 
 # --- set-min-queue ---
 # Planner sets recommended min_queue for dispatch.
-# Pod uses max(1, min(config_min_queue, planner_min_queue)) as the effective value.
+# Pod uses min(config_min_queue, planner_min_queue) as the effective value
+# (no floor at 1 — set 0 to explicitly disable queue-low backfill).
 cmd_set_min_queue() {
     local n="${1:?usage: coordination set-min-queue N}"
     local main_root
@@ -1116,7 +1117,8 @@ cmd_set_min_queue() {
     fi
     cat > "$pod_dir/planner-min-queue" <<EOF
 # Planner advisory: lower queue_balance min_queue threshold.
-# Effective min_queue is max(1, min(config min_queue, planner-min-queue)).
+# Effective min_queue is min(config min_queue, planner-min-queue).
+# Set to 0 to explicitly disable queue-low backfill (no planner re-fire).
 $n
 EOF
     echo "Planner min_queue set to $n"
