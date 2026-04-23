@@ -152,7 +152,17 @@ This tells the dispatcher to assign a worker immediately, bypassing the normal
 queue-size threshold. Use sparingly — only for genuine pipeline bottlenecks where
 no other useful work can proceed until this issue is done.
 
-**Queue health**: keep <3 unclaimed → create unblocked work.
+**How many issues to create**: the dispatcher exports `POD_MIN_QUEUE`,
+`POD_QUEUE_DEPTH`, and `POD_QUEUE_DEFICIT` (= target unclaimed minus current
+unclaimed). Your target for this cycle is roughly `POD_QUEUE_DEFICIT` new
+atomic issues, capped at **10** so a single planner doesn't run too long or
+exhaust context. If the deficit is 0 or negative, create no new issues and
+exit. If the deficit is large, prefer breadth — one small issue per
+independent unit — over depth; leftover deficit will be handled by the next
+planner cycle. The previous "keep under 3 unclaimed" rule is obsolete: the
+dispatcher runs a planner exactly when the queue drops below `min_queue`, so
+refilling to that level is the whole job.
+
 No transitive blocking. Keep work types mixed.
 
 After writing, re-fetch open issues to check for overlap:

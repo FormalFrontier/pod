@@ -3176,6 +3176,21 @@ def launch_agent(config: dict, session_uuid: str, prompt: str,
     # Inject bundled data dir into PATH so agents find `coordination`
     env["PATH"] = str(_data_dir()) + os.pathsep + env.get("PATH", "")
 
+    # Surface dispatcher state so the planner can size its output to the
+    # actual deficit (min_queue - queue_depth). Mirrors the merge logic in
+    # dispatch_queue_balance: planner advisory shrinks but never grows the
+    # configured min_queue.
+    try:
+        _qd = get_queue_depth(config)
+        _cfg_mq = max(0, cfg_get(config, "dispatch", "min_queue", default=3))
+        _adv_mq = read_planner_min_queue()
+        _eff_mq = max(0, min(_cfg_mq, _adv_mq)) if _adv_mq is not None else _cfg_mq
+        env["POD_QUEUE_DEPTH"] = str(_qd)
+        env["POD_MIN_QUEUE"] = str(_eff_mq)
+        env["POD_QUEUE_DEFICIT"] = str(max(0, _eff_mq - _qd))
+    except Exception as e:
+        log(f"launch_agent: failed to read queue state for env injection: {e}")
+
     stdin_pipe = None  # Only used for Codex (stdin prompt delivery)
 
     if backend == "codex":
