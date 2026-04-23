@@ -1827,6 +1827,43 @@ def _list_pr_repair_count(config: dict) -> int:
     return sum(1 for line in r.stdout.splitlines() if line.strip())
 
 
+_gh_quota_cache: dict = {"graphql_remaining": None, "checked_at": 0.0}
+_GH_QUOTA_CHECK_TTL = 30.0  # seconds between `gh api rate_limit` polls
+_GH_QUOTA_PAUSE_THRESHOLD = 100  # pause dispatch below this (of 5000/hr)
+
+
+def _gh_quota_ok() -> bool:
+    """Return False when GitHub GraphQL quota is near exhaustion.
+
+    Polls `gh api rate_limit` at most every `_GH_QUOTA_CHECK_TTL` seconds
+    and caches the result. The `rate_limit` endpoint itself does not
+    consume quota, so the check is effectively free.
+
+    Returns True (allow dispatch) if:
+      - quota has never been checked (first tick — assume OK)
+      - quota remaining >= threshold
+      - a poll failed (timeout / parse error — assume OK, previous reading
+        if cached)
+    """
+    import time
+    now = time.time()
+    if now - _gh_quota_cache["checked_at"] < _GH_QUOTA_CHECK_TTL:
+        rem = _gh_quota_cache["graphql_remaining"]
+        return rem is None or rem >= _GH_QUOTA_PAUSE_THRESHOLD
+    try:
+        r = subprocess.run(
+            ["gh", "api", "rate_limit", "--jq", ".resources.graphql.remaining"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            _gh_quota_cache["graphql_remaining"] = int(r.stdout.strip())
+            _gh_quota_cache["checked_at"] = now
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        pass  # keep previous reading (if any); treat unknown as OK
+    rem = _gh_quota_cache["graphql_remaining"]
+    return rem is None or rem >= _GH_QUOTA_PAUSE_THRESHOLD
+
+
 def _choose_draining(config: dict, draining: dict) -> str | None:
     """Pick a random draining worker type that has available work.
 
@@ -1921,6 +1958,17 @@ def dispatch_queue_balance(config: dict, queue_depth: int,
     effective_target = get_effective_target()
     if effective_target == 0:
         log("dispatch: effective_target=0, no dispatch (return-to-human or user target=0)")
+        return None
+
+    # GitHub GraphQL quota guard. When the hourly quota is near exhaustion,
+    # pause all dispatch — spawning agents whose first GH call will fail
+    # just burns tokens and leaves `claimed` labels stuck. Running agents
+    # already back off on their own via their `GH rate limit low, sleeping`
+    # path.
+    if not _gh_quota_ok():
+        log(f"dispatch: GitHub GraphQL quota low "
+            f"(remaining={_gh_quota_cache['graphql_remaining']}), "
+            f"pausing dispatch until quota recovers")
         return None
 
     # Repair preference. If there are unclaimed PR-repair candidates,
