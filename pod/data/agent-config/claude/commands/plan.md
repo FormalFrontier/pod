@@ -168,30 +168,32 @@ For each issue, write the plan body to `plans/<UUID-prefix>-N.md`, then post:
 coordination plan --label <feature|review|summarize> "title" < plans/<UUID-prefix>-N.md
 ```
 
-**Adjusting agent pool size**: After assessing the project state, use these
-commands to tell the dispatcher what you think is appropriate:
-- `coordination set-target N` — recommend N agents for this project (pod uses
-  min of your recommendation and the user's configured maximum)
-- `coordination set-min-queue N` — recommend min_queue of N (pod uses min of
-  your recommendation and the config value, floored at 1)
+**Agent pool sizing**: By default, do NOT call `coordination set-target`.
+The operator configured it; the advisory merge is `min(config, advisory)`,
+so calling it can only *shrink* the pool, never grow it — and shrinking
+mid-project starves workers.
 
-Set target based on how much parallelisable work exists. Set min_queue based on
-how far ahead you want planning to stay (typically 2-3 during active development,
-1 during sequential bottlenecks).
+Use it only when the project is actually winding down. Two cases:
 
-**If you created zero new issues** but work is still in-flight (claimed issues,
-open PRs, blocked issues): set target to the number of currently claimed issues
-(workers already running) and set min_queue to 1.
+- **Fully converged** (zero unclaimed, zero claimed, zero broken PRs, and
+  you created no new issues because there is nothing left to plan):
+  `coordination return-to-human`. Verify all three are zero first:
+  ```bash
+  coordination queue-depth
+  gh issue list --label claimed --state open --json number --jq 'length'
+  gh pr list --state open --json number,mergeable,statusCheckRollup \
+    --jq '[.[] | select(.mergeable == "CONFLICTING" or (.statusCheckRollup | any(.conclusion == "FAILURE")))] | length'
+  ```
 
-**If zero new issues AND nothing in-flight** (no unclaimed, no claimed, no
-broken PRs): `coordination return-to-human` (signals the pod TUI to stop
-spawning agents). Verify all three are zero first:
-```bash
-coordination queue-depth
-gh issue list --label claimed --state open --json number --jq 'length'
-gh pr list --state open --json number,mergeable,statusCheckRollup \
-  --jq '[.[] | select(.mergeable == "CONFLICTING" or (.statusCheckRollup | any(.conclusion == "FAILURE")))] | length'
-```
+- **Tail** (only a small number of in-flight streams remain and further
+  planning genuinely depends on their outcome): `coordination set-target N`
+  where N = currently claimed issues. Narrows the pool as you wrap up.
+
+Any other case — including a cycle where you happened to create few or
+zero issues during active development — leave `set-target` alone.
+
+Do **not** call `coordination set-min-queue`. That command is for the
+operator, not the planner.
 
 Then exit. Do NOT execute any code changes.
 

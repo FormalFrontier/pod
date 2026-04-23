@@ -32,8 +32,7 @@ The `gh` CLI defaults to the current repo, so `--repo` is not needed.
 | `coordination lock-planner` | Acquire advisory planner lock (20min TTL) |
 | `coordination unlock-planner` | Release planner lock early |
 | `coordination critical-path-depth [L]` | Count unclaimed critical-path issues; optional label filter |
-| `coordination set-target N` | Planner sets recommended target agent count |
-| `coordination set-min-queue N` | Planner sets recommended min_queue |
+| `coordination set-target N` | Planner sets recommended target agent count (wind-down use only) |
 
 **Issue lifecycle**: planner creates issue (label: `agent-plan`) →
 worker claims it (adds label: `claimed`) → worker creates PR closing it
