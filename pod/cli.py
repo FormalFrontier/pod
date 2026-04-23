@@ -172,8 +172,6 @@ min_queue = 3                      # queue_balance: below this → planner-type
 # A PR is considered "stuck" if a required check has been IN_PROGRESS
 # longer than this many minutes. Used by `coordination list-pr-repair`.
 stuck_ci_minutes = 120
-# Maximum concurrent repair agents (spawned regardless of planner_target).
-concurrency_cap = 2
 
 [monitor]
 poll_interval = 2                  # Seconds between status updates
@@ -1908,27 +1906,12 @@ def dispatch_queue_balance(config: dict, queue_depth: int,
                            state: AgentState | None = None) -> str | None:
     """Low queue → locked types (queue-filling), high queue → unlocked types (queue-draining).
 
-    **Repair short-circuit**: before any filling/draining logic, if the
-    `repair` worker type is configured and `coordination list-pr-repair`
-    reports PR candidates with spare repair concurrency, dispatch `repair`.
-    This keeps repair orthogonal to `planner_target` and to queue depth.
+    **Repair preference**: before filling/draining, if the `repair` worker
+    type is configured and there are unclaimed PR-repair candidates,
+    dispatch `repair`. Repair is a regular worker type bounded by the
+    same `target` as every other type — it does not live outside the
+    target.
     """
-    # Repair short-circuit. Runs first so that unhealthy PRs are always
-    # addressed before new feature work is planned or drained.  Repair is
-    # intentionally orthogonal to `effective_target`: an unhealthy PR may
-    # need attention even after the planner has called return-to-human.
-    if "repair" in worker_types:
-        candidates = _list_pr_repair_count(config)
-        running_repair = _count_running_repair_agents()
-        cap = cfg_get(config, "repair", "concurrency_cap", default=2)
-        if candidates > running_repair and running_repair < cap:
-            log(f"dispatch: repair short-circuit (candidates={candidates}, "
-                f"running_repair={running_repair}, cap={cap})")
-            return "repair"
-        elif candidates > 0:
-            log(f"dispatch: repair candidates={candidates} but running_repair={running_repair} "
-                f"already at/near cap={cap}, falling through")
-
     # Honour an effective target of 0.  `get_effective_target()` returns 0
     # whenever the user or the planner has set their respective target to 0
     # (e.g. via `coordination return-to-human`).  Without this check the
@@ -1939,6 +1922,19 @@ def dispatch_queue_balance(config: dict, queue_depth: int,
     if effective_target == 0:
         log("dispatch: effective_target=0, no dispatch (return-to-human or user target=0)")
         return None
+
+    # Repair preference. If there are unclaimed PR-repair candidates,
+    # prefer `repair` over other work. Each dispatch tick claims one
+    # repair; the next tick will either pick another repair (if more
+    # candidates remain and we have the target budget) or fall through
+    # to normal work.
+    if "repair" in worker_types:
+        candidates = _list_pr_repair_count(config)
+        running_repair = _count_running_repair_agents()
+        if candidates > running_repair:
+            log(f"dispatch: repair preferred (candidates={candidates}, "
+                f"running_repair={running_repair})")
+            return "repair"
 
     config_min_queue = cfg_get(config, "dispatch", "min_queue", default=3)
     planner_min_queue = read_planner_min_queue()
@@ -4015,10 +4011,8 @@ def _tui_main(stdscr, config: dict):
     blocked_deps_fetch_time = 0.0
     cached_lock_status: str | None = None  # "locked" or "unlocked"
     lock_fetch_time = 0.0
-    cached_repair_candidates: int = 0
-    repair_candidates_fetch_time = 0.0
-    # Whether the repair worker type is configured (avoid recomputing each tick).
-    repair_configured = "repair" in cfg_get(config, "worker_types", default={})
+    # (The repair worker type, if configured, is dispatched directly by
+    # `dispatch_queue_balance` — no TUI-level tracking needed.)
     # Check for pre-existing return-to-human signal synchronously at startup.
     # If it was already set before this TUI session, we honour it (target=0, banner)
     # but do NOT send SIGUSR1 — the human restarted pod intentionally.
@@ -4054,7 +4048,7 @@ def _tui_main(stdscr, config: dict):
     # Background fetch infrastructure: all GH/coordination calls run in daemon
     # threads so the TUI never blocks on network I/O.
     _bg_data: dict = {"queue": None, "items": None, "blocked_deps": None, "lock_status": None,
-                      "return_to_human": None, "repair_candidates": None}
+                      "return_to_human": None}
     _bg_active: set = set()
     _bg_mutex = threading.Lock()
 
@@ -4150,12 +4144,6 @@ def _tui_main(stdscr, config: dict):
         if now - return_to_human_fetch_time > CACHE_SECS:
             _bg_fetch("return_to_human", get_return_to_human, config)
             return_to_human_fetch_time = now
-        # Repair candidates: count of PRs needing repair. Used by the
-        # auto-spawn override to expand `desired` beyond `target` when
-        # unhealthy PRs are present.
-        if repair_configured and now - repair_candidates_fetch_time > CACHE_SECS_SLOW:
-            _bg_fetch("repair_candidates", _list_pr_repair_count, config)
-            repair_candidates_fetch_time = now
         # Lock status: check agent state first (cheap), fall back to background API
         if now - lock_fetch_time > CACHE_SECS_SLOW:
             lock_fetch_time = now
@@ -4178,8 +4166,6 @@ def _tui_main(stdscr, config: dict):
                 cached_lock_status = _bg_data["lock_status"]
             if _bg_data["return_to_human"] is not None:
                 cached_return_to_human = _bg_data["return_to_human"]
-            if _bg_data["repair_candidates"] is not None:
-                cached_repair_candidates = _bg_data["repair_candidates"]
 
         # React to return-to-human signal: set target=0 and gracefully finish agents.
         # The latched flag (`_acted_on_return_to_human`) gates one-shot side effects —
@@ -4214,24 +4200,8 @@ def _tui_main(stdscr, config: dict):
             _grandfathered_agents = set()
 
         # Auto-spawn agents to maintain target (only if no agents are finishing).
-        # Repair overflow: if there are PR repair candidates with spare
-        # concurrency, expand `desired` beyond `target` so a repair agent can
-        # spawn even when `planner_target` is 0. All spawns go through the
-        # same crash-loop guard below.
         target = get_effective_target()
-        if target is None:
-            desired = 0
-        else:
-            desired = target
-            if repair_configured:
-                running_repair = _count_running_repair_agents(agents)
-                cap = cfg_get(config, "repair", "concurrency_cap", default=2)
-                repair_overflow = max(
-                    0,
-                    min(cached_repair_candidates - running_repair, cap - running_repair),
-                )
-                if repair_overflow > 0:
-                    desired = max(desired, running + repair_overflow)
+        desired = 0 if target is None else target
         if target is not None and running < desired and now - last_auto_spawn_time > 5.0:
             finishing_count = sum(1 for a in agents if a.status == "finishing")
             if finishing_count == 0:
