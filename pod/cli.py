@@ -3204,78 +3204,149 @@ def _log_credential_state(session_uuid: str, claude_config_dir: Path | None = No
     log(f"Credential state at launch: {' | '.join(parts)}")
 
 
-_codex_runnable_checked = False
+_codex_command_resolved: str | None = None
 
 
-def _ensure_codex_runnable() -> None:
-    """Detect macOS Gatekeeper "launched-suspended" state and remediate it.
+def _resolve_codex_command() -> str:
+    """Return a codex command/path that runs successfully on this host.
 
-    Runs at most once per pod process (memoised via a module-level flag).
+    Memoised — the actual probe runs at most once per pod process.
 
-    On macOS, a freshly-installed `codex` binary from Homebrew carries
-    `com.apple.quarantine` and `com.apple.provenance` xattrs. The first
-    launch from a Notarized Developer ID then triggers a syspolicyd
-    confirmation prompt. When pod runs over SSH or otherwise without a
-    GUI session the prompt is shown to nobody, the user response never
-    arrives, and the kernel keeps every codex spawn frozen in the
-    `launched-suspended` state — 96 KB resident, 0% CPU, no syscalls,
-    no stdout/stderr ever — until SIGKILL. Externally indistinguishable
-    from a deeply hung codex.
+    On macOS, AppleSystemPolicy can permanently deny a specific Mach-O
+    *path* after a failed Gatekeeper first-launch policy evaluation. Once
+    that happens, every subsequent spawn from that path is held in the
+    kernel `launched-suspended` state forever (96 KB resident, 0% CPU,
+    no syscalls, no stdout/stderr) — externally indistinguishable from a
+    deeply hung codex. The denial is keyed on path, not file content:
+    the same bytes copied to a different path run fine. Common trigger:
+    `brew install codex` deposits the binary at
+    `/opt/homebrew/Caskroom/codex/<v>/codex-aarch64-apple-darwin` with
+    `com.apple.quarantine` + `com.apple.provenance` xattrs; on first
+    launch syspolicyd shows a confirmation dialog to a GUI session that
+    isn't there (pod is over SSH), the response never arrives, and the
+    path enters a denied state.
 
-    Probe: run `codex --version` with a short timeout. On clean exit,
-    codex is healthy. On timeout, confirm via `vmmap` that the spawn is
-    truly launched-suspended (so we don't mis-remediate a real hang),
-    and rotate the binary in place: copy contents to a temp file, clear
-    xattrs, ad-hoc resign, then `unlink`+`rename` over the original so
-    the on-disk file gets a fresh inode. The new (vuid, objid) tuple
-    isn't in syspolicyd's policy database, so subsequent launches
-    proceed without a prompt.
+    Algorithm:
+    1. Probe `codex --version` with a 5 s timeout. Clean exit → return
+       the bare name `"codex"` (PATH lookup, normal behaviour).
+    2. On timeout, confirm via `vmmap` that the spawn is in
+       `launched-suspended` state. Real hangs are *not* touched.
+    3. Copy the binary content (preserving its original notarized
+       signature — do NOT ad-hoc resign, AMFI rejects ad-hoc Mach-Os) to
+       a stable per-user cache path that ASP hasn't blocked, clear
+       xattrs on the copy, and verify it runs.
+    4. Return the absolute path to the copy. Callers (i.e.
+       `launch_agent`) invoke codex by that path so the spawn never
+       transits the poisoned location.
 
-    Trade-offs:
-    - The ad-hoc resign drops the OpenAI Developer ID + hardened-runtime
-      flags from the signature. Codex's stdin/stdout + HTTPS + auth.json
-      flow doesn't require either, but anything that did would now fail.
-    - The next `brew upgrade codex` reinstalls the original notarized
-      binary and re-introduces the bug; we'll detect and fix again on
-      next pod start. (We could also hold a flag-file beside the binary
-      to skip the probe but the probe is sub-second when healthy.)
+    The user-facing `/opt/homebrew/bin/codex` symlink is left alone —
+    homebrew owns it and would clobber any rewrite on next upgrade. We
+    keep our remediation pod-local.
 
-    No-op on non-Darwin platforms.
+    Why no ad-hoc resign: a previous version of this helper resigned the
+    rotated binary with `codesign --force -s -`. That broke on Sonoma /
+    Sequoia where AMFI denies ad-hoc-signed binaries with
+    `-423 "The file is adhoc signed or signed by an unknown certificate
+    chain"`. Keeping the original Developer ID + hardened-runtime
+    signature works fine; ASP only objected to the *path*, not the
+    signature.
+
+    Freshness: if the cached copy already exists from a previous pod
+    run, we still re-probe (the probe is sub-second when healthy and
+    catches a stale cache where the user `brew upgrade`d codex
+    underneath us — `which codex`'s realpath would now have a different
+    mtime/size than the cache copy). On detected drift we re-copy.
+
+    No-op (returns `"codex"`) on non-Darwin platforms.
     """
-    global _codex_runnable_checked
-    if _codex_runnable_checked:
-        return
-    _codex_runnable_checked = True
+    global _codex_command_resolved
+    if _codex_command_resolved is not None:
+        return _codex_command_resolved
 
-    if sys.platform != "darwin":
-        return
+    def _decide() -> str:
+        if sys.platform != "darwin":
+            return "codex"
 
-    codex = shutil.which("codex")
-    if not codex:
-        return  # Not installed; later spawn will fail loudly anyway.
-    real = os.path.realpath(codex)
+        codex = shutil.which("codex")
+        if not codex:
+            return "codex"
 
-    # Fast path: probe with a generous timeout. Healthy codex returns in
-    # well under a second; we allow 5s for cold-start.
+        # Probe via PATH first.
+        if _codex_probe_ok(codex):
+            return "codex"
+
+        # Determine if we're seeing the launched-suspended path-denial.
+        if not _codex_probe_launched_suspended(codex):
+            log("codex --version is unresponsive but vmmap does not show "
+                "launched-suspended; this is some other hang. Not "
+                "remediating.")
+            return "codex"
+
+        real = os.path.realpath(codex)
+        log(f"codex at {real} is held in macOS launched-suspended state "
+            f"(AppleSystemPolicy path denial after a Gatekeeper "
+            f"first-launch prompt was queued without a GUI to answer "
+            f"it). Copying the binary to a per-user safe path and "
+            f"invoking codex from there.")
+
+        cache_dir = Path.home() / ".cache" / "pod" / "codex"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        safe_bin = cache_dir / "codex"
+
+        # Refresh the cache if missing or stale relative to upstream.
+        try:
+            need_copy = (
+                not safe_bin.exists()
+                or safe_bin.stat().st_size != os.stat(real).st_size
+                or safe_bin.stat().st_mtime < os.stat(real).st_mtime
+            )
+            if need_copy:
+                tmp = safe_bin.with_name(safe_bin.name + ".tmp")
+                shutil.copyfile(real, tmp)
+                shutil.copymode(real, tmp)
+                subprocess.run(["xattr", "-c", str(tmp)], check=False)
+                os.replace(tmp, safe_bin)
+        except Exception as e:
+            log(f"codex cache refresh failed: {e!r}")
+            return "codex"
+
+        if _codex_probe_ok(str(safe_bin)):
+            log(f"codex remediation succeeded; using {safe_bin}.")
+            return str(safe_bin)
+
+        log(f"codex copy at {safe_bin} also fails to run; not "
+            f"remediating. Manual fix likely required (e.g. log in to "
+            f"the Mac via GUI and approve the binary in Terminal once, "
+            f"or `sudo spctl --add` it).")
+        return "codex"
+
+    _codex_command_resolved = _decide()
+    return _codex_command_resolved
+
+
+def _codex_probe_ok(cmd: str) -> bool:
+    """Return True iff `<cmd> --version` exits 0 within 5 s."""
     try:
         subprocess.run(
-            [codex, "--version"],
+            [cmd, "--version"],
             timeout=5,
             check=True,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        return
+        return True
     except subprocess.TimeoutExpired:
-        pass
+        return False
     except Exception:
-        # Some other failure — exit non-zero, missing dyld, etc. Not the
-        # bug we're fixing. Let the real launch surface the error.
-        return
+        # Non-timeout failure (missing binary, dyld error, etc.) is not
+        # the launched-suspended bug — caller should propagate.
+        return False
 
-    # Confirm launched-suspended via vmmap before doing anything destructive.
+
+def _codex_probe_launched_suspended(cmd: str) -> bool:
+    """Spawn `<cmd> --version` and check vmmap for launched-suspended."""
     proc = subprocess.Popen(
-        [codex, "--version"],
+        [cmd, "--version"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -3289,64 +3360,14 @@ def _ensure_codex_runnable() -> None:
                 text=True,
             ).stdout
         except Exception:
-            return
-        if "launched-suspended" not in vm:
-            log("codex --version timed out but vmmap shows the process "
-                "running normally; not a Gatekeeper hang. Skipping "
-                "remediation.")
-            return
+            return False
+        return "launched-suspended" in vm
     finally:
         try:
             proc.kill()
             proc.wait(timeout=2)
         except Exception:
             pass
-
-    log(f"codex at {real} is held in macOS launched-suspended state "
-        f"(syspolicyd Gatekeeper first-launch prompt with no GUI to "
-        f"answer it). Rotating the binary in place to clear the policy "
-        f"record. See `man syspolicyd` and the xattrs com.apple.quarantine "
-        f"/ com.apple.provenance for background.")
-
-    tmp = real + ".pod-rotate"
-    try:
-        shutil.copyfile(real, tmp)
-        shutil.copymode(real, tmp)
-        subprocess.run(["xattr", "-c", tmp], check=False)
-        subprocess.run(
-            ["codesign", "--force", "-s", "-", tmp],
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        os.unlink(real)
-        os.rename(tmp, real)
-        subprocess.run(["xattr", "-c", real], check=False)
-    except Exception as e:
-        log(f"codex remediation failed during binary rotation: {e!r}")
-        # Best-effort cleanup of the temp file.
-        try:
-            os.unlink(tmp)
-        except FileNotFoundError:
-            pass
-        except Exception:
-            pass
-        return
-
-    # Final verification.
-    try:
-        subprocess.run(
-            [codex, "--version"],
-            timeout=5,
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        log("codex remediation succeeded; binary now runs without a "
-            "Gatekeeper prompt.")
-    except Exception as e:
-        log(f"codex remediation completed but `codex --version` still "
-            f"fails: {e!r}")
 
 
 def launch_agent(config: dict, session_uuid: str, prompt: str,
@@ -3384,7 +3405,12 @@ def launch_agent(config: dict, session_uuid: str, prompt: str,
 
     if backend == "codex":
         # --- Codex launch ---
-        _ensure_codex_runnable()
+        # Resolve the codex command/path. Returns "codex" on healthy hosts
+        # (ordinary PATH lookup) and a per-user safe-path on macOS hosts
+        # where the homebrew-installed binary is held in
+        # launched-suspended state by AppleSystemPolicy's path-based
+        # denial cache.
+        codex_cmd = _resolve_codex_command()
 
         # Pass model via -c (config override) rather than -m. The -m flag
         # routes through codex's API-account validation path, which rejects
@@ -3392,7 +3418,7 @@ def launch_agent(config: dict, session_uuid: str, prompt: str,
         # account") even when the underlying ChatGPT-account session does
         # support them. -c overlays onto config.toml without that check, and
         # works for both auth modes.
-        codex_args = ["codex", "exec", "--json",
+        codex_args = [codex_cmd, "exec", "--json",
                       "--dangerously-bypass-approvals-and-sandbox",
                       "--skip-git-repo-check",
                       "-c", f"model={model}",
