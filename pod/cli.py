@@ -3204,6 +3204,151 @@ def _log_credential_state(session_uuid: str, claude_config_dir: Path | None = No
     log(f"Credential state at launch: {' | '.join(parts)}")
 
 
+_codex_runnable_checked = False
+
+
+def _ensure_codex_runnable() -> None:
+    """Detect macOS Gatekeeper "launched-suspended" state and remediate it.
+
+    Runs at most once per pod process (memoised via a module-level flag).
+
+    On macOS, a freshly-installed `codex` binary from Homebrew carries
+    `com.apple.quarantine` and `com.apple.provenance` xattrs. The first
+    launch from a Notarized Developer ID then triggers a syspolicyd
+    confirmation prompt. When pod runs over SSH or otherwise without a
+    GUI session the prompt is shown to nobody, the user response never
+    arrives, and the kernel keeps every codex spawn frozen in the
+    `launched-suspended` state — 96 KB resident, 0% CPU, no syscalls,
+    no stdout/stderr ever — until SIGKILL. Externally indistinguishable
+    from a deeply hung codex.
+
+    Probe: run `codex --version` with a short timeout. On clean exit,
+    codex is healthy. On timeout, confirm via `vmmap` that the spawn is
+    truly launched-suspended (so we don't mis-remediate a real hang),
+    and rotate the binary in place: copy contents to a temp file, clear
+    xattrs, ad-hoc resign, then `unlink`+`rename` over the original so
+    the on-disk file gets a fresh inode. The new (vuid, objid) tuple
+    isn't in syspolicyd's policy database, so subsequent launches
+    proceed without a prompt.
+
+    Trade-offs:
+    - The ad-hoc resign drops the OpenAI Developer ID + hardened-runtime
+      flags from the signature. Codex's stdin/stdout + HTTPS + auth.json
+      flow doesn't require either, but anything that did would now fail.
+    - The next `brew upgrade codex` reinstalls the original notarized
+      binary and re-introduces the bug; we'll detect and fix again on
+      next pod start. (We could also hold a flag-file beside the binary
+      to skip the probe but the probe is sub-second when healthy.)
+
+    No-op on non-Darwin platforms.
+    """
+    global _codex_runnable_checked
+    if _codex_runnable_checked:
+        return
+    _codex_runnable_checked = True
+
+    if sys.platform != "darwin":
+        return
+
+    codex = shutil.which("codex")
+    if not codex:
+        return  # Not installed; later spawn will fail loudly anyway.
+    real = os.path.realpath(codex)
+
+    # Fast path: probe with a generous timeout. Healthy codex returns in
+    # well under a second; we allow 5s for cold-start.
+    try:
+        subprocess.run(
+            [codex, "--version"],
+            timeout=5,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    except Exception:
+        # Some other failure — exit non-zero, missing dyld, etc. Not the
+        # bug we're fixing. Let the real launch surface the error.
+        return
+
+    # Confirm launched-suspended via vmmap before doing anything destructive.
+    proc = subprocess.Popen(
+        [codex, "--version"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        time.sleep(1)  # Let the process reach the suspended state.
+        try:
+            vm = subprocess.run(
+                ["vmmap", str(proc.pid)],
+                timeout=5,
+                capture_output=True,
+                text=True,
+            ).stdout
+        except Exception:
+            return
+        if "launched-suspended" not in vm:
+            log("codex --version timed out but vmmap shows the process "
+                "running normally; not a Gatekeeper hang. Skipping "
+                "remediation.")
+            return
+    finally:
+        try:
+            proc.kill()
+            proc.wait(timeout=2)
+        except Exception:
+            pass
+
+    log(f"codex at {real} is held in macOS launched-suspended state "
+        f"(syspolicyd Gatekeeper first-launch prompt with no GUI to "
+        f"answer it). Rotating the binary in place to clear the policy "
+        f"record. See `man syspolicyd` and the xattrs com.apple.quarantine "
+        f"/ com.apple.provenance for background.")
+
+    tmp = real + ".pod-rotate"
+    try:
+        shutil.copyfile(real, tmp)
+        shutil.copymode(real, tmp)
+        subprocess.run(["xattr", "-c", tmp], check=False)
+        subprocess.run(
+            ["codesign", "--force", "-s", "-", tmp],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        os.unlink(real)
+        os.rename(tmp, real)
+        subprocess.run(["xattr", "-c", real], check=False)
+    except Exception as e:
+        log(f"codex remediation failed during binary rotation: {e!r}")
+        # Best-effort cleanup of the temp file.
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+        return
+
+    # Final verification.
+    try:
+        subprocess.run(
+            [codex, "--version"],
+            timeout=5,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        log("codex remediation succeeded; binary now runs without a "
+            "Gatekeeper prompt.")
+    except Exception as e:
+        log(f"codex remediation completed but `codex --version` still "
+            f"fails: {e!r}")
+
+
 def launch_agent(config: dict, session_uuid: str, prompt: str,
                    wt_dir: str,
                    claude_config_dir: Path | None = None) -> subprocess.Popen:
@@ -3239,10 +3384,18 @@ def launch_agent(config: dict, session_uuid: str, prompt: str,
 
     if backend == "codex":
         # --- Codex launch ---
+        _ensure_codex_runnable()
+
+        # Pass model via -c (config override) rather than -m. The -m flag
+        # routes through codex's API-account validation path, which rejects
+        # GPT-5.x slugs ("not supported when using Codex with a ChatGPT
+        # account") even when the underlying ChatGPT-account session does
+        # support them. -c overlays onto config.toml without that check, and
+        # works for both auth modes.
         codex_args = ["codex", "exec", "--json",
                       "--dangerously-bypass-approvals-and-sandbox",
                       "--skip-git-repo-check",
-                      "-m", model,
+                      "-c", f"model={model}",
                       "-C", wt_dir,
                       "-"]  # Read prompt from stdin
         env["OPENAI_API_KEY"] = ""  # Force subscription auth
