@@ -126,7 +126,7 @@ isolated_config = true             # Use pod-managed isolated CLAUDE_CONFIG_DIR 
 [agent.codex]
 model = "gpt-5.4"                  # Codex model to use
 quota_check = "~/.claude/skills/claude-usage/codex-available-model"
-quota_check_required = false       # Proceed if quota cache missing/stale
+quota_check_required = true        # Hard-fail if quota unavailable
 quota_retry_seconds = 60           # Sleep duration when quota unavailable
 isolated_config = true             # Use strict pod-managed CODEX_HOME (no ~/.codex state except auth.json)
 
