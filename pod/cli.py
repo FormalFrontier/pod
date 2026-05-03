@@ -99,6 +99,7 @@ worktree_base = "worktrees"        # Where git worktrees are created
 session_dir = "sessions"           # Session stdout capture directory
 build_cache_dir = ".lake"          # Build cache to rsync into worktrees
 protected_files = ["PLAN.md"]      # Files agents may not modify in PRs
+min_free_disk_gb = 2               # Pause dispatch when free disk drops below this
 
 [merge]
 # Status check contexts that must pass before a PR can auto-merge.
@@ -2850,8 +2851,56 @@ def check_dead_pr_claimed_prs(config: dict):
 # Agent Lifecycle
 # ---------------------------------------------------------------------------
 
+def _scrub_worktree_remnants(short_id: str, wt_dir: Path) -> None:
+    """Best-effort removal of any partial worktree/branch state for short_id.
+
+    Handles four kinds of leftovers from a crashed or partially-failed
+    ``git worktree add``:
+      - the worktree directory itself (``worktrees/<short_id>``)
+      - the worktree admin entry (``.git/worktrees/<short_id>``)
+      - a stale branch lock (``.git/refs/heads/agent/<short_id>.lock``)
+      - the branch ref (``agent/<short_id>``)
+
+    Idempotent: safe to call when nothing exists.  We need this because
+    ``git worktree add -b`` is non-atomic — it writes the branch ref before
+    the worktree dir is fully checked out, so a partial failure (disk full,
+    SIGTERM, lock contention) can leave any subset of these behind.
+    """
+    branch = f"agent/{short_id}"
+    if wt_dir.exists():
+        subprocess.run(
+            ["git", "-C", str(PROJECT_DIR), "worktree", "unlock", str(wt_dir)],
+            capture_output=True, timeout=10,
+        )
+        shutil.rmtree(str(wt_dir), ignore_errors=True)
+    # Always prune — clears admin entries even when wt_dir is already gone
+    subprocess.run(
+        ["git", "-C", str(PROJECT_DIR), "worktree", "prune"],
+        capture_output=True, timeout=30,
+    )
+    # Clear stale branch lock that can outlive a crashed git process
+    lock_path = PROJECT_DIR / ".git" / "refs" / "heads" / f"{branch}.lock"
+    try:
+        lock_path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        log(f"Warning: could not remove stale branch lock {lock_path}: {e}")
+    subprocess.run(
+        ["git", "branch", "-D", branch],
+        capture_output=True, timeout=10, cwd=str(PROJECT_DIR),
+    )
+
+
 def setup_worktree(config: dict, short_id: str) -> tuple[str, str]:
-    """Create a fresh git worktree. Returns (worktree_path, branch_name)."""
+    """Create a fresh git worktree. Returns (worktree_path, branch_name).
+
+    Self-healing: scrubs any leftover state from a previous crash or
+    partial failure before attempting creation, and on failure scrubs
+    again so the next retry starts from a clean slate.  Re-raises
+    ``CalledProcessError`` with the underlying git stderr in the message
+    so callers' logs show *why* git failed, not just the command line.
+    """
     base = PROJECT_DIR / cfg_get(config, "project", "worktree_base", default="worktrees")
     base.mkdir(parents=True, exist_ok=True)
     wt_dir = base / short_id
@@ -2864,33 +2913,35 @@ def setup_worktree(config: dict, short_id: str) -> tuple[str, str]:
         capture_output=True, timeout=60,
     )
 
-    # Clean up any leftover worktree/branch from a crash
-    if wt_dir.exists():
-        # Unlock first — locked worktrees survive prune even when the dir is gone
-        subprocess.run(
-            ["git", "-C", str(PROJECT_DIR), "worktree", "unlock", str(wt_dir)],
-            capture_output=True, timeout=10,
-        )
-        shutil.rmtree(str(wt_dir), ignore_errors=True)
-        subprocess.run(
-            ["git", "-C", str(PROJECT_DIR), "worktree", "prune"],
-            capture_output=True, timeout=30,
-        )
-    subprocess.run(
-        ["git", "branch", "-D", branch],
-        capture_output=True, timeout=10, cwd=str(PROJECT_DIR),
-    )
+    # Scrub any leftover worktree/branch/admin state from a previous crash
+    _scrub_worktree_remnants(short_id, wt_dir)
 
     # Create worktree
-    r = subprocess.run(
-        ["git", "-C", str(PROJECT_DIR), "worktree", "add", "-b", branch,
-         str(wt_dir), f"origin/{base_branch}", "--quiet"],
-        capture_output=True, timeout=60, check=True,
-    )
-    if not wt_dir.exists():
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(PROJECT_DIR), "worktree", "add", "-b", branch,
+             str(wt_dir), f"origin/{base_branch}", "--quiet"],
+            capture_output=True, timeout=60, check=True,
+        )
+    except subprocess.CalledProcessError as e:
+        # git may have created the branch ref before failing on the worktree
+        # checkout (disk full, lock contention, etc.). Scrub the partial
+        # state so the next dispatch attempt isn't blocked by leftovers.
+        _scrub_worktree_remnants(short_id, wt_dir)
+        stderr = (e.stderr or b"").decode(errors="replace").strip()
+        # Re-raise with stderr embedded so the caller's log shows it
         raise subprocess.CalledProcessError(
-            0, "git worktree add",
-            output=r.stdout, stderr=(r.stderr + b" [dir not created]"),
+            e.returncode, e.cmd,
+            output=e.output,
+            stderr=(stderr + " [setup_worktree scrubbed partial state]").encode(),
+        ) from e
+
+    if not wt_dir.exists():
+        _scrub_worktree_remnants(short_id, wt_dir)
+        raise subprocess.CalledProcessError(
+            1, "git worktree add",
+            output=r.stdout,
+            stderr=(r.stderr + b" [dir not created; partial state scrubbed]"),
         )
 
     return str(wt_dir), branch
@@ -3208,9 +3259,12 @@ def _cleanup_stale_worktrees_locked(
              str(entry)],
             capture_output=True, timeout=10,
         )
+        # Worktrees may contain large build outputs (e.g. Lake .lake dirs
+        # with 100k+ files) that take well over 2 minutes to remove on
+        # spinning disks or busy SSDs.  600s gives realistic headroom.
         r = subprocess.run(
             ["rm", "-rf", str(entry)],
-            capture_output=True, timeout=120,
+            capture_output=True, timeout=600,
         )
         return r.returncode == 0 and not entry.exists()
 
@@ -3253,6 +3307,103 @@ def _cleanup_stale_worktrees_locked(
         log(msg)
 
     return removed
+
+
+# Minimum age before an orphan agent/* branch is eligible for cleanup.
+# Protects against racing with a setup_worktree() call that has just
+# created the branch but hasn't finished checking out the worktree.
+STALE_BRANCH_MIN_AGE_SECONDS = 300
+
+
+def cleanup_stale_branches(config: dict, *, verbose: bool = False,
+                           min_age: float = STALE_BRANCH_MIN_AGE_SECONDS) -> int:
+    """Delete ``agent/*`` branches with no worktree and no live owner.
+
+    Why: ``git worktree add -b`` is non-atomic — it creates the branch
+    ref before the worktree dir is fully checked out.  When that second
+    step fails (disk full, lock contention, signal), the branch persists
+    and becomes a permanent leftover.  Over time this accumulates
+    hundreds of dead refs that bloat ``.git/refs/heads/agent/`` and can
+    collide with future session UUIDs.
+
+    Safety:
+      - Only deletes branches whose worktree dir does **not** exist.
+      - Skips branches referenced by any live agent state file.
+      - Skips branches younger than ``min_age`` seconds (default 5 min)
+        to avoid racing with an in-flight ``setup_worktree`` call.
+    """
+    base = PROJECT_DIR / cfg_get(config, "project", "worktree_base", default="worktrees")
+    refs_dir = PROJECT_DIR / ".git" / "refs" / "heads" / "agent"
+    if not refs_dir.is_dir():
+        return 0
+
+    # Branches referenced by live (non-dead) agents — never delete these
+    live_branches: set[str] = set()
+    for agent in read_all_agents():
+        if agent.branch and agent.status != "dead":
+            live_branches.add(agent.branch)
+
+    now = time.time()
+    deleted = 0
+    skipped_young = 0
+    skipped_live = 0
+    skipped_has_worktree = 0
+    for ref in sorted(refs_dir.iterdir()):
+        if not ref.is_file():
+            continue
+        short_id = ref.name
+        branch = f"agent/{short_id}"
+        if branch in live_branches:
+            skipped_live += 1
+            continue
+        if (base / short_id).exists():
+            skipped_has_worktree += 1
+            continue
+        try:
+            age = now - ref.stat().st_mtime
+        except OSError:
+            continue
+        if age < min_age:
+            skipped_young += 1
+            continue
+        r = subprocess.run(
+            ["git", "branch", "-D", branch],
+            capture_output=True, text=True, timeout=10, cwd=str(PROJECT_DIR),
+        )
+        if r.returncode == 0:
+            deleted += 1
+        elif verbose:
+            log(f"cleanup_stale_branches: failed to delete {branch}: {r.stderr.strip()}")
+
+    if verbose and (deleted or skipped_young or skipped_live or skipped_has_worktree):
+        log(f"cleanup_stale_branches: deleted={deleted} "
+            f"skipped(young={skipped_young}, live={skipped_live}, "
+            f"has_worktree={skipped_has_worktree})")
+    return deleted
+
+
+def _disk_low(config: dict) -> str | None:
+    """Return a human-readable reason if free disk is below the configured
+    threshold, else None.
+
+    Used to pause dispatch before a disk-full event corrupts worktree state
+    (the canonical failure mode: ``git worktree add`` half-completes,
+    leaving an orphan branch that blocks future dispatches).
+    """
+    try:
+        min_gb = float(cfg_get(config, "project", "min_free_disk_gb", default=2))
+    except (TypeError, ValueError):
+        min_gb = 2.0
+    if min_gb <= 0:
+        return None
+    try:
+        usage = shutil.disk_usage(str(PROJECT_DIR))
+    except OSError as e:
+        return f"disk_usage check failed: {e}"
+    free_gb = usage.free / (1024 ** 3)
+    if free_gb < min_gb:
+        return f"{free_gb:.2f} GiB free < {min_gb:.2f} GiB threshold"
+    return None
 
 
 def _log_credential_state(session_uuid: str, claude_config_dir: Path | None = None):
@@ -3913,6 +4064,23 @@ def agent_process_main(config: dict, agent_id: str | None = None,
                 cleanup_stale_worktrees(config, verbose=True)
             except Exception:
                 pass
+            try:
+                cleanup_stale_branches(config, verbose=True)
+            except Exception:
+                pass
+
+        # --- Disk-space guard ---
+        # Pause dispatch when free disk drops below the configured threshold.
+        # A disk-full event during ``git worktree add`` corrupts state in ways
+        # that take manual cleanup to recover from (orphan branch refs that
+        # block all future dispatches), so it's much cheaper to back off here.
+        disk_reason = _disk_low(config)
+        if disk_reason:
+            log(f"Agent {short_id}: pausing dispatch — disk low ({disk_reason})")
+            state.status = "waiting_disk"
+            state.write()
+            time.sleep(60)
+            continue
 
         # --- Dispatch (sets state.lock_held atomically if lock acquired) ---
         # If this agent was spawned to resume a specific session, skip dispatch.
@@ -3993,7 +4161,9 @@ def agent_process_main(config: dict, agent_id: str | None = None,
         try:
             wt_dir, branch = setup_worktree(config, session_short)
         except subprocess.CalledProcessError as e:
-            log(f"Agent {short_id}: worktree setup failed: {e}")
+            stderr_text = (e.stderr or b"").decode(errors="replace").strip()
+            log(f"Agent {short_id}: worktree setup failed: {e}"
+                + (f" — stderr: {stderr_text}" if stderr_text else ""))
             state.worktree = ""
             state.branch = ""
             if lock_name:
