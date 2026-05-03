@@ -114,7 +114,13 @@ protected_files = ["PLAN.md"]      # Files agents may not modify in PRs
 required_checks = []
 
 [agent]
-backend = "claude"                 # "claude" or "codex"
+backend = "claude"                 # "claude", "codex", or "auto"
+# In "auto" mode, each iteration picks whichever backend has available
+# quota. Settings under [agent.auto] apply only to auto mode.
+quota_retry_seconds = 60           # Auto-mode sleep when no backend has quota
+
+[agent.auto]
+prefer = "codex"                   # Tie-break when both backends have quota
 
 [agent.claude]
 model = "opus"                     # Claude model to use
@@ -345,14 +351,15 @@ def ensure_config() -> dict:
 
 
 def get_isolated_config_dir(config: dict) -> Path | None:
-    """Return isolated CLAUDE_CONFIG_DIR path, or None if disabled/not Claude.
+    """Return isolated CLAUDE_CONFIG_DIR path, or None if disabled/Codex-only.
 
-    Only used for Claude backend. Codex isolation is handled by
-    _setup_codex_home() inside launch_agent() via CODEX_HOME env var.
+    Returns the path for `claude` and `auto` backends (auto may pick Claude
+    in any iteration); returns None for `codex`. Codex isolation is handled
+    by `_setup_codex_home()` inside `launch_agent()` via `CODEX_HOME`.
     """
-    if _backend(config) != "claude":
+    if _backend(config) == "codex":
         return None
-    if not _backend_cfg(config, "isolated_config", default=False):
+    if not _backend_cfg(config, "isolated_config", backend="claude", default=False):
         return None
     return ISOLATED_CONFIG_DIR
 
@@ -391,29 +398,34 @@ def ensure_isolated_config(config: dict) -> Path | None:
 
 
 def _instruction_file_warning(git_root: Path, backend: str) -> str | None:
-    """Return a warning if instruction files are inconsistent for the backend."""
+    """Return a warning if instruction files are inconsistent for the backend.
+
+    `auto` mode requires both AGENTS.md and .claude/CLAUDE.md (since either
+    backend may run in any iteration).
+    """
     agents = git_root / "AGENTS.md"
     claude = git_root / ".claude" / "CLAUDE.md"
 
     agents_exists = agents.exists() or agents.is_symlink()
     claude_exists = claude.exists() or claude.is_symlink()
 
+    needs_claude = backend in ("claude", "auto")
+    needs_agents = backend in ("codex", "auto")
+
     if not agents_exists and not claude_exists:
         return None
     if agents_exists and not claude_exists:
-        if backend == "claude":
+        if needs_claude:
             return ("warning: repo has AGENTS.md but no .claude/CLAUDE.md, "
-                    "while pod is configured for Claude\n"
+                    f"while pod is configured for {backend}\n"
                     "    → Prefer AGENTS.md -> .claude/CLAUDE.md for cross-backend parity.")
-        else:
-            return None
+        return None
     if claude_exists and not agents_exists:
-        if backend == "codex":
+        if needs_agents:
             return ("warning: repo has .claude/CLAUDE.md but no AGENTS.md, "
-                    "while pod is configured for Codex\n"
+                    f"while pod is configured for {backend}\n"
                     "    → Prefer AGENTS.md -> .claude/CLAUDE.md for cross-backend parity.")
-        else:
-            return None
+        return None
 
     try:
         if agents.is_symlink() and agents.resolve() == claude.resolve():
@@ -449,14 +461,26 @@ def cfg_get(config: dict, *keys, default=None):
 
 
 def _backend(config: dict) -> str:
-    """Return the agent backend name ('claude' or 'codex')."""
+    """Return the agent backend name.
+
+    Returns 'claude', 'codex', or 'auto'. Callers that need a concrete
+    backend (not 'auto') should use `_select_backend()` instead, or pass
+    the per-iteration choice explicitly to `_backend_cfg(..., backend=)`.
+    """
     return cfg_get(config, "agent", "backend", default="claude")
 
 
-def _backend_cfg(config: dict, *keys, default=None):
+def _backend_cfg(config: dict, *keys, backend: str | None = None, default=None):
     """Read a backend-specific config value.
-    e.g. _backend_cfg(config, 'model') reads agent.<backend>.model."""
-    return cfg_get(config, "agent", _backend(config), *keys, default=default)
+
+    e.g. `_backend_cfg(config, 'model')` reads `agent.<backend>.model`.
+
+    Pass `backend=` to read settings for a specific backend (required in
+    `auto` mode, where the global `agent.backend` value isn't a concrete
+    backend name).
+    """
+    b = backend if backend is not None else _backend(config)
+    return cfg_get(config, "agent", b, *keys, default=default)
 
 
 def _migrate_legacy_config(cfg: dict) -> dict:
@@ -1322,24 +1346,22 @@ def resolve_claude_credential(claude_config_dir: Path | None) -> dict:
     return {"accountLabel": "?", "tokenPrefix": "", "source": "none"}
 
 
-def check_quota(config: dict, force: bool = False,
-                claude_config_dir: Path | None = None) -> bool:
-    """Check if agent quota is available. Returns True if OK.
+def _backend_available(config: dict, backend: str,
+                        claude_config_dir: Path | None = None) -> bool:
+    """Check whether `backend` has available quota right now.
 
-    For the Claude backend, resolves the credential Claude Code will actually
-    use for ``claude_config_dir`` and asks the quota helper about *that*
-    account specifically — otherwise the helper inspects whichever account
-    owns the default keychain entry, which may differ from the one launched
-    sessions actually hit.
+    For Claude, resolves the credential Claude Code will actually use for
+    ``claude_config_dir`` and asks the quota helper about *that* account
+    specifically — otherwise the helper inspects whichever account owns the
+    default keychain entry, which may differ from the one launched sessions
+    actually hit.
     """
-    if force or FORCE_QUOTA_FILE.exists():
-        return True
-    cmd = os.path.expanduser(_backend_cfg(config, "quota_check", default=""))
+    cmd = os.path.expanduser(_backend_cfg(config, "quota_check", backend=backend, default=""))
     if not cmd:
         return True
-    quota_required = _backend_cfg(config, "quota_check_required", default=True)
+    quota_required = _backend_cfg(config, "quota_check_required", backend=backend, default=True)
     args = [cmd]
-    if _backend(config) == "claude":
+    if backend == "claude":
         resolved = resolve_claude_credential(claude_config_dir)
         label = resolved.get("accountLabel", "")
         if label and label != "?":
@@ -1350,18 +1372,70 @@ def check_quota(config: dict, force: bool = False,
         )
         if result.returncode == 2 and not quota_required:
             # Exit 2 = cache missing/stale; proceed if quota check is optional
-            log("quota_check returned 2 (unknown); proceeding because quota_check_required=false")
+            log(f"quota_check ({backend}) returned 2 (unknown); proceeding because quota_check_required=false")
             return True
         if result.returncode != 0:
             return False
         available = result.stdout.strip()
         # Re-read model from disk so config.toml edits take effect without restart.
-        backend = _backend(config)
         required = _reload_config_value("agent", backend, "model", default="opus")
         # Model tier: higher-tier availability satisfies lower-tier requirements.
         return _model_tier(backend, available) >= _model_tier(backend, required)
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         return False
+
+
+def _auto_backend_order(config: dict) -> list[str]:
+    """Return the backends to try in `auto` mode, preferred first."""
+    prefer = cfg_get(config, "agent", "auto", "prefer", default="codex")
+    if prefer not in ("claude", "codex"):
+        prefer = "codex"
+    other = "claude" if prefer == "codex" else "codex"
+    return [prefer, other]
+
+
+def select_available_backend(config: dict, force: bool = False,
+                              claude_config_dir: Path | None = None) -> str | None:
+    """Pick the backend to run for this iteration.
+
+    Returns the backend name (`"claude"` or `"codex"`), or `None` if no
+    backend has available quota.
+
+    - Fixed mode (`agent.backend = "claude"` or `"codex"`): returns that
+      backend if its quota check passes, else None.
+    - Auto mode (`agent.backend = "auto"`): tries each backend in the
+      preference order from `[agent.auto].prefer` and returns the first
+      one whose quota check passes.
+
+    `force` (or the global `FORCE_QUOTA_FILE` flag) bypasses quota checks
+    entirely; in auto mode this returns the preferred backend.
+    """
+    raw = cfg_get(config, "agent", "backend", default="claude")
+    if raw == "auto":
+        order = _auto_backend_order(config)
+        if force or FORCE_QUOTA_FILE.exists():
+            return order[0]
+        for b in order:
+            if _backend_available(config, b, claude_config_dir):
+                return b
+        return None
+    # Fixed-backend mode
+    if force or FORCE_QUOTA_FILE.exists():
+        return raw
+    if _backend_available(config, raw, claude_config_dir):
+        return raw
+    return None
+
+
+def check_quota(config: dict, force: bool = False,
+                claude_config_dir: Path | None = None) -> bool:
+    """Back-compat shim: True iff some backend has available quota now.
+
+    New code should call `select_available_backend()` directly so it knows
+    *which* backend to launch.
+    """
+    return select_available_backend(config, force=force,
+                                    claude_config_dir=claude_config_dir) is not None
 
 
 def coordination(config: dict, *args, env_extra: dict | None = None,
@@ -2928,14 +3002,18 @@ def install_agent_config(wt_dir: str, backend: str = "claude"):
                     f.write("\n\n" + agent_text)
 
 
-def _worker_prompt(config: dict, worker_type: str) -> str:
+def _worker_prompt(config: dict, worker_type: str,
+                    backend: str | None = None) -> str:
     """Return the prompt text for a given worker type.
 
     For Claude: returns the slash command name (e.g. "/work").
     For Codex: reads the command template file and returns its full text,
     since Codex has no slash command system.
+
+    Pass `backend` to override the configured value (required in auto mode).
     """
-    backend = _backend(config)
+    if backend is None:
+        backend = _backend(config)
     worker_types = cfg_get(config, "worker_types", default={})
     wt_cfg = worker_types.get(worker_type, {})
     prompt = wt_cfg.get("prompt", f"/{worker_type}")
@@ -3372,10 +3450,20 @@ def _codex_probe_launched_suspended(cmd: str) -> bool:
 
 def launch_agent(config: dict, session_uuid: str, prompt: str,
                    wt_dir: str,
-                   claude_config_dir: Path | None = None) -> subprocess.Popen:
-    """Launch agent subprocess (Claude or Codex) in the worktree directory."""
+                   claude_config_dir: Path | None = None,
+                   backend: str | None = None) -> subprocess.Popen:
+    """Launch agent subprocess (Claude or Codex) in the worktree directory.
+
+    `backend` is required when running in auto mode; for fixed-backend
+    modes it defaults to the configured value (re-read from disk to pick
+    up live config edits).
+    """
+    if backend is None:
+        backend = _reload_config_value("agent", "backend", default="claude")
+        if backend == "auto":
+            raise ValueError(
+                "launch_agent: explicit backend= required in auto mode")
     # Re-read model from disk so config.toml edits take effect without restart.
-    backend = _reload_config_value("agent", "backend", default="claude")
     model = _reload_config_value("agent", backend, "model", default="opus")
     session_dir = PROJECT_DIR / cfg_get(config, "project", "session_dir", default="sessions")
     session_dir.mkdir(parents=True, exist_ok=True)
@@ -3538,7 +3626,7 @@ def _setup_codex_home(config: dict, wt_dir: str) -> Path | None:
 
     Returns the CODEX_HOME path, or None if isolation is disabled.
     """
-    if not _backend_cfg(config, "isolated_config", default=True):
+    if not _backend_cfg(config, "isolated_config", backend="codex", default=True):
         return None
 
     codex_home = Path(wt_dir) / ".pod-codex-home"
@@ -3699,15 +3787,19 @@ def agent_process_main(config: dict, agent_id: str | None = None,
     short_id = agent_id or uuid.uuid4().hex[:8]
 
     my_pid = os.getpid()
-    _backend_name = _backend(config)
+    raw_backend = _backend(config)
+    # In auto mode, leave backend/model blank; both are filled per iteration.
+    initial_backend = "" if raw_backend == "auto" else raw_backend
+    initial_model = "" if raw_backend == "auto" else (
+        _backend_cfg(config, "model", default="") or "")
     state = AgentState(
         short_id=short_id,
         pid=my_pid,
         pid_start_time=_get_pid_start_time(my_pid),
         status="starting",
         resume_session_uuid=resume_uuid or "",
-        backend=_backend_name,
-        model=_backend_cfg(config, "model", default="") or "",
+        backend=initial_backend,
+        model=initial_model,
     )
     _agent_state = state
     state.write()
@@ -3717,14 +3809,23 @@ def agent_process_main(config: dict, agent_id: str | None = None,
     signal.signal(signal.SIGUSR1, _sigusr1_handler)
 
     poll_interval = cfg_get(config, "monitor", "poll_interval", default=2)
-    quota_retry = _backend_cfg(config, "quota_retry_seconds", default=60)
+    # In auto mode, the [agent] level retry applies before a backend is
+    # chosen. Fixed mode falls back to the per-backend value.
+    if raw_backend == "auto":
+        quota_retry = cfg_get(config, "agent", "quota_retry_seconds", default=60)
+    else:
+        quota_retry = _backend_cfg(config, "quota_retry_seconds", default=60)
     worker_types = cfg_get(config, "worker_types", default={})
 
     claude_config_dir = ensure_isolated_config(config)
     if claude_config_dir:
-        log(f"Agent {short_id}: using isolated CLAUDE_CONFIG_DIR={claude_config_dir}")
-    elif _backend(config) == "codex":
-        log(f"Agent {short_id}: using codex backend (CODEX_HOME set per session)")
+        log(f"Agent {short_id}: claude isolated config at {claude_config_dir}"
+            + (" (auto mode — claude iterations only)" if raw_backend == "auto" else ""))
+    if raw_backend in ("codex", "auto"):
+        log(f"Agent {short_id}: codex iterations use CODEX_HOME set per session")
+    if raw_backend == "auto":
+        order = _auto_backend_order(config)
+        log(f"Agent {short_id}: auto backend selection enabled, prefer={order[0]}")
 
     log(f"Agent {short_id} started (PID {os.getpid()})")
 
@@ -3736,11 +3837,29 @@ def agent_process_main(config: dict, agent_id: str | None = None,
         iteration += 1
         state.loop_iteration = iteration
 
-        # --- Quota check ---
+        # --- Backend selection + quota check ---
+        # Resume sessions are pinned to the backend they originally ran
+        # under: only Claude has a real `--resume`, and a Codex "resume"
+        # at minimum reuses its worktree/UUID. Auto-selecting here would
+        # silently drop the original conversation.
+        resume_pin = state.backend if state.resume_session_uuid and state.backend else None
         state.status = "waiting_quota"
         state.write()
-        while not check_quota(config, force=state.force_quota,
-                               claude_config_dir=claude_config_dir):
+        chosen_backend: str | None = None
+        while True:
+            if resume_pin:
+                # Honour force_quota during resume too — some quota helpers
+                # may be stale right after a kill/restart.
+                if state.force_quota or _backend_available(
+                        config, resume_pin, claude_config_dir):
+                    chosen_backend = resume_pin
+                    break
+            else:
+                chosen_backend = select_available_backend(
+                    config, force=state.force_quota,
+                    claude_config_dir=claude_config_dir)
+                if chosen_backend is not None:
+                    break
             if state.finishing:
                 break
             # Re-read state file to pick up force_quota toggled by TUI
@@ -3752,11 +3871,23 @@ def agent_process_main(config: dict, agent_id: str | None = None,
                 pass
             if state.force_quota:
                 log(f"Agent {short_id}: force_quota enabled, skipping wait")
+                if resume_pin:
+                    chosen_backend = resume_pin
+                else:
+                    chosen_backend = (select_available_backend(
+                        config, force=True,
+                        claude_config_dir=claude_config_dir) or "claude")
                 break
-            log(f"Agent {short_id}: no quota, sleeping {quota_retry}s")
+            target = resume_pin or "any backend"
+            log(f"Agent {short_id}: no quota for {target}, sleeping {quota_retry}s")
             time.sleep(quota_retry)
-        if state.finishing:
+        if state.finishing or chosen_backend is None:
             break
+
+        state.backend = chosen_backend
+        state.model = _backend_cfg(config, "model", backend=chosen_backend,
+                                    default="") or ""
+        state.write()
 
         # --- Housekeeping (time-based, every 10 minutes to conserve GH API calls) ---
         now_hk = time.time()
@@ -3889,21 +4020,21 @@ def agent_process_main(config: dict, agent_id: str | None = None,
         state.branch = branch
         state.git_start = _git_rev(wt_dir)
 
-        install_agent_config(wt_dir, backend=_backend(config))
+        install_agent_config(wt_dir, backend=chosen_backend)
 
         if not _resume_uuid:
-            prompt = _worker_prompt(config, chosen_type)
+            prompt = _worker_prompt(config, chosen_type, backend=chosen_backend)
 
         if wt_config.get("copy_build_cache", wt_config.get("copy_lake_cache", False)):
             copy_build_cache(wt_dir, config)
 
         # --- Start JSONL monitor ---
         jsonl_path = get_jsonl_path(wt_dir, session_uuid, claude_config_dir,
-                                    backend=_backend(config))
+                                    backend=chosen_backend)
         stop_monitor = threading.Event()
         monitor_thread = threading.Thread(
             target=jsonl_monitor,
-            args=(jsonl_path, state, stop_monitor, _backend(config)),
+            args=(jsonl_path, state, stop_monitor, chosen_backend),
             daemon=True,
         )
         monitor_thread.start()
@@ -3911,13 +4042,13 @@ def agent_process_main(config: dict, agent_id: str | None = None,
         # --- Launch agent ---
         state.status = "running"
         state.write()
-        log(f"Agent {short_id}: launching {_backend(config)} session {session_uuid} in {wt_dir}")
+        log(f"Agent {short_id}: launching {chosen_backend} session {session_uuid} in {wt_dir}")
 
         try:
             _agent_proc = launch_agent(config, session_uuid, prompt, wt_dir,
-                                        claude_config_dir)
+                                        claude_config_dir, backend=chosen_backend)
         except (OSError, FileNotFoundError) as e:
-            log(f"Agent {short_id}: failed to launch {_backend(config)}: {e}")
+            log(f"Agent {short_id}: failed to launch {chosen_backend}: {e}")
             stop_monitor.set()
             cleanup_worktree(wt_dir, branch)
             if lock_name:
@@ -5389,11 +5520,15 @@ def cmd_init(args):
     if warning:
         print(f"  {warning}")
 
-    if init_backend == "claude":
+    if init_backend in ("claude", "auto"):
         global ISOLATED_CONFIG_DIR
         ISOLATED_CONFIG_DIR = pod_dir / "claude-config"
         _populate_agent_config()
-        print(f"  populated {ISOLATED_CONFIG_DIR.relative_to(git_root)}/")
+        rel = ISOLATED_CONFIG_DIR.relative_to(git_root)
+        if init_backend == "auto":
+            print(f"  populated {rel}/ (auto mode — Codex installs per-session)")
+        else:
+            print(f"  populated {rel}/")
     else:
         print(f"  {init_backend} backend — agent config installed per-session via CODEX_HOME")
 
@@ -5416,9 +5551,12 @@ def cmd_update(args):
         sys.exit(1)
     config = ensure_config()
     backend = _backend(config)
-    if backend == "claude":
+    if backend in ("claude", "auto"):
+        # Auto mode may invoke Claude in any iteration, so its config
+        # bundle still needs to be installed.
         _populate_agent_config()
-        print("Updated .pod/claude-config/ from installed package.")
+        suffix = " (auto mode — Codex installs per-session)" if backend == "auto" else ""
+        print(f"Updated .pod/claude-config/ from installed package.{suffix}")
     else:
         print(f"{backend} backend — agent config is installed per-session, nothing to update.")
 
