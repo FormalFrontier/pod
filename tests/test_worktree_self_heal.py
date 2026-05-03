@@ -102,6 +102,34 @@ class ScrubRemnantsTests(unittest.TestCase):
         ref = self.root / ".git" / "refs" / "heads" / "agent" / "abc12345"
         self.assertFalse(ref.exists())
 
+    def test_removes_regular_file_at_worktree_path(self):
+        # shutil.rmtree(..., ignore_errors=True) is a no-op on regular files.
+        # The scrub must dispatch on file type so a file blocker actually goes
+        # away — otherwise the next setup_worktree retry still fails.
+        wt_dir = self.root / "worktrees" / "ffffffff"
+        wt_dir.parent.mkdir(parents=True, exist_ok=True)
+        wt_dir.write_text("not a directory\n")
+        self.assertTrue(wt_dir.is_file())
+
+        cli._scrub_worktree_remnants("ffffffff", wt_dir)
+
+        self.assertFalse(wt_dir.exists(), "regular file blocker must be removed")
+
+    def test_removes_broken_symlink_at_worktree_path(self):
+        # Path.exists() returns False for broken symlinks — so the old
+        # if-exists guard would skip them and leave them in place to block
+        # the retry.  Verify lexists semantics actually clean up.
+        wt_dir = self.root / "worktrees" / "55555555"
+        wt_dir.parent.mkdir(parents=True, exist_ok=True)
+        wt_dir.symlink_to(self.root / "definitely_does_not_exist")
+        self.assertFalse(wt_dir.exists(), "broken symlink: exists() == False")
+        self.assertTrue(wt_dir.is_symlink())
+
+        cli._scrub_worktree_remnants("55555555", wt_dir)
+
+        self.assertFalse(wt_dir.is_symlink(), "broken-symlink blocker must be removed")
+        self.assertFalse(os.path.lexists(str(wt_dir)))
+
 
 class SetupWorktreeFailureTests(unittest.TestCase):
     def setUp(self):
@@ -123,30 +151,90 @@ class SetupWorktreeFailureTests(unittest.TestCase):
         # Cleanup so worktree handles don't leak between tests
         cli._scrub_worktree_remnants("11111111", Path(wt_dir))
 
-    def test_failure_scrubs_partial_state_and_surfaces_stderr(self):
-        # Pre-create the destination as a *file* so `git worktree add` fails
-        # with a clear error after creating the branch ref. This mimics the
-        # disk-full / lock-contention failure mode where git creates the
-        # branch then trips on the worktree directory.
+    def test_file_blocker_is_self_healed_and_setup_succeeds(self):
+        # A regular file at wt_dir is the exact failure mode left behind
+        # by some partial git failures.  After the fix, setup_worktree
+        # should clean it up and succeed without manual intervention.
         wt_dir = self.root / "worktrees" / "22222222"
         wt_dir.parent.mkdir(parents=True, exist_ok=True)
-        wt_dir.write_text("not a directory\n")  # blocks worktree creation
+        wt_dir.write_text("not a directory\n")
 
-        with self.assertRaises(subprocess.CalledProcessError) as cm:
-            cli.setup_worktree({}, "22222222")
+        out_dir, branch = cli.setup_worktree({}, "22222222")
 
-        # stderr from git is surfaced (decoded) in the re-raised exception
+        self.assertTrue(Path(out_dir).is_dir(),
+                        "scrub must remove the file blocker so setup succeeds")
+        self.assertEqual(branch, "agent/22222222")
+        cli._scrub_worktree_remnants("22222222", Path(out_dir))
+
+    def test_failure_scrubs_partial_state_and_surfaces_stderr(self):
+        # Force the underlying `git worktree add` to fail by pointing at a
+        # nonexistent base ref.  Verifies the failure path: stderr is
+        # surfaced and any partial state is scrubbed.
+        with mock.patch.object(cli, "_get_base_branch", return_value="nonexistent_ref"):
+            with self.assertRaises(subprocess.CalledProcessError) as cm:
+                cli.setup_worktree({}, "33333333")
+
         stderr = (cm.exception.stderr or b"").decode(errors="replace")
-        self.assertTrue(stderr, "stderr should be non-empty so the caller can log why git failed")
+        self.assertTrue(stderr,
+                        "stderr should be non-empty so the caller can log why git failed")
         self.assertIn("scrubbed partial state", stderr)
 
-        # Partial state was scrubbed: no orphan branch ref left over
-        ref = self.root / ".git" / "refs" / "heads" / "agent" / "22222222"
-        self.assertFalse(ref.exists(),
-                         "branch ref must be scrubbed so the next dispatch attempt can reuse the slot")
+        # No leftover branch ref to block the next attempt
+        ref = self.root / ".git" / "refs" / "heads" / "agent" / "33333333"
+        self.assertFalse(ref.exists())
 
-        # Clean up the blocker file
-        wt_dir.unlink()
+    def test_timeout_normalised_to_called_process_error(self):
+        # subprocess.TimeoutExpired must not escape — it bypasses the
+        # caller's CalledProcessError except clause and leaves the agent
+        # half-set-up.  Verify the conversion.
+        cmd_calls = []
+        real_run = subprocess.run
+
+        def faulty_run(args, *a, **kw):
+            cmd_calls.append(args)
+            # Time out only on the actual `worktree add` invocation
+            if isinstance(args, list) and "add" in args and "worktree" in args:
+                raise subprocess.TimeoutExpired(cmd=args, timeout=kw.get("timeout", 60))
+            return real_run(args, *a, **kw)
+
+        with mock.patch.object(cli.subprocess, "run", side_effect=faulty_run):
+            with self.assertRaises(subprocess.CalledProcessError) as cm:
+                cli.setup_worktree({}, "44444444")
+
+        stderr = (cm.exception.stderr or b"").decode(errors="replace")
+        self.assertIn("timed out", stderr)
+        self.assertIn("scrubbed", stderr)
+        # Branch must not remain
+        ref = self.root / ".git" / "refs" / "heads" / "agent" / "44444444"
+        self.assertFalse(ref.exists())
+
+    def test_refuses_to_clobber_live_agent_branch(self):
+        # If another live agent already owns this branch (short_id
+        # collision), setup_worktree must refuse rather than scrubbing
+        # the other agent's working state.
+        live = cli.AgentState(
+            uuid="other-session", short_id="otheragent",
+            branch="agent/77777777", status="working",
+        )
+        with mock.patch.object(cli, "read_all_agents", return_value=[live]):
+            with self.assertRaises(subprocess.CalledProcessError) as cm:
+                cli.setup_worktree({}, "77777777")
+
+        stderr = (cm.exception.stderr or b"").decode(errors="replace")
+        self.assertIn("owned by another live agent", stderr)
+
+    def test_excludes_self_via_own_agent_id(self):
+        # The collision check must NOT trigger for the agent's own
+        # pre-registered state — that would self-deadlock every dispatch.
+        own = cli.AgentState(
+            uuid="my-session", short_id="myagent",
+            branch="agent/88888888", status="dispatching",
+        )
+        with mock.patch.object(cli, "read_all_agents", return_value=[own]):
+            out_dir, branch = cli.setup_worktree({}, "88888888", own_agent_id="myagent")
+
+        self.assertTrue(Path(out_dir).is_dir())
+        cli._scrub_worktree_remnants("88888888", Path(out_dir))
 
 
 class CleanupStaleBranchesTests(unittest.TestCase):
@@ -250,6 +338,49 @@ class DiskLowTests(unittest.TestCase):
             self.assertIsNotNone(cli._disk_low({}))
         with self._patch_free(5.0):
             self.assertIsNone(cli._disk_low({}))
+
+    def test_checks_distinct_mountpoints(self):
+        # When session_dir lives on a different volume, _disk_low must
+        # check that volume too — not just PROJECT_DIR.
+        config = {"project": {"min_free_disk_gb": 2}}
+
+        # First volume (PROJECT_DIR) has plenty; second (session_dir) is full.
+        # Stub disk_usage to vary by path.
+        def fake_usage(path):
+            usage = mock.MagicMock()
+            usage.free = int(0.5 * (1024 ** 3)) if "session" in str(path) else int(50 * (1024 ** 3))
+            return usage
+
+        # Stub _distinct_mounts to return both PROJECT_DIR and a sessions dir,
+        # so we exercise the per-mount loop.
+        sess = self.root / "sessions_on_other_volume"
+        sess.mkdir()
+        with mock.patch("pod.cli.shutil.disk_usage", side_effect=fake_usage), \
+             mock.patch.object(cli, "_distinct_mounts", return_value=[self.root, sess]):
+            reason = cli._disk_low(config)
+
+        self.assertIsNotNone(reason)
+        self.assertIn("sessions_on_other_volume", reason)
+
+
+class DistinctMountsTests(unittest.TestCase):
+    def test_dedupes_by_st_dev(self):
+        # All paths under the same tmp dir share st_dev — should collapse to one.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            a = root / "a"; a.mkdir()
+            b = root / "b"; b.mkdir()
+            mounts = cli._distinct_mounts(root, a, b)
+            self.assertEqual(len(mounts), 1, f"all under same fs but got {mounts}")
+
+    def test_walks_up_to_existing_ancestor(self):
+        # If a configured leaf doesn't exist yet, walk up so disk_usage works.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            phantom = root / "does" / "not" / "exist" / "yet"
+            mounts = cli._distinct_mounts(phantom)
+            self.assertEqual(len(mounts), 1)
+            self.assertTrue(mounts[0].exists())
 
 
 if __name__ == "__main__":
