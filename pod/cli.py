@@ -97,7 +97,10 @@ DEFAULT_CONFIG = """\
 [project]
 worktree_base = "worktrees"        # Where git worktrees are created
 session_dir = "sessions"           # Session stdout capture directory
-build_cache_dir = ".lake"          # Build cache to rsync into worktrees
+build_cache_dir = ".lake"          # Build cache seeded into worktrees
+build_cache_symlink_subdirs = ["packages"]  # Subdirs of build_cache_dir to symlink
+                                            # instead of copy (immutable shared deps).
+                                            # Set to [] to copy everything.
 protected_files = ["PLAN.md"]      # Files agents may not modify in PRs
 
 [merge]
@@ -3031,32 +3034,61 @@ def _worker_prompt(config: dict, worker_type: str,
 
 
 def copy_build_cache(wt_dir: str, config: dict):
-    """rsync build cache directory into worktree for faster builds."""
+    """Seed the build cache directory in a fresh worktree.
+
+    Subdirectories listed in ``build_cache_symlink_subdirs`` (default
+    ``["packages"]``) are symlinked back to the source — they hold immutable
+    dependency artefacts (e.g. Lake's downloaded packages) that all worktrees
+    can safely share. Everything else under ``build_cache_dir`` is rsynced so
+    each worktree's own build outputs stay isolated.
+    """
     cache_dir = cfg_get(config, "project", "build_cache_dir", default=".lake")
     cache_src = PROJECT_DIR / cache_dir
     timeout = cfg_get(config, "project", "build_cache_timeout", default=600)
-    if cache_src.is_dir():
+    symlink_subdirs = cfg_get(
+        config, "project", "build_cache_symlink_subdirs", default=["packages"],
+    )
+    if not cache_src.is_dir():
+        return
+
+    cache_dest = Path(wt_dir) / cache_dir
+    cache_dest.mkdir(parents=True, exist_ok=True)
+
+    # Symlink shared subdirs first so rsync skips them.
+    rsync_excludes = []
+    for name in symlink_subdirs:
+        src_sub = cache_src / name
+        dest_sub = cache_dest / name
+        rsync_excludes.extend(["--exclude", f"/{name}"])
+        if not src_sub.is_dir():
+            continue
+        if dest_sub.exists() or dest_sub.is_symlink():
+            continue
         try:
-            r = subprocess.run(
-                ["rsync", "-a", "--quiet", f"{cache_src}/", f"{wt_dir}/{cache_dir}/"],
-                capture_output=True, timeout=timeout,
-            )
-            if r.returncode != 0:
-                log(f"Warning: rsync of {cache_dir} failed (exit {r.returncode}): "
-                    f"{r.stderr.decode(errors='replace').strip()[:200]}")
-                # Remove partial copy to avoid corrupt cache
-                dest = Path(wt_dir) / cache_dir
-                if dest.is_dir():
-                    shutil.rmtree(str(dest), ignore_errors=True)
-        except subprocess.TimeoutExpired:
-            log(f"Warning: rsync of {cache_dir} timed out after {timeout}s "
-                f"(source may be too large)")
-            # Remove partial copy to avoid corrupt cache
-            dest = Path(wt_dir) / cache_dir
-            if dest.is_dir():
-                shutil.rmtree(str(dest), ignore_errors=True)
+            os.symlink(src_sub.resolve(), dest_sub)
         except OSError as e:
-            log(f"Warning: rsync of {cache_dir} failed: {e}")
+            log(f"Warning: symlink of {cache_dir}/{name} failed: {e}")
+
+    try:
+        r = subprocess.run(
+            ["rsync", "-a", "--quiet", *rsync_excludes,
+             f"{cache_src}/", f"{cache_dest}/"],
+            capture_output=True, timeout=timeout,
+        )
+        if r.returncode != 0:
+            log(f"Warning: rsync of {cache_dir} failed (exit {r.returncode}): "
+                f"{r.stderr.decode(errors='replace').strip()[:200]}")
+            # Remove partial copy to avoid corrupt cache
+            if cache_dest.is_dir():
+                shutil.rmtree(str(cache_dest), ignore_errors=True)
+    except subprocess.TimeoutExpired:
+        log(f"Warning: rsync of {cache_dir} timed out after {timeout}s "
+            f"(source may be too large)")
+        # Remove partial copy to avoid corrupt cache
+        if cache_dest.is_dir():
+            shutil.rmtree(str(cache_dest), ignore_errors=True)
+    except OSError as e:
+        log(f"Warning: rsync of {cache_dir} failed: {e}")
 
 
 def cleanup_worktree(wt_dir: str, branch: str):
