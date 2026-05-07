@@ -366,7 +366,9 @@ def ensure_config() -> dict:
     _agent_config_sync_check()
     with open(CONFIG_PATH, "rb") as f:
         cfg = tomllib.load(f)
-    return _migrate_legacy_config(cfg)
+    cfg = _migrate_legacy_config(cfg)
+    validate_security_config(cfg)
+    return cfg
 
 
 def get_isolated_config_dir(config: dict) -> Path | None:
@@ -2325,12 +2327,44 @@ _INTERACTION_LIMIT_RANK = {
     "collaborators_only": 3,
 }
 
-_security_checked: bool = False
+# Re-check the live interaction limit at most this often, to bound the cost
+# of `gh api` calls when many spawns happen in quick succession but still
+# detect limit removal/expiry inside long-running pod processes.
+_SECURITY_CHECK_TTL_SECONDS = 300
+
+_security_last_ok: float = 0.0
 
 
-def _security_fail(slug: str, msg: str) -> None:
+def validate_security_config(cfg: dict) -> None:
+    """Reject typo'd values in `[security]` so they fail loudly rather than
+    silently weakening the policy.
+    """
+    sec = cfg.get("security", {}) or {}
+    minimum = sec.get("minimum_interaction_limit", "collaborators_only")
+    if minimum not in _INTERACTION_LIMIT_RANK:
+        valid = ", ".join(sorted(_INTERACTION_LIMIT_RANK))
+        print(f"pod: invalid [security].minimum_interaction_limit = {minimum!r}; "
+              f"must be one of: {valid}", file=sys.stderr)
+        sys.exit(1)
+    enforce = sec.get("enforce_interaction_limits", True)
+    if not isinstance(enforce, bool):
+        print(f"pod: invalid [security].enforce_interaction_limits = {enforce!r}; "
+              f"must be true or false", file=sys.stderr)
+        sys.exit(1)
+    days = sec.get("minimum_expiry_days", 7)
+    if not isinstance(days, (int, float)) or isinstance(days, bool) or days < 0:
+        print(f"pod: invalid [security].minimum_expiry_days = {days!r}; "
+              f"must be a non-negative number", file=sys.stderr)
+        sys.exit(1)
+
+
+def _security_fail(slug: str, msg: str, *, auth_hint: bool = False) -> None:
     print(f"pod: security check failed for {slug}: {msg}", file=sys.stderr)
     print("", file=sys.stderr)
+    if auth_hint:
+        print("If `gh` is unauthenticated, run `gh auth status` / `gh auth login`.",
+              file=sys.stderr)
+        print("", file=sys.stderr)
     print("Refusing to dispatch agents. Either:", file=sys.stderr)
     print("  • Set/renew the interaction limit:", file=sys.stderr)
     print(f"      gh api -X PUT repos/{slug}/interaction-limits \\", file=sys.stderr)
@@ -2346,19 +2380,27 @@ def check_repo_security(config: dict) -> None:
     missing, too lax, or expiring soon.
 
     Pod feeds issue bodies and comments on labeled issues into agent prompts.
-    On a public repo with no interaction limit, an arbitrary GitHub user can
-    inject content there. GitHub's interaction-limits feature gates who can
-    post; this check enforces that gate before any agent runs.
+    On a public repo with no interaction limit, anyone with a GitHub account
+    can inject text into that prompt stream. GitHub's interaction-limits
+    feature gates who can post; this check enforces it before any spawn.
 
-    Idempotent — only checks once per pod process.
+    Note: interaction limits are forward-only — content posted *before* the
+    limit was enabled (issue bodies, comments on issues labeled later) is
+    not protected. This check guards against new injection, not provenance
+    of historical content.
+
+    Re-runs at most every `_SECURITY_CHECK_TTL_SECONDS`. Called from
+    `spawn_agent` so every dispatch path is gated, including TUI auto-spawn
+    and dead-session restart from `check_dead_claimed_issues`.
     """
-    global _security_checked
-    if _security_checked:
+    global _security_last_ok
+    now = time.time()
+    if _security_last_ok and (now - _security_last_ok) < _SECURITY_CHECK_TTL_SECONDS:
         return
 
     sec = config.get("security", {}) or {}
     if not sec.get("enforce_interaction_limits", True):
-        _security_checked = True
+        _security_last_ok = now
         return
 
     minimum = sec.get("minimum_interaction_limit", "collaborators_only")
@@ -2377,8 +2419,11 @@ def check_repo_security(config: dict) -> None:
         print(f"pod: security: failed to query repo: {e}", file=sys.stderr)
         sys.exit(1)
     if r.returncode != 0 or not r.stdout.strip():
-        print(f"pod: security: cannot determine repo visibility: "
-              f"{r.stderr.strip() or 'empty response'}", file=sys.stderr)
+        err = r.stderr.strip() or "empty response"
+        print(f"pod: security: cannot determine repo visibility: {err}", file=sys.stderr)
+        if "auth" in err.lower() or "login" in err.lower() or "401" in err:
+            print("    → run `gh auth status` / `gh auth login` and retry.",
+                  file=sys.stderr)
         sys.exit(1)
     try:
         info = json.loads(r.stdout)
@@ -2389,7 +2434,7 @@ def check_repo_security(config: dict) -> None:
         sys.exit(1)
 
     if visibility != "public":
-        _security_checked = True
+        _security_last_ok = now
         return
 
     try:
@@ -2400,8 +2445,11 @@ def check_repo_security(config: dict) -> None:
     except Exception as e:
         _security_fail(slug, f"failed to query interaction-limits: {e}")
     if r.returncode != 0:
-        _security_fail(slug, f"failed to query interaction-limits: "
-                             f"{r.stderr.strip() or 'gh api error'}")
+        err = r.stderr.strip() or "gh api error"
+        is_auth = ("auth" in err.lower() or "login" in err.lower()
+                   or "401" in err or "403" in err)
+        _security_fail(slug, f"failed to query interaction-limits: {err}",
+                       auth_hint=is_auth)
 
     body = r.stdout.strip() or "{}"
     try:
@@ -2434,7 +2482,7 @@ def check_repo_security(config: dict) -> None:
                 f"interaction limit `{have}` expires in {days:.1f} days "
                 f"(< {min_days}-day threshold).")
 
-    _security_checked = True
+    _security_last_ok = now
 
 
 def _release_claim(issue_str: str, session_uuid: str, restart_count: int) -> bool:
@@ -4770,6 +4818,9 @@ def spawn_agent(config: dict, agent_id: str | None = None,
     check_dead_claimed_issues) would break git's internal waitpid and cause
     silent failures in git worktree add.
     """
+    # Gate every dispatch path. TTL-cached, so back-to-back spawns from
+    # the TUI loop or auto-spawn don't each hit the GitHub API.
+    check_repo_security(config)
     pid = os.fork()
     if pid > 0:
         # Parent: wait for the short-lived intermediate child (exits immediately).
@@ -5590,7 +5641,6 @@ def cmd_list(config: dict, args):
 
 def cmd_add(config: dict, args):
     """Launch new agents and update the target count."""
-    check_repo_security(config)
     n = args.count if args.count else 1
     for _ in range(n):
         pid = spawn_agent(config)
