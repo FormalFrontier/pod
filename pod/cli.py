@@ -4441,6 +4441,13 @@ def launch_agent(config: dict, session_uuid: str, prompt: str,
             "--no-claude-config",
             "--claude-credentials",
             "--no-codex-credentials",
+            # Pod's coordination script uses `gh issue list --label X`, which
+            # gh implements as a multi-top-level GraphQL search() that the
+            # default `allowlist-write-graphql` proxy correctly rejects.
+            # `write-graphql` widens GraphQL to account-wide for this bubble
+            # only; REST stays repo-scoped. Per-launch override leaves the
+            # user's other bubbles on the safer default.
+            "--github-security", "write-graphql",
             "--name", bubble_name,
             "--mount", f"{_data_dir()}:/opt/pod-data:ro",
             "--command", bubble_command,
