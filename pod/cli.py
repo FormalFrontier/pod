@@ -40,6 +40,7 @@ import sys
 import threading
 import time
 import tomllib
+import traceback
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -4509,18 +4510,46 @@ _agent_proc: subprocess.Popen | None = None
 _agent_config: dict = {}
 
 
-def _sigterm_handler(signum, frame):
-    """Handle SIGTERM: kill claude, unclaim, cleanup, exit."""
+def _release_agent_resources(reason: str, skip_msg: str) -> None:
+    """Tear down this agent's resources before exit.
+
+    Kills any child claude/codex subprocess, unclaims the agent's GitHub
+    issue (if any), releases its dispatch lock, cleans up its worktree,
+    and removes its state file.
+
+    Used both by the SIGTERM path and the unhandled-exception path in
+    `spawn_agent`. Without this on the crash path, an unhandled exception
+    in `agent_process_main` (e.g. a stale `_data_dir()` path after an
+    editable-install switcheroo, a transient GitHub failure, an OOM in a
+    helper) would leave the GitHub `claimed` label and the
+    `claim-history.json` entry orphaned: the issue would sit unclaimable
+    until the next housekeeping cycle's dead-claim sweep, and the
+    operator would just see "agent disappeared from the TUI" with no
+    indication of why.
+
+    `reason` becomes the agent's `status` ("killed", "crashed", …) and
+    is excluded from the "another live agent has this claim" check so
+    the unclaim path is taken correctly.
+
+    `skip_msg` is the operator-visible reason recorded by
+    `coordination skip`. Callers should embed enough detail (session
+    UUID, exception text) to identify the failure post-hoc.
+
+    Idempotent. Safe to call from a signal handler or from a
+    `try/except` in the grandchild process.
+    """
     global _agent_state, _agent_proc, _agent_config
     state = _agent_state
     config = _agent_config
 
     if state:
-        log(f"Agent {state.short_id} received SIGTERM")
-        state.status = "killed"
-        state.write()
+        state.status = reason
+        try:
+            state.write()
+        except OSError:
+            pass
 
-    # Kill claude subprocess
+    # Kill the child agent subprocess (claude/codex), if still running.
     if _agent_proc and _agent_proc.poll() is None:
         try:
             os.killpg(os.getpgid(_agent_proc.pid), signal.SIGTERM)
@@ -4539,28 +4568,35 @@ def _sigterm_handler(signum, frame):
         # live agent is also working on this issue (prevents unclaiming
         # when killing duplicate claimants).
         if state.claimed_issue > 0 and state.pr_number == 0:
+            try:
+                other_agents = read_all_agents()
+            except Exception:
+                other_agents = []
             other_live = any(
                 a.claimed_issue == state.claimed_issue
                 and a.uuid != state.uuid
-                and a.status not in ("dead", "stopped", "killed")
-                for a in read_all_agents()
+                and a.status not in ("dead", "stopped", "killed", "crashed")
+                for a in other_agents
             )
             if other_live:
                 log(f"Agent {state.short_id}: not unclaiming #{state.claimed_issue} — another agent has it")
-                clear_claim(state.claimed_issue, session_uuid=state.uuid)
+                try:
+                    clear_claim(state.claimed_issue, session_uuid=state.uuid)
+                except Exception:
+                    pass
             else:
                 try:
                     coordination(
                         config, "skip", str(state.claimed_issue),
-                        f"Agent killed by operator (session {state.uuid})",
+                        skip_msg,
                         env_extra={"POD_SESSION_ID": state.uuid},
                     )
                     clear_claim(state.claimed_issue, session_uuid=state.uuid)
                     log(f"Unclaimed issue #{state.claimed_issue}")
-                except Exception:
+                except Exception as e:
                     # Don't clear_claim — leave in history so housekeeping
                     # can retry the GitHub label removal later.
-                    log(f"Failed to skip #{state.claimed_issue} on kill, keeping in history")
+                    log(f"Failed to skip #{state.claimed_issue} on {reason} ({e}), keeping in history")
 
         # Release lock if held
         if state.lock_held:
@@ -4572,10 +4608,26 @@ def _sigterm_handler(signum, frame):
 
         # Cleanup worktree
         if state.worktree and state.branch:
-            cleanup_worktree(state.worktree, state.branch)
+            try:
+                cleanup_worktree(state.worktree, state.branch)
+            except Exception as e:
+                log(f"Worktree cleanup failed on {reason}: {e}")
 
-        state.remove_file()
+        try:
+            state.remove_file()
+        except OSError:
+            pass
 
+
+def _sigterm_handler(signum, frame):
+    """Handle SIGTERM: kill claude, unclaim, cleanup, exit."""
+    state = _agent_state
+    if state:
+        log(f"Agent {state.short_id} received SIGTERM")
+        skip_msg = f"Agent killed by operator (session {state.uuid})"
+    else:
+        skip_msg = "Agent killed by operator"
+    _release_agent_resources("killed", skip_msg)
     os._exit(0)
 
 
@@ -5155,7 +5207,28 @@ def spawn_agent(config: dict, agent_id: str | None = None,
         os.close(devnull_w)
         agent_process_main(config, agent_id, resume_uuid)
     except Exception as e:
-        log(f"Agent process crashed: {e}")
+        # Log the full traceback so the operator can diagnose post-hoc.
+        # The agent's stdout went to /dev/null after the dup2 above, so
+        # this `log` call (which writes to .pod/pod.log) is the only
+        # surviving record.
+        log(f"Agent process crashed: {e}\n{traceback.format_exc()}")
+        # Best-effort cleanup so the GitHub claim is released and the
+        # state file is removed; otherwise the issue sits in
+        # claim-history.json with `released: false` and the GitHub
+        # `claimed` label, blocking other agents from picking it up
+        # until the next housekeeping dead-claim sweep notices the
+        # session UUID is dead. Wrap in its own try/except because the
+        # crash itself may have come from a broken environment in which
+        # the cleanup helpers will also raise (e.g. a stale `_data_dir()`
+        # path after an editable-install switcheroo).
+        sid = _agent_state.short_id if _agent_state else "?"
+        uid = _agent_state.uuid if _agent_state else "?"
+        skip_msg = f"Agent crashed: {e!s} (session {uid})"
+        try:
+            _release_agent_resources("crashed", skip_msg)
+        except Exception as cleanup_e:
+            log(f"Agent {sid}: crash cleanup also failed: {cleanup_e}\n"
+                f"{traceback.format_exc()}")
     finally:
         os._exit(0)
 
