@@ -87,6 +87,32 @@ Codex configuration such as custom providers, base URLs, MCP settings,
 and other global config; isolated Codex sessions use only pod-managed
 configuration plus the shared auth token.
 
+### Public-repo safety: GitHub interaction limits
+
+Pod feeds issue bodies and comments on labeled issues into agent
+prompts. On a public repo with no interaction limit, anyone with a
+GitHub account can post text into that prompt stream. Before
+dispatching agents, pod checks
+`gh api repos/<owner>/<repo>/interaction-limits` and refuses to run if:
+
+- the repo is public and has no interaction limit set;
+- the limit is weaker than the configured minimum (default
+  `collaborators_only`); or
+- the limit expires within `minimum_expiry_days` (default 7).
+
+Set or renew the limit with:
+
+```sh
+gh api -X PUT repos/<owner>/<repo>/interaction-limits \
+  -f limit=collaborators_only -f expiry=six_months
+```
+
+GitHub interaction limits expire (max `six_months`), so the check runs
+on every `pod` startup and you'll need to renew periodically. The
+`[security]` section of `.pod/config.toml` exposes
+`enforce_interaction_limits`, `minimum_interaction_limit`, and
+`minimum_expiry_days` if you need a different policy.
+
 ## Coordination
 
 `pod coordination <subcommand>` runs the bundled coordination script

@@ -184,6 +184,20 @@ min_queue = 3                      # queue_balance: below this → planner-type
 # longer than this many minutes. Used by `coordination list-pr-repair`.
 stuck_ci_minutes = 120
 
+[security]
+# Pod ingests issue/comment text into agent prompts. On a public repo,
+# anyone can post that text unless GitHub interaction limits are set.
+# Pod refuses to dispatch agents on a public repo whose interaction
+# limit is missing, weaker than `minimum_interaction_limit`, or expiring
+# in less than `minimum_expiry_days`.
+#
+# To set/renew the limit:
+#   gh api -X PUT repos/<owner>/<repo>/interaction-limits \
+#     -f limit=collaborators_only -f expiry=six_months
+enforce_interaction_limits = true
+minimum_interaction_limit = "collaborators_only"  # or "contributors_only", "existing_users"
+minimum_expiry_days = 7
+
 [monitor]
 poll_interval = 2                  # Seconds between status updates
 jsonl_stale_warning = 300          # Warn if JSONL unchanged for this many seconds
@@ -2302,6 +2316,125 @@ def _get_repo() -> str:
     except Exception:
         pass
     return "unknown/unknown"
+
+
+# Strictness ranking of GitHub interaction-limit values. Higher = more restrictive.
+_INTERACTION_LIMIT_RANK = {
+    "existing_users": 1,
+    "contributors_only": 2,
+    "collaborators_only": 3,
+}
+
+_security_checked: bool = False
+
+
+def _security_fail(slug: str, msg: str) -> None:
+    print(f"pod: security check failed for {slug}: {msg}", file=sys.stderr)
+    print("", file=sys.stderr)
+    print("Refusing to dispatch agents. Either:", file=sys.stderr)
+    print("  • Set/renew the interaction limit:", file=sys.stderr)
+    print(f"      gh api -X PUT repos/{slug}/interaction-limits \\", file=sys.stderr)
+    print("        -f limit=collaborators_only -f expiry=six_months", file=sys.stderr)
+    print("  • Or disable the check (not recommended for public repos):", file=sys.stderr)
+    print("      under [security] in .pod/config.toml, set", file=sys.stderr)
+    print("      enforce_interaction_limits = false", file=sys.stderr)
+    sys.exit(1)
+
+
+def check_repo_security(config: dict) -> None:
+    """Refuse to dispatch agents if the repo's GitHub interaction limits are
+    missing, too lax, or expiring soon.
+
+    Pod feeds issue bodies and comments on labeled issues into agent prompts.
+    On a public repo with no interaction limit, an arbitrary GitHub user can
+    inject content there. GitHub's interaction-limits feature gates who can
+    post; this check enforces that gate before any agent runs.
+
+    Idempotent — only checks once per pod process.
+    """
+    global _security_checked
+    if _security_checked:
+        return
+
+    sec = config.get("security", {}) or {}
+    if not sec.get("enforce_interaction_limits", True):
+        _security_checked = True
+        return
+
+    minimum = sec.get("minimum_interaction_limit", "collaborators_only")
+    min_days = sec.get("minimum_expiry_days", 7)
+
+    try:
+        r = subprocess.run(
+            ["gh", "repo", "view", "--json", "visibility,nameWithOwner"],
+            capture_output=True, text=True, timeout=15, cwd=str(PROJECT_DIR),
+        )
+    except FileNotFoundError:
+        print("pod: security: `gh` CLI not found; cannot verify interaction limits.",
+              file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"pod: security: failed to query repo: {e}", file=sys.stderr)
+        sys.exit(1)
+    if r.returncode != 0 or not r.stdout.strip():
+        print(f"pod: security: cannot determine repo visibility: "
+              f"{r.stderr.strip() or 'empty response'}", file=sys.stderr)
+        sys.exit(1)
+    try:
+        info = json.loads(r.stdout)
+        visibility = (info.get("visibility") or "").lower()
+        slug = info.get("nameWithOwner") or "unknown/unknown"
+    except json.JSONDecodeError as e:
+        print(f"pod: security: unparseable repo info: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if visibility != "public":
+        _security_checked = True
+        return
+
+    try:
+        r = subprocess.run(
+            ["gh", "api", f"repos/{slug}/interaction-limits"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except Exception as e:
+        _security_fail(slug, f"failed to query interaction-limits: {e}")
+    if r.returncode != 0:
+        _security_fail(slug, f"failed to query interaction-limits: "
+                             f"{r.stderr.strip() or 'gh api error'}")
+
+    body = r.stdout.strip() or "{}"
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError as e:
+        _security_fail(slug, f"unparseable interaction-limits response: {e}")
+
+    if not data:
+        _security_fail(slug,
+            "no interaction limit set on this public repo. "
+            "Random GitHub users can post issues/comments whose contents "
+            "feed into pod agent prompts.")
+
+    have = data.get("limit", "")
+    if _INTERACTION_LIMIT_RANK.get(have, 0) < _INTERACTION_LIMIT_RANK.get(minimum, 0):
+        _security_fail(slug,
+            f"interaction limit is `{have or 'unknown'}`, "
+            f"but pod requires `{minimum}` or stricter.")
+
+    expires = data.get("expires_at")
+    if expires:
+        try:
+            t = datetime.datetime.fromisoformat(expires.replace("Z", "+00:00"))
+        except ValueError:
+            _security_fail(slug, f"unparseable expires_at: {expires!r}")
+        delta = t - datetime.datetime.now(datetime.timezone.utc)
+        days = delta.total_seconds() / 86400
+        if days < min_days:
+            _security_fail(slug,
+                f"interaction limit `{have}` expires in {days:.1f} days "
+                f"(< {min_days}-day threshold).")
+
+    _security_checked = True
 
 
 def _release_claim(issue_str: str, session_uuid: str, restart_count: int) -> bool:
@@ -4681,6 +4814,7 @@ def spawn_agent(config: dict, agent_id: str | None = None,
 
 def run_tui(config: dict):
     """Run the interactive curses TUI."""
+    check_repo_security(config)
     curses.wrapper(_tui_main, config)
 
 
@@ -5456,6 +5590,7 @@ def cmd_list(config: dict, args):
 
 def cmd_add(config: dict, args):
     """Launch new agents and update the target count."""
+    check_repo_security(config)
     n = args.count if args.count else 1
     for _ in range(n):
         pid = spawn_agent(config)
