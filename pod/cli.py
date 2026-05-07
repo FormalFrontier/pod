@@ -1378,6 +1378,58 @@ def resolve_claude_credential(claude_config_dir: Path | None) -> dict:
     return {"accountLabel": "?", "tokenPrefix": "", "source": "none"}
 
 
+def _sync_isolated_credential(claude_config_dir: Path | None) -> None:
+    """Mirror the default Claude credential into the isolated config's keychain entry.
+
+    Claude Code derives a per-config-dir keychain service name (suffix =
+    sha256(config_dir)[:8]). `swap-account` only updates the unsuffixed
+    default entry, so without this sync agents stay pinned to whichever
+    account was active when the isolated entry was first written. Run this
+    before each quota check and each agent launch so swap-account changes
+    propagate transparently.
+    """
+    if claude_config_dir is None or sys.platform != "darwin":
+        return
+    default = resolve_claude_credential(None)
+    isolated = resolve_claude_credential(claude_config_dir)
+    if default.get("source") == "none":
+        return
+    if (default.get("accountLabel") == isolated.get("accountLabel")
+            and default.get("tokenPrefix") == isolated.get("tokenPrefix")):
+        return
+    user = os.getenv("USER", "")
+    blob: str | None = None
+    try:
+        r = subprocess.run(
+            ["security", "find-generic-password",
+             "-s", "Claude Code-credentials", "-a", user, "-w"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            blob = r.stdout.strip()
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        pass
+    if blob is None:
+        try:
+            with open(Path.home() / ".claude" / ".credentials.json") as f:
+                blob = f.read().strip()
+        except (OSError, ValueError):
+            return
+    service = _claude_keychain_service(claude_config_dir)
+    hex_data = blob.encode().hex()
+    try:
+        subprocess.run(
+            ["security", "add-generic-password", "-U",
+             "-a", user, "-s", service, "-X", hex_data],
+            capture_output=True, timeout=5, check=True,
+        )
+        log(f"Mirrored credential [{default.get('accountLabel')}] → "
+            f"isolated keychain [{service}] (was [{isolated.get('accountLabel')}])")
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
+            FileNotFoundError, OSError) as e:
+        log(f"Failed to mirror credential to {service}: {e}")
+
+
 def _backend_available(config: dict, backend: str,
                         claude_config_dir: Path | None = None) -> bool:
     """Check whether `backend` has available quota right now.
@@ -1394,6 +1446,7 @@ def _backend_available(config: dict, backend: str,
     quota_required = _backend_cfg(config, "quota_check_required", backend=backend, default=True)
     args = [cmd]
     if backend == "claude":
+        _sync_isolated_credential(claude_config_dir)
         resolved = resolve_claude_credential(claude_config_dir)
         label = resolved.get("accountLabel", "")
         if label and label != "?":
@@ -4076,6 +4129,7 @@ def _log_credential_state(session_uuid: str, claude_config_dir: Path | None = No
     """
     parts = [f"session={session_uuid[:8]}"]
 
+    _sync_isolated_credential(claude_config_dir)
     resolved = resolve_claude_credential(claude_config_dir)
     parts.append(
         f"resolved=[{resolved['accountLabel']}] "
