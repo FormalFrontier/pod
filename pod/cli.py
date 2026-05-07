@@ -198,6 +198,17 @@ enforce_interaction_limits = true
 minimum_interaction_limit = "collaborators_only"  # or "contributors_only", "existing_users"
 minimum_expiry_days = 7
 
+# Per-message author provenance gate. On top of the repo-wide
+# interaction-limit check, refuse to surface issue bodies / comments
+# whose authors don't have a trusted association with the repo.
+# See README for the threat model and limits, including the org-
+# membership caveat for `MEMBER`.
+trust_only_collaborators = true
+trusted_author_associations = ["OWNER", "MEMBER", "COLLABORATOR"]
+trusted_users = []                 # bot allowlist
+                                   # e.g. ["dependabot[bot]", "github-actions[bot]"]
+provenance_cache_seconds = 60      # applies to list/orient; claim/read are always fresh
+
 [monitor]
 poll_interval = 2                  # Seconds between status updates
 jsonl_stale_warning = 300          # Warn if JSONL unchanged for this many seconds
@@ -2327,6 +2338,13 @@ _INTERACTION_LIMIT_RANK = {
     "collaborators_only": 3,
 }
 
+# Possible values of GitHub's `authorAssociation` field on issues and comments.
+# See https://docs.github.com/en/graphql/reference/enums#commentauthorassociation
+_GH_AUTHOR_ASSOCIATIONS = {
+    "OWNER", "MEMBER", "COLLABORATOR", "CONTRIBUTOR",
+    "FIRST_TIMER", "FIRST_TIME_CONTRIBUTOR", "MANNEQUIN", "NONE",
+}
+
 # Re-check the live interaction limit at most this often, to bound the cost
 # of `gh api` calls when many spawns happen in quick succession but still
 # detect limit removal/expiry inside long-running pod processes.
@@ -2354,6 +2372,35 @@ def validate_security_config(cfg: dict) -> None:
     days = sec.get("minimum_expiry_days", 7)
     if not isinstance(days, (int, float)) or isinstance(days, bool) or days < 0:
         print(f"pod: invalid [security].minimum_expiry_days = {days!r}; "
+              f"must be a non-negative number", file=sys.stderr)
+        sys.exit(1)
+
+    trust = sec.get("trust_only_collaborators", True)
+    if not isinstance(trust, bool):
+        print(f"pod: invalid [security].trust_only_collaborators = {trust!r}; "
+              f"must be true or false", file=sys.stderr)
+        sys.exit(1)
+    assocs = sec.get("trusted_author_associations",
+                     ["OWNER", "MEMBER", "COLLABORATOR"])
+    if not isinstance(assocs, list) or not all(isinstance(a, str) for a in assocs):
+        print(f"pod: invalid [security].trusted_author_associations = {assocs!r}; "
+              f"must be a list of strings", file=sys.stderr)
+        sys.exit(1)
+    bad = [a for a in assocs if a not in _GH_AUTHOR_ASSOCIATIONS]
+    if bad:
+        valid = ", ".join(sorted(_GH_AUTHOR_ASSOCIATIONS))
+        print(f"pod: invalid value(s) in [security].trusted_author_associations: "
+              f"{bad!r}; must each be one of: {valid}", file=sys.stderr)
+        sys.exit(1)
+    users = sec.get("trusted_users", [])
+    if not isinstance(users, list) or not all(isinstance(u, str) for u in users):
+        print(f"pod: invalid [security].trusted_users = {users!r}; "
+              f"must be a list of strings", file=sys.stderr)
+        sys.exit(1)
+    cache_s = sec.get("provenance_cache_seconds", 60)
+    if (not isinstance(cache_s, (int, float)) or isinstance(cache_s, bool)
+            or cache_s < 0):
+        print(f"pod: invalid [security].provenance_cache_seconds = {cache_s!r}; "
               f"must be a non-negative number", file=sys.stderr)
         sys.exit(1)
 
@@ -2483,6 +2530,260 @@ def check_repo_security(config: dict) -> None:
                 f"(< {min_days}-day threshold).")
 
     _security_last_ok = now
+
+
+# ----------------------------------------------------------------------
+# Per-message author provenance gate.
+#
+# A defense-in-depth layer on top of the repo-wide interaction-limit
+# check. We refuse to surface issue bodies / comments authored by
+# accounts that lack a trusted association with the repo. Trust is
+# decided by GitHub's `authorAssociation` field on issues and comments
+# (no admin scope needed). See README "Public-repo safety" for the
+# threat model and limits — including the `MEMBER` ≠ repo-write caveat
+# for org repos.
+# ----------------------------------------------------------------------
+
+
+@dataclass
+class _ProvenanceComment:
+    comment_id: int
+    login: str
+    association: str
+
+
+@dataclass
+class _IssueProvenance:
+    repo: str
+    issue_num: int
+    author_login: str
+    author_association: str
+    comments: list[_ProvenanceComment]
+    fetched_at: float
+
+
+# Cache: {(repo, issue_num): _IssueProvenance}.
+_provenance_cache: dict[tuple[str, int], _IssueProvenance] = {}
+
+
+def _provenance_ttl(config: dict) -> float:
+    sec = config.get("security", {}) or {}
+    return float(sec.get("provenance_cache_seconds", 60))
+
+
+def _is_repo_public(config: dict) -> bool:
+    """Return True iff the current repo is public. Cached via the same
+    `gh repo view` call used by `check_repo_security`. Safe to call from
+    contexts where we want to short-circuit the gate on private repos.
+    """
+    try:
+        r = subprocess.run(
+            ["gh", "repo", "view", "--json", "visibility"],
+            capture_output=True, text=True, timeout=15, cwd=str(PROJECT_DIR),
+        )
+    except Exception:
+        return True  # fail-closed: treat as public so we still check
+    if r.returncode != 0 or not r.stdout.strip():
+        return True
+    try:
+        return (json.loads(r.stdout).get("visibility") or "").lower() == "public"
+    except json.JSONDecodeError:
+        return True
+
+
+def fetch_issue_provenance(repo: str, issue_num: int) -> _IssueProvenance:
+    """Fetch the issue + its comments and bundle author/association data.
+
+    Two `gh api` calls per issue: one for the issue, one paginated for
+    comments. Raises subprocess.CalledProcessError on `gh` failure so
+    callers can surface a clear error.
+    """
+    issue_r = subprocess.run(
+        ["gh", "api", f"repos/{repo}/issues/{issue_num}"],
+        capture_output=True, text=True, timeout=30, check=True,
+    )
+    issue = json.loads(issue_r.stdout)
+    comments_r = subprocess.run(
+        ["gh", "api", "--paginate", f"repos/{repo}/issues/{issue_num}/comments"],
+        capture_output=True, text=True, timeout=60, check=True,
+    )
+    # `gh api --paginate` concatenates JSON arrays; parse each line that's
+    # an array, falling back to a single document on no pagination.
+    comments_raw: list = []
+    body = comments_r.stdout.strip()
+    if body:
+        # `gh` emits one or more arrays back-to-back (no separator).
+        # JSONDecoder.raw_decode handles that.
+        decoder = json.JSONDecoder()
+        idx = 0
+        while idx < len(body):
+            while idx < len(body) and body[idx].isspace():
+                idx += 1
+            if idx >= len(body):
+                break
+            obj, end = decoder.raw_decode(body, idx)
+            if isinstance(obj, list):
+                comments_raw.extend(obj)
+            idx = end
+    comments = [
+        _ProvenanceComment(
+            comment_id=int(c.get("id", 0)),
+            login=(c.get("user") or {}).get("login", "") or "",
+            association=c.get("author_association", "NONE") or "NONE",
+        )
+        for c in comments_raw
+    ]
+    return _IssueProvenance(
+        repo=repo,
+        issue_num=issue_num,
+        author_login=(issue.get("user") or {}).get("login", "") or "",
+        author_association=issue.get("author_association", "NONE") or "NONE",
+        comments=comments,
+        fetched_at=time.time(),
+    )
+
+
+def is_trusted(provenance: _IssueProvenance, config: dict) -> tuple[bool, str]:
+    """Pure policy: decide whether `provenance` passes the trust rule.
+
+    Returns `(True, "")` if trusted, else `(False, reason)`. Reason is a
+    grep-friendly single line naming the offending login and (for
+    comments) the comment id.
+    """
+    sec = config.get("security", {}) or {}
+    if not sec.get("trust_only_collaborators", True):
+        return True, ""
+    trusted_assocs = set(sec.get("trusted_author_associations",
+                                  ["OWNER", "MEMBER", "COLLABORATOR"]))
+    trusted_users = set(sec.get("trusted_users", []) or [])
+
+    def author_ok(login: str, assoc: str) -> bool:
+        return assoc in trusted_assocs or login in trusted_users
+
+    if not author_ok(provenance.author_login, provenance.author_association):
+        return False, (f"untrusted issue author @{provenance.author_login} "
+                       f"({provenance.author_association})")
+    for c in provenance.comments:
+        if not author_ok(c.login, c.association):
+            return False, (f"untrusted comment c#{c.comment_id} "
+                           f"@{c.login} ({c.association})")
+    return True, ""
+
+
+def _cached_provenance(repo: str, issue_num: int, config: dict,
+                        *, fresh: bool) -> _IssueProvenance:
+    """Shared cache entry point. `fresh=True` invalidates and re-fetches."""
+    key = (repo, issue_num)
+    if fresh:
+        _provenance_cache.pop(key, None)
+    else:
+        cached = _provenance_cache.get(key)
+        if cached and (time.time() - cached.fetched_at) < _provenance_ttl(config):
+            return cached
+    prov = fetch_issue_provenance(repo, issue_num)
+    _provenance_cache[key] = prov
+    return prov
+
+
+def check_issue_provenance(repo: str, issue_num: int, config: dict,
+                            *, fresh: bool = False) -> tuple[bool, str]:
+    """High-level gate: short-circuits on private/disabled, fetches (cached
+    or fresh per `fresh`), runs `is_trusted`, returns `(ok, reason)`."""
+    sec = config.get("security", {}) or {}
+    if not sec.get("trust_only_collaborators", True):
+        return True, ""
+    if not _is_repo_public(config):
+        return True, ""
+    try:
+        prov = _cached_provenance(repo, issue_num, config, fresh=fresh)
+    except subprocess.CalledProcessError as e:
+        err = (e.stderr or "").strip() or "gh api error"
+        return False, f"failed to fetch provenance for #{issue_num}: {err}"
+    except (json.JSONDecodeError, ValueError) as e:
+        return False, f"unparseable provenance response for #{issue_num}: {e}"
+    return is_trusted(prov, config)
+
+
+def cmd_check_provenance(config: dict, args) -> None:
+    """`pod _check-provenance N [--fresh]` — single-issue gate.
+
+    Exit 0 if trusted, exit 1 with reason on stderr if not.
+    Used by `coordination claim` and `coordination read-issue`
+    (always with --fresh).
+    """
+    repo = _get_repo()
+    ok, reason = check_issue_provenance(repo, args.issue_num, config,
+                                          fresh=args.fresh)
+    if ok:
+        return
+    print(f"pod: provenance check failed for {repo}#{args.issue_num}: {reason}",
+          file=sys.stderr)
+    sys.exit(1)
+
+
+def cmd_filter_trusted_issues(config: dict, args) -> None:
+    """`pod _filter-trusted-issues [...gh-issue-list-args...]` — runs
+    `gh issue list` once, drops untrusted issues in one Python pass, then
+    applies `--jq` (if any) to the surviving JSON array. One Python
+    startup, regardless of issue count.
+
+    Used by `coordination list-unclaimed`, `coordination orient` blocked
+    section, and directly by `plan.md` to replace inline `gh issue list`.
+    """
+    repo = _get_repo()
+    cmd = ["gh", "issue", "list", "--repo", repo]
+    for label in (args.label or []):
+        cmd += ["--label", label]
+    if args.state:
+        cmd += ["--state", args.state]
+    if args.limit:
+        cmd += ["--limit", str(args.limit)]
+    # Always include the fields needed to filter, plus whatever the
+    # caller asked for.
+    requested = set((args.json or "number,title").split(","))
+    requested |= {"number"}
+    cmd += ["--json", ",".join(sorted(requested))]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        print(f"pod: gh issue list failed: {r.stderr.strip()}", file=sys.stderr)
+        sys.exit(1)
+    try:
+        items = json.loads(r.stdout or "[]")
+    except json.JSONDecodeError as e:
+        print(f"pod: unparseable gh issue list output: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    sec_enabled = (config.get("security", {}) or {}).get(
+        "trust_only_collaborators", True)
+    repo_public = _is_repo_public(config) if sec_enabled else False
+    filtered: list[dict] = []
+    if not (sec_enabled and repo_public):
+        filtered = items
+    else:
+        for it in items:
+            num = int(it.get("number", 0))
+            if num <= 0:
+                continue
+            ok, reason = check_issue_provenance(repo, num, config, fresh=False)
+            if ok:
+                filtered.append(it)
+            elif args.include_untrusted:
+                marked = dict(it)
+                if "title" in marked:
+                    marked["title"] = f"[UNTRUSTED: {reason}] {marked['title']}"
+                filtered.append(marked)
+
+    out_json = json.dumps(filtered)
+    if args.jq:
+        jq = subprocess.run(["jq", "-r", args.jq], input=out_json,
+                             capture_output=True, text=True, timeout=30)
+        if jq.returncode != 0:
+            print(f"pod: jq failed: {jq.stderr.strip()}", file=sys.stderr)
+            sys.exit(1)
+        sys.stdout.write(jq.stdout)
+    else:
+        sys.stdout.write(out_json)
+        sys.stdout.write("\n")
 
 
 def _release_claim(issue_str: str, session_uuid: str, restart_count: int) -> bool:
@@ -6172,6 +6473,27 @@ def main():
     p_config.add_argument("--edit", action="store_true",
                            help="Open config in $EDITOR")
 
+    # Internal helpers shelled out to from the bundled `coordination` script.
+    # Underscore-prefixed names keep them out of casual `--help` browsing.
+    p_check = sub.add_parser("_check-provenance",
+                              help=argparse.SUPPRESS)
+    p_check.add_argument("issue_num", type=int)
+    p_check.add_argument("--fresh", action="store_true",
+                          help="Bypass cache and re-fetch")
+
+    p_filter = sub.add_parser("_filter-trusted-issues",
+                               help=argparse.SUPPRESS)
+    p_filter.add_argument("--label", action="append",
+                           help="Forwarded to gh issue list (repeatable)")
+    p_filter.add_argument("--state", default="open")
+    p_filter.add_argument("--limit", type=int, default=50)
+    p_filter.add_argument("--json", default="number,title",
+                           help="Forwarded to gh issue list")
+    p_filter.add_argument("--jq", default=None,
+                           help="Applied to filtered JSON array")
+    p_filter.add_argument("--include-untrusted", action="store_true",
+                           help="Surface untrusted issues with [UNTRUSTED: ...] prefix")
+
     args = parser.parse_args()
 
     # Handle subcommands that don't require ensure_config()
@@ -6212,6 +6534,10 @@ def main():
         cmd_log(config, args)
     elif args.command == "config":
         cmd_config(config, args)
+    elif args.command == "_check-provenance":
+        cmd_check_provenance(config, args)
+    elif args.command == "_filter-trusted-issues":
+        cmd_filter_trusted_issues(config, args)
 
 
 if __name__ == "__main__":
