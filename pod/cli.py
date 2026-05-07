@@ -33,6 +33,7 @@ import os
 import random
 import re
 import signal
+import shlex
 import shutil
 import stat
 import subprocess
@@ -141,6 +142,16 @@ quota_check = "~/.claude/skills/claude-usage/codex-available-model"
 quota_check_required = true        # Hard-fail if quota unavailable
 quota_retry_seconds = 60           # Sleep duration when quota unavailable
 isolated_config = true             # Use strict pod-managed CODEX_HOME (no ~/.codex state except auth.json)
+
+[agent.bubble]
+# Run each agent inside a `bubble` container instead of directly on the
+# host. The host's ~/.claude/CLAUDE.md, skills/, commands/, and
+# settings.json are NOT exposed to agents; only .credentials.json is
+# mounted (read-only) so subscription auth still works. Requires the
+# `bubble` CLI on PATH and a working Incus runtime. When enabled,
+# `[agent.claude] isolated_config` is ignored: transcripts land in
+# ~/.bubble/ai-projects/<bubble-name>/ and are read from there.
+enabled = false
 
 # Dollars per million tokens.
 # Resolution order when pricing an agent (see `_pricing_for`):
@@ -480,6 +491,45 @@ def _claude_projects_dir(claude_config_dir: Path | None = None) -> Path:
     if claude_config_dir is not None:
         return claude_config_dir / "projects"
     return Path.home() / ".claude" / "projects"
+
+
+def _use_bubble(config: dict) -> bool:
+    """Whether agents should run inside `bubble` containers."""
+    return bool(cfg_get(config, "agent", "bubble", "enabled", default=False))
+
+
+def _bubble_name(session_uuid: str) -> str:
+    """Deterministic per-session bubble container name."""
+    return f"pod-{session_uuid[:8]}"
+
+
+def _bubble_in_container_repo(wt_dir: str) -> str:
+    """Path inside the bubble where the worktree's repo is cloned.
+
+    Bubble clones into /home/user/<repo-name>; pod's worktrees are named
+    after their branch but the in-container clone uses the repo name.
+    """
+    # Bubble names the in-container clone after the upstream repo, not
+    # the worktree directory. Read it from the worktree's git config.
+    try:
+        url = subprocess.check_output(
+            ["git", "-C", wt_dir, "remote", "get-url", "origin"],
+            stderr=subprocess.DEVNULL,
+        ).decode().strip()
+        # e.g. git@github.com:owner/name.git -> name
+        name = url.rsplit("/", 1)[-1].removesuffix(".git")
+        return f"/home/user/{name}"
+    except (subprocess.CalledProcessError, OSError):
+        return f"/home/user/{Path(wt_dir).name}"
+
+
+def _bubble_jsonl_dir(bubble_name: str, wt_in_bubble: str) -> Path:
+    """Host-visible path where Claude (running inside the bubble) writes
+    its JSONL transcript. Bubble mounts ~/.bubble/ai-projects/<name>/
+    at /home/user/.claude/projects/.
+    """
+    encoded = wt_in_bubble.replace("/", "-")
+    return Path.home() / ".bubble" / "ai-projects" / bubble_name / encoded
 
 
 def cfg_get(config: dict, *keys, default=None):
@@ -4404,7 +4454,7 @@ def launch_agent(config: dict, session_uuid: str, prompt: str,
             claude_args += ["--resume", session_uuid]
         else:
             claude_args += ["--session-id", session_uuid]
-        if claude_config_dir is not None:
+        if claude_config_dir is not None or _use_bubble(config):
             claude_args += ["--dangerously-skip-permissions"]
         claude_args += ["-p", prompt]
 
@@ -4417,6 +4467,53 @@ def launch_agent(config: dict, session_uuid: str, prompt: str,
         _log_credential_state(session_uuid, claude_config_dir)
 
         agent_args = claude_args
+
+    # --- Optional: wrap in `bubble` for filesystem isolation ---
+    if _use_bubble(config):
+        bubble_name = _bubble_name(session_uuid)
+        in_repo = _bubble_in_container_repo(wt_dir)
+        # Inner command to run inside the bubble. Quote agent_args
+        # individually, and wrap in `bash -lc` so /etc/profile.d (which
+        # exports GH_TOKEN for the auth proxy) is sourced. Empty
+        # ANTHROPIC_API_KEY/OPENAI_API_KEY/CLAUDECODE force subscription
+        # auth via the mounted .credentials.json. /opt/pod-data prepended
+        # to PATH so `coordination` is found.
+        inner_cmd = " ".join(shlex.quote(a) for a in agent_args)
+        bash_inner = (
+            f"cd {shlex.quote(in_repo)} && "
+            f"ANTHROPIC_API_KEY= OPENAI_API_KEY= CLAUDECODE= "
+            f"PATH=/opt/pod-data:$PATH exec {inner_cmd}"
+        )
+        bash_lc = "bash -lc " + shlex.quote(bash_inner)
+        # Outer single-quote so bubble's shlex.split() preserves bash_lc
+        # as one token (works around bubble's host-side argv splitting).
+        bubble_command = shlex.quote(bash_lc)
+        agent_args = [
+            "bubble", "open",
+            "--path", wt_dir,
+            "--shell",
+            "--no-claude-config",
+            "--claude-credentials",
+            "--no-codex-credentials",
+            # Pod's coordination script uses `gh issue list --label X`, which
+            # gh implements as a multi-top-level GraphQL search() that the
+            # default `allowlist-write-graphql` proxy correctly rejects.
+            # `write-graphql` widens GraphQL to account-wide for this bubble
+            # only; REST stays repo-scoped. Per-launch override leaves the
+            # user's other bubbles on the safer default.
+            "--github-security", "write-graphql",
+            "--name", bubble_name,
+            "--mount", f"{_data_dir()}:/opt/pod-data:ro",
+            "--command", bubble_command,
+        ]
+        # Drop CLAUDE_CONFIG_DIR — agent runs inside bubble, host
+        # isolated_config doesn't apply.
+        env.pop("CLAUDE_CONFIG_DIR", None)
+        # Stash the bubble name globally so the run-loop and the
+        # SIGTERM handler can pop the container after exit.
+        global _agent_bubble_name
+        _agent_bubble_name = bubble_name
+        log(f"Agent {session_uuid[:8]}: launching inside bubble {bubble_name}")
 
     stdout_fd = os.open(str(stdout_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
     proc = subprocess.Popen(
@@ -4541,15 +4638,22 @@ def _setup_codex_home(config: dict, wt_dir: str) -> Path | None:
 
 def get_jsonl_path(wt_dir: str, session_uuid: str,
                    claude_config_dir: Path | None = None,
-                   backend: str = "claude") -> str:
+                   backend: str = "claude",
+                   config: dict | None = None) -> str:
     """Compute JSONL file path for a session.
 
-    For Claude: reads from ~/.claude/projects/{wt_dir}/{uuid}.jsonl
-    For Codex: reads from sessions/{uuid}.stdout (the --json stream)
+    For Claude: reads from ~/.claude/projects/{wt_dir}/{uuid}.jsonl,
+    or — when running in bubble mode — from
+    ~/.bubble/ai-projects/<bubble-name>/<encoded-in-bubble-cwd>/{uuid}.jsonl.
+    For Codex: reads from sessions/{uuid}.stdout (the --json stream).
     """
     if backend == "codex":
         session_dir = PROJECT_DIR / "sessions"
         return str(session_dir / f"{session_uuid}.stdout")
+    if config is not None and _use_bubble(config):
+        bubble_name = _bubble_name(session_uuid)
+        in_repo = _bubble_in_container_repo(wt_dir)
+        return str(_bubble_jsonl_dir(bubble_name, in_repo) / f"{session_uuid}.jsonl")
     jsonl_dir = _claude_projects_dir(claude_config_dir) / wt_dir.replace("/", "-")
     return str(jsonl_dir / f"{session_uuid}.jsonl")
 
@@ -4562,6 +4666,30 @@ def get_jsonl_path(wt_dir: str, session_uuid: str,
 _agent_state: AgentState | None = None
 _agent_proc: subprocess.Popen | None = None
 _agent_config: dict = {}
+_agent_bubble_name: str | None = None  # Set when running in bubble mode
+
+
+def _pop_agent_bubble() -> None:
+    """Pop the bubble container associated with the current agent, if any.
+
+    Idempotent: clears `_agent_bubble_name` so repeated calls (e.g. from
+    both the SIGTERM handler and the normal-exit path) do nothing.
+    """
+    global _agent_bubble_name
+    name = _agent_bubble_name
+    if not name:
+        return
+    _agent_bubble_name = None
+    try:
+        subprocess.run(
+            ["bubble", "pop", "--force", name],
+            timeout=30,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError) as e:
+        log(f"Warning: failed to pop bubble {name}: {e}")
 
 
 def _release_agent_resources(reason: str, skip_msg: str) -> None:
@@ -4616,6 +4744,9 @@ def _release_agent_resources(reason: str, skip_msg: str) -> None:
                 os.killpg(os.getpgid(_agent_proc.pid), signal.SIGKILL)
             except (ProcessLookupError, OSError):
                 pass
+
+    # Pop bubble container (no-op when not in bubble mode)
+    _pop_agent_bubble()
 
     if state and config:
         # Unclaim issue if claimed and no PR yet — but only if no other
@@ -4966,7 +5097,7 @@ def agent_process_main(config: dict, agent_id: str | None = None,
 
         # --- Start JSONL monitor ---
         jsonl_path = get_jsonl_path(wt_dir, session_uuid, claude_config_dir,
-                                    backend=chosen_backend)
+                                    backend=chosen_backend, config=config)
         stop_monitor = threading.Event()
         monitor_thread = threading.Thread(
             target=jsonl_monitor,
@@ -5080,6 +5211,11 @@ def agent_process_main(config: dict, agent_id: str | None = None,
         # --- Session ended ---
         stop_monitor.set()
         monitor_thread.join(timeout=5)
+
+        # Pop bubble container (no-op when not in bubble mode). Done here
+        # rather than in cleanup_worktree so the bubble is reclaimed even
+        # if a later cleanup step throws.
+        _pop_agent_bubble()
 
         # (Final JSONL drain handled by the monitor thread's exit path.)
 
