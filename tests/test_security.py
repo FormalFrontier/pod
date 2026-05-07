@@ -207,5 +207,163 @@ class SpawnAgentSecurityGateTests(unittest.TestCase):
         fork.assert_not_called()
 
 
+def _prov(*, author_login="alice", author_assoc="OWNER", comments=()):
+    return cli._IssueProvenance(
+        repo="o/r", issue_num=1,
+        author_login=author_login, author_association=author_assoc,
+        comments=[
+            cli._ProvenanceComment(comment_id=cid, login=login, association=assoc)
+            for cid, login, assoc in comments
+        ],
+        fetched_at=datetime.datetime.now(datetime.timezone.utc).timestamp(),
+    )
+
+
+class IsTrustedTests(unittest.TestCase):
+    def test_owner_no_comments_trusted(self):
+        ok, reason = cli.is_trusted(_prov(), {})
+        self.assertTrue(ok)
+        self.assertEqual(reason, "")
+
+    def test_member_collaborator_trusted(self):
+        for assoc in ("OWNER", "MEMBER", "COLLABORATOR"):
+            ok, _ = cli.is_trusted(_prov(author_assoc=assoc), {})
+            self.assertTrue(ok, assoc)
+
+    def test_none_author_rejected_with_login_in_reason(self):
+        ok, reason = cli.is_trusted(
+            _prov(author_login="attacker", author_assoc="NONE"), {})
+        self.assertFalse(ok)
+        self.assertIn("@attacker", reason)
+        self.assertIn("NONE", reason)
+
+    def test_contributor_rejected_by_default(self):
+        # CONTRIBUTOR = "previously merged a PR" — not a trust signal.
+        ok, reason = cli.is_trusted(
+            _prov(author_login="bob", author_assoc="CONTRIBUTOR"), {})
+        self.assertFalse(ok)
+        self.assertIn("@bob", reason)
+
+    def test_untrusted_comment_rejected_with_comment_id(self):
+        ok, reason = cli.is_trusted(
+            _prov(comments=[(12345, "attacker", "NONE")]), {})
+        self.assertFalse(ok)
+        self.assertIn("c#12345", reason)
+        self.assertIn("@attacker", reason)
+
+    def test_trusted_users_promotes_none_author(self):
+        ok, _ = cli.is_trusted(
+            _prov(author_login="dependabot[bot]", author_assoc="NONE"),
+            {"security": {"trusted_users": ["dependabot[bot]"]}})
+        self.assertTrue(ok)
+
+    def test_trusted_users_promotes_none_commenter(self):
+        ok, _ = cli.is_trusted(
+            _prov(comments=[(1, "ci-bot", "NONE")]),
+            {"security": {"trusted_users": ["ci-bot"]}})
+        self.assertTrue(ok)
+
+    def test_disabled_short_circuits(self):
+        ok, _ = cli.is_trusted(
+            _prov(author_assoc="NONE"),
+            {"security": {"trust_only_collaborators": False}})
+        self.assertTrue(ok)
+
+    def test_custom_trusted_assocs(self):
+        # Operator drops MEMBER from trust set — MEMBER author now rejected.
+        ok, _ = cli.is_trusted(
+            _prov(author_assoc="MEMBER"),
+            {"security": {"trusted_author_associations":
+                          ["OWNER", "COLLABORATOR"]}})
+        self.assertFalse(ok)
+
+
+class ProvenanceCacheTests(unittest.TestCase):
+    def setUp(self):
+        cli._provenance_cache.clear()
+
+    def _patch_fetch(self, prov):
+        # Patch the fetcher and visibility check; return mock for assertions.
+        return mock.patch.multiple(
+            cli,
+            fetch_issue_provenance=mock.MagicMock(return_value=prov),
+            _is_repo_public=mock.MagicMock(return_value=True),
+        )
+
+    def test_cached_call_reuses(self):
+        prov = _prov()
+        with self._patch_fetch(prov):
+            cli.check_issue_provenance("o/r", 1, {})
+            cli.check_issue_provenance("o/r", 1, {})
+            self.assertEqual(cli.fetch_issue_provenance.call_count, 1)
+
+    def test_fresh_bypasses_cache(self):
+        prov = _prov()
+        with self._patch_fetch(prov):
+            cli.check_issue_provenance("o/r", 1, {})
+            cli.check_issue_provenance("o/r", 1, {}, fresh=True)
+            self.assertEqual(cli.fetch_issue_provenance.call_count, 2)
+
+    def test_ttl_expiry_refetches(self):
+        prov = _prov()
+        with self._patch_fetch(prov):
+            cli.check_issue_provenance("o/r", 1, {})
+            # Age the cached entry past TTL.
+            cached = cli._provenance_cache[("o/r", 1)]
+            cached.fetched_at -= cli._provenance_ttl({}) + 1
+            cli.check_issue_provenance("o/r", 1, {})
+            self.assertEqual(cli.fetch_issue_provenance.call_count, 2)
+
+    def test_private_repo_short_circuits(self):
+        with mock.patch.object(cli, "_is_repo_public", return_value=False), \
+             mock.patch.object(cli, "fetch_issue_provenance") as fetch:
+            ok, _ = cli.check_issue_provenance("o/r", 1, {})
+        self.assertTrue(ok)
+        fetch.assert_not_called()
+
+    def test_disabled_short_circuits(self):
+        with mock.patch.object(cli, "fetch_issue_provenance") as fetch, \
+             mock.patch.object(cli, "_is_repo_public", return_value=True):
+            ok, _ = cli.check_issue_provenance(
+                "o/r", 1, {"security": {"trust_only_collaborators": False}})
+        self.assertTrue(ok)
+        fetch.assert_not_called()
+
+
+class ValidateProvenanceConfigTests(unittest.TestCase):
+    def test_defaults_pass(self):
+        cli.validate_security_config({})
+
+    def test_explicit_associations_pass(self):
+        cli.validate_security_config(
+            {"security": {"trusted_author_associations":
+                          ["OWNER", "COLLABORATOR"]}})
+
+    def test_typo_association_rejected(self):
+        with self.assertRaises(SystemExit):
+            cli.validate_security_config(
+                {"security": {"trusted_author_associations": ["OWNERR"]}})
+
+    def test_non_list_associations_rejected(self):
+        with self.assertRaises(SystemExit):
+            cli.validate_security_config(
+                {"security": {"trusted_author_associations": "OWNER"}})
+
+    def test_non_list_trusted_users_rejected(self):
+        with self.assertRaises(SystemExit):
+            cli.validate_security_config(
+                {"security": {"trusted_users": "dependabot"}})
+
+    def test_negative_cache_rejected(self):
+        with self.assertRaises(SystemExit):
+            cli.validate_security_config(
+                {"security": {"provenance_cache_seconds": -1}})
+
+    def test_non_bool_trust_rejected(self):
+        with self.assertRaises(SystemExit):
+            cli.validate_security_config(
+                {"security": {"trust_only_collaborators": "yes"}})
+
+
 if __name__ == "__main__":
     unittest.main()

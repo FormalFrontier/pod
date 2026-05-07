@@ -47,7 +47,7 @@ Never skip this step. Downstream agents are blocked on `main` until merged PRs l
 
 Fetch the list:
 ```
-gh issue list --label replan --state open --json number,title,body \
+pod _filter-trusted-issues --label replan --state open --json number,title,body \
     --jq '.[] | "### #\(.number) \(.title)\n\(.body)\n"'
 ```
 
@@ -97,7 +97,7 @@ These fix issues take priority over all new feature work.
 
 Read the **full body** of every open `agent-plan` issue:
 ```
-gh issue list --label agent-plan --state open --limit 20 \
+pod _filter-trusted-issues --label agent-plan --state open --limit 20 \
     --json number,title,body --jq '.[] | "### #\(.number) \(.title)\n\(.body)\n"'
 ```
 

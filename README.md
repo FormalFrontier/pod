@@ -122,9 +122,67 @@ forward-only. They block who can post *new* issues and comments, but
 they don't reach back through history. An issue body authored before
 the limit was enabled, or comments left on an issue *before* a
 collaborator applied the `agent-plan` / `human-oversight` label, are
-still ingested verbatim. Treat the check as defence against ongoing
-injection, not provenance for historical content. If your repo has
-existing untrusted issue history, audit it before enabling pod.
+still ingested verbatim by the interaction-limit check alone. The
+per-message provenance gate below covers that residual gap.
+
+### Per-message provenance gate
+
+A second layer that closes the historical-content gap. Pod refuses to
+surface issue bodies / comments authored by accounts without a
+trusted association with the repo. Decided per message using GitHub's
+`authorAssociation` field on every issue and comment, so it works
+without admin scope and covers content posted before any
+interaction-limit was set.
+
+Trusted by default: `OWNER`, `MEMBER`, `COLLABORATOR`. Configurable
+under `[security]`:
+
+```toml
+trust_only_collaborators = true
+trusted_author_associations = ["OWNER", "MEMBER", "COLLABORATOR"]
+trusted_users = []                # bot allowlist (e.g. "dependabot[bot]")
+provenance_cache_seconds = 60
+```
+
+Behaviour on rejection:
+
+- `coordination list-unclaimed` and `coordination orient` silently
+  omit untrusted issues. Set `POD_INCLUDE_UNTRUSTED=1` to surface
+  them annotated `[UNTRUSTED: <reason>]` for human triage.
+- `coordination claim N` refuses with `CLAIM FAILED: ...`; the agent
+  picks a different issue per the existing flow.
+- `coordination read-issue N` refuses; this is the gate that the
+  worker flow uses in place of `gh issue view N --json body`.
+- The planner's pre-claim body reads (in `plan.md` Steps 3 and 5) go
+  through `pod _filter-trusted-issues`, which drops untrusted issues
+  before any body text reaches the agent.
+
+Caching: list-time checks use a 60-second TTL; `claim` and
+`read-issue` always re-check fresh, so a comment added between
+discovery and read can't sneak past.
+
+**Org-membership caveat:** `MEMBER` is org membership, not write
+access on the specific repo. On an org repo it trusts every org
+member, including users who can't push to this repo. For stricter
+behaviour, drop `MEMBER` from `trusted_author_associations`.
+
+**Bot allowlist:** service accounts (`dependabot[bot]`,
+`github-actions[bot]`, custom CI/status bots that comment on issues)
+typically have `authorAssociation == NONE`. Add them to
+`trusted_users` so their comments don't trip the gate.
+
+**What this layer does *not* cover** (named honestly so we don't
+oversell):
+
+- PR diffs and PR review comments — the `/repair` flow operates on
+  PR metadata, but PR text is not run through this gate.
+- CI logs — relevant to `/repair`, which can ingest log text.
+- Repository file contents — if a malicious commit lands in a
+  file-path an agent reads, this gate doesn't help.
+- Linked issues/PRs that the agent fetches mid-session of its own
+  initiative.
+- Text a *trusted* collaborator copies into an issue from an
+  untrusted source. Provenance ≠ semantic sanitization.
 
 ## Coordination
 

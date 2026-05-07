@@ -100,7 +100,7 @@ coordination claim <issue-number>
 on that issue — pick a different one. Only proceed if the output says
 `Claimed issue #N`. Read the full issue body:
 ```
-gh issue view <N> --json body --jq .body
+coordination read-issue <N> --json body --jq .body
 ```
 
 ## Step 2: Set Up
