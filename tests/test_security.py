@@ -7,26 +7,34 @@ from pod import cli
 
 def _mock_run(visibility: str, slug: str, limit_response: str | None,
               limit_returncode: int = 0):
-    """Return a fake subprocess.run that responds to the two gh calls
-    check_repo_security makes (gh repo view, then gh api interaction-limits).
-    """
-    repo_view = mock.Mock()
-    repo_view.returncode = 0
-    repo_view.stdout = (
-        '{"visibility":"' + visibility + '","nameWithOwner":"' + slug + '"}\n'
-    )
-    repo_view.stderr = ""
+    """Return a fake subprocess.run that responds to the gh calls
+    check_repo_security makes. After the GraphQL-quota fix these are:
 
-    api = mock.Mock()
-    api.returncode = limit_returncode
-    api.stdout = limit_response if limit_response is not None else ""
-    api.stderr = "" if limit_returncode == 0 else "API error"
+      - `git remote get-url origin`     (slug detection, fully local)
+      - `gh api repos/{slug} --jq .visibility`
+      - `gh api repos/{slug}/interaction-limits`
+    """
+    git_remote = mock.Mock(returncode=0, stderr="",
+                           stdout=f"git@github.com:{slug}.git\n")
+
+    repo_visibility = mock.Mock(returncode=0, stderr="",
+                                stdout=visibility + "\n")
+
+    api_limits = mock.Mock()
+    api_limits.returncode = limit_returncode
+    api_limits.stdout = limit_response if limit_response is not None else ""
+    api_limits.stderr = "" if limit_returncode == 0 else "API error"
 
     def fake_run(argv, **kwargs):
-        if argv[:2] == ["gh", "repo"]:
-            return repo_view
+        if argv[:2] == ["git", "remote"]:
+            return git_remote
         if argv[:2] == ["gh", "api"]:
-            return api
+            # Distinguish the visibility probe (path = repos/{slug}) from
+            # the interaction-limits probe (path = repos/{slug}/interaction-limits).
+            path = argv[2] if len(argv) > 2 else ""
+            if path.endswith("/interaction-limits"):
+                return api_limits
+            return repo_visibility
         raise AssertionError(f"unexpected subprocess call: {argv}")
 
     return fake_run
@@ -40,6 +48,7 @@ def _iso(days_from_now: float) -> str:
 class SecurityCheckTests(unittest.TestCase):
     def setUp(self):
         cli._security_last_ok = 0.0
+        cli._cached_repo_name = None
 
     def test_disabled_skips_all_checks(self):
         with mock.patch.object(cli.subprocess, "run") as run:
@@ -108,20 +117,22 @@ class SecurityCheckTests(unittest.TestCase):
         fake = _mock_run("private", "owner/repo", "{}")
         with mock.patch.object(cli.subprocess, "run", side_effect=fake) as run:
             cli.check_repo_security({})
+            first_count = run.call_count
             cli.check_repo_security({})
-        # Within TTL — only the first call should have hit subprocess.
-        self.assertEqual(run.call_count, 1)
+        # Within TTL — the second call must add zero subprocess invocations.
+        self.assertEqual(run.call_count, first_count)
 
     def test_ttl_expires(self):
         fake = _mock_run("private", "owner/repo", "{}")
         with mock.patch.object(cli.subprocess, "run", side_effect=fake) as run:
             cli.check_repo_security({})
+            first_count = run.call_count
             # Simulate TTL elapsing.
             cli._security_last_ok = (
                 cli._security_last_ok - cli._SECURITY_CHECK_TTL_SECONDS - 1
             )
             cli.check_repo_security({})
-        self.assertEqual(run.call_count, 2)
+        self.assertGreater(run.call_count, first_count)
 
     def test_gh_not_found_fails_closed(self):
         with mock.patch.object(cli.subprocess, "run", side_effect=FileNotFoundError):
@@ -129,21 +140,35 @@ class SecurityCheckTests(unittest.TestCase):
                 cli.check_repo_security({})
 
     def test_gh_repo_view_error_fails_closed(self):
-        bad = mock.Mock()
-        bad.returncode = 1
-        bad.stdout = ""
-        bad.stderr = "auth required"
-        with mock.patch.object(cli.subprocess, "run", return_value=bad):
+        # Slug lookup (git remote) succeeds; the REST visibility probe fails.
+        git_remote = mock.Mock(returncode=0, stderr="",
+                               stdout="git@github.com:o/r.git\n")
+        bad = mock.Mock(returncode=1, stdout="", stderr="auth required")
+
+        def fake_run(argv, **kwargs):
+            if argv[:2] == ["git", "remote"]:
+                return git_remote
+            return bad
+
+        with mock.patch.object(cli.subprocess, "run", side_effect=fake_run):
             with self.assertRaises(SystemExit):
                 cli.check_repo_security({})
 
     def test_gh_api_network_error_fails_closed(self):
-        repo_view = mock.Mock(returncode=0, stderr="",
-                              stdout='{"visibility":"public","nameWithOwner":"o/r"}')
+        git_remote = mock.Mock(returncode=0, stderr="",
+                               stdout="git@github.com:o/r.git\n")
+        repo_visibility = mock.Mock(returncode=0, stderr="", stdout="public\n")
         api_err = mock.Mock(returncode=1, stdout="", stderr="HTTP 500: server error")
 
         def fake_run(argv, **kwargs):
-            return repo_view if argv[:2] == ["gh", "repo"] else api_err
+            if argv[:2] == ["git", "remote"]:
+                return git_remote
+            if argv[:2] == ["gh", "api"]:
+                path = argv[2] if len(argv) > 2 else ""
+                if path.endswith("/interaction-limits"):
+                    return api_err
+                return repo_visibility
+            raise AssertionError(f"unexpected subprocess call: {argv}")
 
         with mock.patch.object(cli.subprocess, "run", side_effect=fake_run):
             with self.assertRaises(SystemExit):
@@ -186,6 +211,7 @@ class SpawnAgentSecurityGateTests(unittest.TestCase):
 
     def setUp(self):
         cli._security_last_ok = 0.0
+        cli._cached_repo_name = None
 
     def test_spawn_agent_calls_check(self):
         # Patch os.fork so we never actually fork during the test.

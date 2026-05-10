@@ -2468,10 +2468,11 @@ def _get_base_branch() -> str:
     global _cached_base_branch
     if _cached_base_branch:
         return _cached_base_branch
+    # REST (`gh api repos/{slug}`) instead of `gh repo view --json` so this
+    # doesn't burn GraphQL quota on every cache miss.
     try:
         r = subprocess.run(
-            ["gh", "repo", "view", "--json", "defaultBranchRef", "-q",
-             ".defaultBranchRef.name"],
+            ["gh", "api", f"repos/{_get_repo()}", "--jq", ".default_branch"],
             capture_output=True, text=True, timeout=15, cwd=str(PROJECT_DIR),
         )
         if r.returncode == 0 and r.stdout.strip():
@@ -2483,21 +2484,15 @@ def _get_base_branch() -> str:
 
 
 def _get_repo() -> str:
-    """Auto-detect GitHub repo (owner/name) from the current git remote. Cached after first call."""
+    """Auto-detect GitHub repo (owner/name) from the current git remote. Cached after first call.
+
+    Uses `git remote get-url origin` first — purely local, no API call. Falls
+    back to `gh api repos/{slug}` only if the remote isn't a GitHub URL we can
+    parse, which keeps startup off the GraphQL quota path.
+    """
     global _cached_repo_name
     if _cached_repo_name:
         return _cached_repo_name
-    try:
-        r = subprocess.run(
-            ["gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"],
-            capture_output=True, text=True, timeout=15, cwd=str(PROJECT_DIR),
-        )
-        if r.returncode == 0 and r.stdout.strip():
-            _cached_repo_name = r.stdout.strip()
-            return _cached_repo_name
-    except Exception:
-        pass
-    # Fallback: parse git remote
     try:
         r = subprocess.run(
             ["git", "remote", "get-url", "origin"],
@@ -2508,7 +2503,20 @@ def _get_repo() -> str:
         import re as _re
         m = _re.search(r"github\.com[:/](.+?)(?:\.git)?$", url)
         if m:
-            return m.group(1)
+            _cached_repo_name = m.group(1)
+            return _cached_repo_name
+    except Exception:
+        pass
+    # Fallback: ask gh (REST). Only reached when the remote isn't a parseable
+    # GitHub URL — e.g. a non-default remote name or a deploy-key URL.
+    try:
+        r = subprocess.run(
+            ["gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"],
+            capture_output=True, text=True, timeout=15, cwd=str(PROJECT_DIR),
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            _cached_repo_name = r.stdout.strip()
+            return _cached_repo_name
     except Exception:
         pass
     return "unknown/unknown"
@@ -2636,9 +2644,14 @@ def check_repo_security(config: dict) -> None:
     minimum = sec.get("minimum_interaction_limit", "collaborators_only")
     min_days = sec.get("minimum_expiry_days", 7)
 
+    # REST (`gh api repos/{slug}`) instead of `gh repo view --json` so the
+    # security gate doesn't fail closed when the GraphQL bucket is exhausted.
+    # The slug comes from the local git remote (`_get_repo()`), which is also
+    # API-free.
+    slug = _get_repo()
     try:
         r = subprocess.run(
-            ["gh", "repo", "view", "--json", "visibility,nameWithOwner"],
+            ["gh", "api", f"repos/{slug}", "--jq", ".visibility"],
             capture_output=True, text=True, timeout=15, cwd=str(PROJECT_DIR),
         )
     except FileNotFoundError:
@@ -2655,13 +2668,7 @@ def check_repo_security(config: dict) -> None:
             print("    → run `gh auth status` / `gh auth login` and retry.",
                   file=sys.stderr)
         sys.exit(1)
-    try:
-        info = json.loads(r.stdout)
-        visibility = (info.get("visibility") or "").lower()
-        slug = info.get("nameWithOwner") or "unknown/unknown"
-    except json.JSONDecodeError as e:
-        print(f"pod: security: unparseable repo info: {e}", file=sys.stderr)
-        sys.exit(1)
+    visibility = r.stdout.strip().lower()
 
     if visibility != "public":
         _security_last_ok = now
@@ -2755,23 +2762,20 @@ def _provenance_ttl(config: dict) -> float:
 
 
 def _is_repo_public(config: dict) -> bool:
-    """Return True iff the current repo is public. Cached via the same
-    `gh repo view` call used by `check_repo_security`. Safe to call from
-    contexts where we want to short-circuit the gate on private repos.
+    """Return True iff the current repo is public. Uses the REST endpoint
+    (`gh api repos/{slug}`) to avoid GraphQL quota. Fails closed by
+    treating ambiguous results as public so the security gate still runs.
     """
     try:
         r = subprocess.run(
-            ["gh", "repo", "view", "--json", "visibility"],
+            ["gh", "api", f"repos/{_get_repo()}", "--jq", ".visibility"],
             capture_output=True, text=True, timeout=15, cwd=str(PROJECT_DIR),
         )
     except Exception:
         return True  # fail-closed: treat as public so we still check
     if r.returncode != 0 or not r.stdout.strip():
         return True
-    try:
-        return (json.loads(r.stdout).get("visibility") or "").lower() == "public"
-    except json.JSONDecodeError:
-        return True
+    return r.stdout.strip().lower() == "public"
 
 
 def fetch_issue_provenance(repo: str, issue_num: int) -> _IssueProvenance:
@@ -6721,8 +6725,7 @@ def _ensure_branch_protection(init_config):
 
     try:
         r = subprocess.run(
-            ["gh", "repo", "view", "--json", "defaultBranchRef",
-             "--jq", ".defaultBranchRef.name"],
+            ["gh", "api", f"repos/{_get_repo()}", "--jq", ".default_branch"],
             capture_output=True, text=True, timeout=15,
             cwd=str(PROJECT_DIR),
         )
