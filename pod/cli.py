@@ -83,6 +83,8 @@ CONFIG_PATH = POD_DIR / "config.toml"
 LOG_PATH = POD_DIR / "pod.log"
 CLAIM_HISTORY_PATH = POD_DIR / "claim-history.json"
 PR_CLAIM_HISTORY_PATH = POD_DIR / "pr-claim-history.json"
+HOUSEKEEPING_LOCK_PATH = POD_DIR / "housekeeping.lock"
+HOUSEKEEPING_STAMP_PATH = POD_DIR / "housekeeping.stamp"
 ISOLATED_CONFIG_DIR = POD_DIR / "claude-config"
 TARGET_FILE = POD_DIR / "target"  # Target agent count (int, one per line)
 PLANNER_TARGET_FILE = POD_DIR / "planner-target"  # Planner-recommended target agent count
@@ -627,6 +629,54 @@ def _claim_history_filelock():
     finally:
         fcntl.flock(fd, fcntl.LOCK_UN)
         fd.close()
+
+
+@contextlib.contextmanager
+def _housekeeping_filelock():
+    """Non-blocking exclusive lock for the housekeeping sweep.
+
+    Yields True if the caller acquired the lock and owns this housekeeping
+    cycle, False if another agent already owns it (caller should skip).
+    The OS releases the lock automatically if the holder is killed mid-sweep.
+    """
+    POD_DIR.mkdir(parents=True, exist_ok=True)
+    HOUSEKEEPING_LOCK_PATH.touch()
+    fd = open(HOUSEKEEPING_LOCK_PATH)
+    acquired = False
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
+        except (BlockingIOError, OSError):
+            yield False
+            return
+        yield True
+    finally:
+        if acquired:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        fd.close()
+
+
+def _housekeeping_due(interval: float) -> bool:
+    """True if no housekeeping has completed within the last `interval` seconds.
+
+    Reads the stamp file written at the end of the previous successful sweep.
+    Treats a missing or unparseable stamp as "due now" so a fresh project
+    or one with a corrupted stamp doesn't get stuck."""
+    try:
+        last = float(HOUSEKEEPING_STAMP_PATH.read_text().strip())
+    except (OSError, ValueError):
+        return True
+    return (time.time() - last) > interval
+
+
+def _housekeeping_mark_done():
+    """Record the timestamp of a successful housekeeping sweep. Written at the
+    *end* of the sweep so a crash mid-sweep doesn't suppress the next one."""
+    try:
+        HOUSEKEEPING_STAMP_PATH.write_text(f"{time.time()}\n")
+    except OSError as e:
+        log(f"Failed to update housekeeping stamp: {e}")
 
 
 def load_claim_history() -> dict:
@@ -2042,6 +2092,35 @@ _GH_QUOTA_CHECK_TTL = 30.0  # seconds between `gh api rate_limit` polls
 _GH_QUOTA_PAUSE_THRESHOLD = 100  # pause dispatch below this (of 5000/hr)
 
 
+class _GraphQLRateLimited(Exception):
+    """Raised when a `gh` subprocess returns a GraphQL rate-limit error.
+
+    Catch at sweep boundaries (`check_dead_claimed_issues`,
+    `reconcile_untracked_github_claims`, `check_dead_pr_claimed_prs`) to
+    abort the whole pass instead of attempting every remaining item — each
+    failed attempt would burn one or more quota slots that already aren't
+    there, and silent re-queueing of failures used to turn one rate-limit
+    blip into a self-perpetuating retry loop."""
+    pass
+
+
+def _is_rate_limit_error(result) -> bool:
+    """True if a `subprocess.run` result carries gh's rate-limit message.
+
+    Matches both `text=True` and binary captures, both stderr and stdout
+    (some gh failure paths route the error to stdout). Substring match on
+    "rate limit" is intentionally broad — gh's wording has shifted over
+    versions ("API rate limit exceeded", "GraphQL: API rate limit already
+    exceeded", "secondary rate limit", ...)."""
+    for stream_name in ("stderr", "stdout"):
+        s = getattr(result, stream_name, "") or ""
+        if isinstance(s, bytes):
+            s = s.decode(errors="replace")
+        if "rate limit" in s.lower():
+            return True
+    return False
+
+
 def _gh_quota_ok() -> bool:
     """Return False when GitHub GraphQL quota is near exhaustion.
 
@@ -2892,46 +2971,107 @@ def cmd_filter_trusted_issues(config: dict, args) -> None:
 
 def _release_claim(issue_str: str, session_uuid: str, restart_count: int) -> bool:
     """Remove the 'claimed' label from an issue and leave an explanatory comment.
-    Returns True on success, False on failure (caller may revert history deletion).
+    Returns True on success (including idempotent terminal cases — see below),
+    False on transient failure (caller may revert history deletion).
+    Raises `_GraphQLRateLimited` if a `gh` call returns a rate-limit error,
+    so callers can abort the whole release sweep instead of attempting every
+    remaining issue against an exhausted bucket.
+
     Includes a GitHub-side CAS: only releases if the latest claim comment still
-    belongs to session_uuid (prevents removing a fresh claim by a different agent)."""
+    belongs to session_uuid (prevents removing a fresh claim by a different
+    agent).
+
+    Idempotency: probes issue state + labels via the REST API first.
+    If the `claimed` label is already absent, returns True without spending
+    GraphQL quota. If the issue is closed and the label is still present,
+    also returns True — pod doesn't read labels off closed issues, and the
+    quota-safe choice is to leave them alone."""
     import re as _re
     repo = _get_repo()
+
+    # Idempotent fast path: REST probe (separate quota bucket from GraphQL).
+    # Catches the common stale-history case where the label was already
+    # removed (by another reconciler, by hand, or by us on a previous run
+    # whose history write was lost). Also handles closed issues.
     try:
-        # GitHub-side CAS: verify latest claim comment is ours
+        r_probe = subprocess.run(
+            ["gh", "api", f"repos/{repo}/issues/{issue_str}",
+             "--jq", '{state, labels: [.labels[].name]}'],
+            capture_output=True, text=True, timeout=30, cwd=str(PROJECT_DIR),
+        )
+    except (subprocess.TimeoutExpired, OSError) as e:
+        log(f"_release_claim: probe failed for #{issue_str}: {e}; falling through")
+        r_probe = None
+    if r_probe is not None:
+        if _is_rate_limit_error(r_probe):
+            raise _GraphQLRateLimited(f"REST probe rate-limited for #{issue_str}")
+        if r_probe.returncode == 0 and r_probe.stdout.strip():
+            try:
+                probe = json.loads(r_probe.stdout)
+                state = probe.get("state", "")
+                labels = probe.get("labels", []) or []
+                if "claimed" not in labels:
+                    log(f"_release_claim: #{issue_str} already lacks 'claimed' label "
+                        f"(state={state}); treating as released")
+                    return True
+                if state == "closed":
+                    log(f"_release_claim: #{issue_str} is closed; leaving stale 'claimed' "
+                        f"label in place (terminal success)")
+                    return True
+            except (json.JSONDecodeError, ValueError) as e:
+                log(f"_release_claim: probe parse failed for #{issue_str}: {e}; falling through")
+
+    # GitHub-side CAS: verify latest claim comment is ours. This call is
+    # GraphQL-backed; the REST probe above ensures we only reach it when
+    # there's actual work to do.
+    try:
         r_cas = subprocess.run(
             ["gh", "issue", "view", issue_str, "--repo", repo,
              "--json", "comments",
              "--jq", '[.comments[] | select(.body | startswith("Claimed by session"))] | sort_by(.createdAt) | last | .body'],
             capture_output=True, text=True, timeout=60, cwd=str(PROJECT_DIR),
         )
-        if r_cas.returncode == 0 and r_cas.stdout.strip():
-            m = _re.search(r'Claimed by session `([^`]+)`', r_cas.stdout.strip().strip('"'))
-            if m and m.group(1) != session_uuid:
-                log(f"Not releasing #{issue_str} — latest claim belongs to {m.group(1)[:8]}, not {session_uuid[:8]}")
-                return False
+    except (subprocess.TimeoutExpired, OSError) as e:
+        log(f"Failed to release claim on #{issue_str}: CAS subprocess error: {e}")
+        return False
+    if _is_rate_limit_error(r_cas):
+        raise _GraphQLRateLimited(f"CAS rate-limited for #{issue_str}")
+    if r_cas.returncode == 0 and r_cas.stdout.strip():
+        m = _re.search(r'Claimed by session `([^`]+)`', r_cas.stdout.strip().strip('"'))
+        if m and m.group(1) != session_uuid:
+            log(f"Not releasing #{issue_str} — latest claim belongs to {m.group(1)[:8]}, not {session_uuid[:8]}")
+            return False
 
+    try:
         r1 = subprocess.run(
             ["gh", "issue", "edit", issue_str, "--repo", repo, "--remove-label", "claimed"],
             capture_output=True, timeout=30, cwd=str(PROJECT_DIR),
         )
-        if r1.returncode != 0:
-            log(f"Failed to remove claimed label on #{issue_str}: {r1.stderr.decode().strip()}")
-            return False
-        msg = (f"Claim released — worker session `{session_uuid}` died after "
-               f"{restart_count} restart attempt(s). Available for reclaim.")
+    except (subprocess.TimeoutExpired, OSError) as e:
+        log(f"Failed to release claim on #{issue_str}: edit subprocess error: {e}")
+        return False
+    if _is_rate_limit_error(r1):
+        raise _GraphQLRateLimited(f"edit rate-limited for #{issue_str}")
+    if r1.returncode != 0:
+        log(f"Failed to remove claimed label on #{issue_str}: {r1.stderr.decode().strip()}")
+        return False
+    msg = (f"Claim released — worker session `{session_uuid}` died after "
+           f"{restart_count} restart attempt(s). Available for reclaim.")
+    try:
         r2 = subprocess.run(
             ["gh", "issue", "comment", issue_str, "--repo", repo, "--body", msg],
             capture_output=True, timeout=30, cwd=str(PROJECT_DIR),
         )
-        if r2.returncode != 0:
-            log(f"Failed to comment on #{issue_str}: {r2.stderr.decode().strip()}")
-            return False
-        log(f"Released claim on #{issue_str}")
-        return True
-    except Exception as e:
-        log(f"Failed to release claim on #{issue_str}: {e}")
+    except (subprocess.TimeoutExpired, OSError) as e:
+        log(f"Failed to comment on #{issue_str}: {e}")
         return False
+    if _is_rate_limit_error(r2):
+        raise _GraphQLRateLimited(f"comment rate-limited for #{issue_str}")
+    if r2.returncode != 0:
+        log(f"Failed to comment on #{issue_str}: {r2.stderr.decode().strip()}")
+        return False
+    log(f"Released claim on #{issue_str}")
+    return True
 
 
 def sync_claims_from_github():
@@ -3070,20 +3210,34 @@ def check_dead_claimed_issues(config: dict):
             live_claimed[a.claimed_issue] = a.uuid
 
     failed_releases: list[tuple[str, str, int]] = []
-    for issue_str, session_uuid, restart_count in to_release:
-        issue_int = int(issue_str)
-        other = live_claimed.get(issue_int)
-        if other and other != session_uuid:
-            log(f"Not releasing #{issue_str} — agent {other[:8]} still has it")
-            # Rebind history entry to the live owner so it stays tracked
-            # (the dead session's tombstone was already written above).
-            other_agent = next((a for a in fresh_agents if a.uuid == other), None)
-            if other_agent:
-                record_claim(issue_int, other_agent.uuid, other_agent.short_id)
-            continue
-        log(f"Max restarts reached for #{issue_str}, releasing claim")
-        if not _release_claim(issue_str, session_uuid, restart_count):
-            failed_releases.append((issue_str, session_uuid, restart_count))
+    # Iterate over a copy so the sentinel handler can re-queue what's left.
+    remaining = list(to_release)
+    try:
+        while remaining:
+            issue_str, session_uuid, restart_count = remaining[0]
+            issue_int = int(issue_str)
+            other = live_claimed.get(issue_int)
+            if other and other != session_uuid:
+                log(f"Not releasing #{issue_str} — agent {other[:8]} still has it")
+                # Rebind history entry to the live owner so it stays tracked
+                # (the dead session's tombstone was already written above).
+                other_agent = next((a for a in fresh_agents if a.uuid == other), None)
+                if other_agent:
+                    record_claim(issue_int, other_agent.uuid, other_agent.short_id)
+                remaining.pop(0)
+                continue
+            log(f"Max restarts reached for #{issue_str}, releasing claim")
+            if not _release_claim(issue_str, session_uuid, restart_count):
+                failed_releases.append((issue_str, session_uuid, restart_count))
+            remaining.pop(0)
+    except _GraphQLRateLimited as e:
+        log(f"check_dead_claimed_issues: aborting release sweep — {e}")
+        # Items still in `remaining` (including the one that just raised) had
+        # their `released: True` tombstones prewritten above. Without re-queuing
+        # them they'd be skipped on every future housekeeping pass — turning a
+        # transient rate-limit blip into a permanent leak. Re-queue them so the
+        # next pass (after quota recovers) re-attempts the release.
+        failed_releases.extend(remaining)
 
     # Re-add any failed releases so we retry next housekeeping cycle
     if failed_releases:
@@ -3126,6 +3280,10 @@ def reconcile_untracked_github_claims():
              "--state", "open", "--limit", "100", "--json", "number"],
             capture_output=True, text=True, timeout=30, cwd=cwd,
         )
+        if _is_rate_limit_error(r):
+            log("reconcile_untracked_github_claims: aborting — GraphQL rate-limited "
+                "on initial issue list")
+            return
         if r.returncode != 0:
             return
         github_claimed = {iss["number"] for iss in json.loads(r.stdout)}
@@ -3160,133 +3318,151 @@ def reconcile_untracked_github_claims():
     released_count = 0
     backfilled_count = 0
 
-    for issue_num in sorted(untracked):
-        # Fetch the latest "Claimed by session" comment for this issue
-        try:
-            r = subprocess.run(
-                ["gh", "issue", "view", str(issue_num), "--repo", repo,
-                 "--json", "comments",
-                 "--jq", '[.comments[] | select(.body | startswith("Claimed by session"))] | sort_by(.createdAt) | last | {body, created_at: .createdAt}'],
-                capture_output=True, text=True, timeout=60, cwd=cwd,
-            )
-            if r.returncode != 0:
+    try:
+        for issue_num in sorted(untracked):
+            # Fetch the latest "Claimed by session" comment for this issue
+            try:
+                r = subprocess.run(
+                    ["gh", "issue", "view", str(issue_num), "--repo", repo,
+                     "--json", "comments",
+                     "--jq", '[.comments[] | select(.body | startswith("Claimed by session"))] | sort_by(.createdAt) | last | {body, created_at: .createdAt}'],
+                    capture_output=True, text=True, timeout=60, cwd=cwd,
+                )
+                if _is_rate_limit_error(r):
+                    raise _GraphQLRateLimited(
+                        f"comment fetch rate-limited for #{issue_num}")
+                if r.returncode != 0:
+                    continue
+                comment_data = json.loads(r.stdout.strip()) if r.stdout.strip() else None
+                if not comment_data:
+                    continue
+            except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError):
                 continue
-            comment_data = json.loads(r.stdout.strip()) if r.stdout.strip() else None
-            if not comment_data:
+
+            comment_body = comment_data.get("body", "")
+            comment_time = comment_data.get("created_at", "")
+
+            # Parse: "Claimed by session `UUID` on branch `agent/SHORT_ID`"
+            m = _re.search(r'Claimed by session `([^`]+)` on branch `agent/([^`]+)`', comment_body)
+            if not m:
                 continue
-        except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError):
-            continue
+            owner_uuid, short_id = m.group(1), m.group(2)
 
-        comment_body = comment_data.get("body", "")
-        comment_time = comment_data.get("created_at", "")
+            # Skip if the latest claim comment is the same one we already released.
+            # Compare by timestamp: if a newer claim comment exists, it's a new
+            # claim (possibly by the same UUID via resume) and must not be skipped.
+            prev_released_time = released_at.get(issue_num, "")
+            if prev_released_time and comment_time and comment_time <= prev_released_time:
+                continue
 
-        # Parse: "Claimed by session `UUID` on branch `agent/SHORT_ID`"
-        m = _re.search(r'Claimed by session `([^`]+)` on branch `agent/([^`]+)`', comment_body)
-        if not m:
-            continue
-        owner_uuid, short_id = m.group(1), m.group(2)
+            # If the owning session is still alive, backfill into claim history
+            if owner_uuid in live_uuids:
+                with _claim_history_filelock():
+                    h = load_claim_history()
+                    key = str(issue_num)
+                    if key not in h or h[key].get("released"):
+                        h[key] = {"session_uuid": owner_uuid, "short_id": short_id, "restart_count": 0}
+                        _save_claim_history(h)
+                        backfilled_count += 1
+                        log(f"Reconcile: backfilled claim #{issue_num} → session {owner_uuid[:8]}")
+                continue
 
-        # Skip if the latest claim comment is the same one we already released.
-        # Compare by timestamp: if a newer claim comment exists, it's a new
-        # claim (possibly by the same UUID via resume) and must not be skipped.
-        prev_released_time = released_at.get(issue_num, "")
-        if prev_released_time and comment_time and comment_time <= prev_released_time:
-            continue
+            # Owner is dead — check grace period using claim comment timestamp
+            try:
+                from datetime import datetime, timezone
+                claim_dt = datetime.fromisoformat(comment_time.replace("Z", "+00:00"))
+                claim_epoch = claim_dt.timestamp()
+            except (ValueError, TypeError):
+                continue  # Can't parse timestamp, skip
 
-        # If the owning session is still alive, backfill into claim history
-        if owner_uuid in live_uuids:
-            with _claim_history_filelock():
-                h = load_claim_history()
-                key = str(issue_num)
-                if key not in h or h[key].get("released"):
-                    h[key] = {"session_uuid": owner_uuid, "short_id": short_id, "restart_count": 0}
+            age = now_epoch - claim_epoch
+            if age < grace_seconds:
+                continue  # Too fresh, might be a just-claimed issue
+
+            # Re-fetch latest claim owner before releasing (compare-and-swap)
+            try:
+                r2 = subprocess.run(
+                    ["gh", "issue", "view", str(issue_num), "--repo", repo,
+                     "--json", "comments",
+                     "--jq", '[.comments[] | select(.body | startswith("Claimed by session"))] | sort_by(.createdAt) | last | .body'],
+                    capture_output=True, text=True, timeout=60, cwd=cwd,
+                )
+                if _is_rate_limit_error(r2):
+                    raise _GraphQLRateLimited(
+                        f"CAS fetch rate-limited for #{issue_num}")
+                if r2.returncode != 0:
+                    continue
+                latest_body = r2.stdout.strip().strip('"')
+            except (subprocess.TimeoutExpired, OSError):
+                continue
+
+            m2 = _re.search(r'Claimed by session `([^`]+)`', latest_body)
+            if not m2 or m2.group(1) != owner_uuid:
+                continue  # Owner changed since our first read — someone reclaimed it
+
+            # Re-check liveness — agent state may have changed during API calls.
+            # Check if ANY live agent has this issue claimed (not just the owner
+            # from the GitHub comment — another agent may have picked it up).
+            fresh_agents = read_all_agents()
+            fresh_live = {a.uuid for a in fresh_agents if a.status not in ("dead", "stopped", "killed")}
+            if owner_uuid in fresh_live:
+                continue  # Owner came back to life (e.g. resumed session)
+            if any(a.claimed_issue == issue_num and a.uuid in fresh_live for a in fresh_agents):
+                continue  # Another live agent has this issue — don't release
+
+            # Release the stale claim — first verify the label is still present
+            # (prevents N parallel reconcilers from all posting release comments)
+            try:
+                r_label_check = subprocess.run(
+                    ["gh", "issue", "view", str(issue_num), "--repo", repo,
+                     "--json", "labels", "--jq", '[.labels[].name] | any(. == "claimed")'],
+                    capture_output=True, text=True, timeout=30, cwd=cwd,
+                )
+                if _is_rate_limit_error(r_label_check):
+                    raise _GraphQLRateLimited(
+                        f"label probe rate-limited for #{issue_num}")
+                if r_label_check.returncode != 0 or r_label_check.stdout.strip() != "true":
+                    continue  # Label already removed by another reconciler
+
+                r3 = subprocess.run(
+                    ["gh", "issue", "edit", str(issue_num), "--repo", repo, "--remove-label", "claimed"],
+                    capture_output=True, timeout=30, cwd=cwd,
+                )
+                if _is_rate_limit_error(r3):
+                    raise _GraphQLRateLimited(
+                        f"label remove rate-limited for #{issue_num}")
+                if r3.returncode != 0:
+                    continue
+                age_str = f"{int(age // 3600)}h{int((age % 3600) // 60)}m"
+                msg = (f"Stale claim released by reconciler — session `{owner_uuid}` "
+                       f"is no longer running (claimed {age_str} ago). Available for reclaim.")
+                r_comment = subprocess.run(
+                    ["gh", "issue", "comment", str(issue_num), "--repo", repo, "--body", msg],
+                    capture_output=True, timeout=30, cwd=cwd,
+                )
+                if _is_rate_limit_error(r_comment):
+                    raise _GraphQLRateLimited(
+                        f"release comment rate-limited for #{issue_num}")
+                # Record in history so we don't re-process this exact claim.
+                # Store the comment timestamp so we can distinguish this release
+                # from a future re-claim (even by the same UUID via resume).
+                with _claim_history_filelock():
+                    h = load_claim_history()
+                    key = str(issue_num)
+                    h[key] = {
+                        "session_uuid": owner_uuid,
+                        "short_id": short_id,
+                        "restart_count": 0,
+                        "released": True,
+                        "released_comment_time": comment_time,
+                    }
                     _save_claim_history(h)
-                    backfilled_count += 1
-                    log(f"Reconcile: backfilled claim #{issue_num} → session {owner_uuid[:8]}")
-            continue
-
-        # Owner is dead — check grace period using claim comment timestamp
-        try:
-            from datetime import datetime, timezone
-            claim_dt = datetime.fromisoformat(comment_time.replace("Z", "+00:00"))
-            claim_epoch = claim_dt.timestamp()
-        except (ValueError, TypeError):
-            continue  # Can't parse timestamp, skip
-
-        age = now_epoch - claim_epoch
-        if age < grace_seconds:
-            continue  # Too fresh, might be a just-claimed issue
-
-        # Re-fetch latest claim owner before releasing (compare-and-swap)
-        try:
-            r2 = subprocess.run(
-                ["gh", "issue", "view", str(issue_num), "--repo", repo,
-                 "--json", "comments",
-                 "--jq", '[.comments[] | select(.body | startswith("Claimed by session"))] | sort_by(.createdAt) | last | .body'],
-                capture_output=True, text=True, timeout=60, cwd=cwd,
-            )
-            if r2.returncode != 0:
+                released_count += 1
+                log(f"Reconcile: released stale claim #{issue_num} (owner {owner_uuid[:8]}, age {age_str})")
+            except (subprocess.TimeoutExpired, OSError):
                 continue
-            latest_body = r2.stdout.strip().strip('"')
-        except (subprocess.TimeoutExpired, OSError):
-            continue
-
-        m2 = _re.search(r'Claimed by session `([^`]+)`', latest_body)
-        if not m2 or m2.group(1) != owner_uuid:
-            continue  # Owner changed since our first read — someone reclaimed it
-
-        # Re-check liveness — agent state may have changed during API calls.
-        # Check if ANY live agent has this issue claimed (not just the owner
-        # from the GitHub comment — another agent may have picked it up).
-        fresh_agents = read_all_agents()
-        fresh_live = {a.uuid for a in fresh_agents if a.status not in ("dead", "stopped", "killed")}
-        if owner_uuid in fresh_live:
-            continue  # Owner came back to life (e.g. resumed session)
-        if any(a.claimed_issue == issue_num and a.uuid in fresh_live for a in fresh_agents):
-            continue  # Another live agent has this issue — don't release
-
-        # Release the stale claim — first verify the label is still present
-        # (prevents N parallel reconcilers from all posting release comments)
-        try:
-            r_label_check = subprocess.run(
-                ["gh", "issue", "view", str(issue_num), "--repo", repo,
-                 "--json", "labels", "--jq", '[.labels[].name] | any(. == "claimed")'],
-                capture_output=True, text=True, timeout=30, cwd=cwd,
-            )
-            if r_label_check.returncode != 0 or r_label_check.stdout.strip() != "true":
-                continue  # Label already removed by another reconciler
-
-            r3 = subprocess.run(
-                ["gh", "issue", "edit", str(issue_num), "--repo", repo, "--remove-label", "claimed"],
-                capture_output=True, timeout=30, cwd=cwd,
-            )
-            if r3.returncode != 0:
-                continue
-            age_str = f"{int(age // 3600)}h{int((age % 3600) // 60)}m"
-            msg = (f"Stale claim released by reconciler — session `{owner_uuid}` "
-                   f"is no longer running (claimed {age_str} ago). Available for reclaim.")
-            subprocess.run(
-                ["gh", "issue", "comment", str(issue_num), "--repo", repo, "--body", msg],
-                capture_output=True, timeout=30, cwd=cwd,
-            )
-            # Record in history so we don't re-process this exact claim.
-            # Store the comment timestamp so we can distinguish this release
-            # from a future re-claim (even by the same UUID via resume).
-            with _claim_history_filelock():
-                h = load_claim_history()
-                key = str(issue_num)
-                h[key] = {
-                    "session_uuid": owner_uuid,
-                    "short_id": short_id,
-                    "restart_count": 0,
-                    "released": True,
-                    "released_comment_time": comment_time,
-                }
-                _save_claim_history(h)
-            released_count += 1
-            log(f"Reconcile: released stale claim #{issue_num} (owner {owner_uuid[:8]}, age {age_str})")
-        except (subprocess.TimeoutExpired, OSError):
-            continue
+    except _GraphQLRateLimited as e:
+        log(f"reconcile_untracked_github_claims: aborting sweep — {e}")
 
     if released_count or backfilled_count:
         log(f"Reconcile: {backfilled_count} backfilled, {released_count} released")
@@ -3319,6 +3495,10 @@ def check_dead_pr_claimed_prs(config: dict):
              "--json", "number"],
             capture_output=True, text=True, timeout=30, cwd=cwd,
         )
+        if _is_rate_limit_error(r):
+            log("check_dead_pr_claimed_prs: aborting — GraphQL rate-limited "
+                "on initial pr list")
+            return
         if r.returncode != 0:
             return
         labelled = {pr["number"] for pr in json.loads(r.stdout)}
@@ -3337,88 +3517,100 @@ def check_dead_pr_claimed_prs(config: dict):
     now_epoch = time.time()
     grace_seconds = 300  # 5 min — don't yank labels out from under fresh claims
     to_release: list[tuple[int, str]] = []  # (pr_num, reason)
+    released = 0
 
     # 2. Labelled PRs: check live-session liveness via history + agent state.
-    for pr_num in labelled:
-        if pr_num in live_repair_prs:
-            continue  # A live agent reports this PR as its repair_pr
-        entry = history.get(str(pr_num))
-        if not entry:
-            # Untracked label. Could be a leak (label added by a failed
-            # claim run that died before record_pr_claim) or a very fresh
-            # claim whose record hasn't been written yet. Fetch the latest
-            # claim comment to distinguish, and only release if:
-            #  - the comment is older than the grace window, AND
-            #  - its owner session is not live.
+    try:
+        for pr_num in labelled:
+            if pr_num in live_repair_prs:
+                continue  # A live agent reports this PR as its repair_pr
+            entry = history.get(str(pr_num))
+            if not entry:
+                # Untracked label. Could be a leak (label added by a failed
+                # claim run that died before record_pr_claim) or a very fresh
+                # claim whose record hasn't been written yet. Fetch the latest
+                # claim comment to distinguish, and only release if:
+                #  - the comment is older than the grace window, AND
+                #  - its owner session is not live.
+                try:
+                    r = subprocess.run(
+                        ["gh", "api", "--paginate", f"repos/{repo}/issues/{pr_num}/comments",
+                         "--jq",
+                         '[.[] | select(.body | startswith("Claimed PR repair by session"))] '
+                         '| sort_by(.created_at) | last | {body, created_at}'],
+                        capture_output=True, text=True, timeout=30, cwd=cwd,
+                    )
+                    if _is_rate_limit_error(r):
+                        raise _GraphQLRateLimited(
+                            f"comment fetch rate-limited for PR #{pr_num}")
+                    if r.returncode != 0:
+                        continue
+                    blob = r.stdout.strip()
+                    if not blob or blob == "null":
+                        # No claim comment at all — label is orphaned from a
+                        # failed claim attempt. Grace-release.
+                        to_release.append((pr_num, "orphaned label: no claim comment"))
+                        continue
+                    cdata = json.loads(blob)
+                except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError):
+                    continue
+                import re as _re
+                m = _re.search(r'Claimed PR repair by session `([^`]+)`', cdata.get("body", ""))
+                if not m:
+                    continue
+                owner_uuid = m.group(1)
+                try:
+                    from datetime import datetime
+                    created_at = cdata.get("created_at", "")
+                    claim_ts = datetime.fromisoformat(created_at.replace("Z", "+00:00")).timestamp()
+                except (ValueError, TypeError):
+                    continue
+                age = now_epoch - claim_ts
+                if age < grace_seconds:
+                    continue  # Too fresh, might be a claim mid-write
+                if owner_uuid in live_uuids:
+                    continue  # Owner is alive — leave their label alone
+                to_release.append((pr_num, f"untracked: owner {owner_uuid[:8]} not live (age {int(age)}s)"))
+                continue
+
+            owner_uuid = entry.get("session_uuid", "")
+            if owner_uuid in live_uuids:
+                continue  # Still being worked on
+
+            claimed_at = entry.get("claimed_at", 0)
+            age = now_epoch - claimed_at if claimed_at else stale_seconds + 1
+            if age < grace_seconds:
+                continue
+            to_release.append((pr_num, f"owner {owner_uuid[:8]} no longer live (age {int(age)}s)"))
+
+        # 3. Issue the releases.
+        for pr_num, reason in to_release:
             try:
                 r = subprocess.run(
-                    ["gh", "api", "--paginate", f"repos/{repo}/issues/{pr_num}/comments",
-                     "--jq",
-                     '[.[] | select(.body | startswith("Claimed PR repair by session"))] '
-                     '| sort_by(.created_at) | last | {body, created_at}'],
-                    capture_output=True, text=True, timeout=30, cwd=cwd,
+                    ["gh", "pr", "edit", str(pr_num), "--repo", repo,
+                     "--remove-label", "repair-claimed"],
+                    capture_output=True, timeout=30, cwd=cwd,
                 )
+                if _is_rate_limit_error(r):
+                    raise _GraphQLRateLimited(
+                        f"label remove rate-limited for PR #{pr_num}")
                 if r.returncode != 0:
                     continue
-                blob = r.stdout.strip()
-                if not blob or blob == "null":
-                    # No claim comment at all — label is orphaned from a
-                    # failed claim attempt. Grace-release.
-                    to_release.append((pr_num, "orphaned label: no claim comment"))
-                    continue
-                cdata = json.loads(blob)
-            except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError):
+                r_comment = subprocess.run(
+                    ["gh", "pr", "comment", str(pr_num), "--repo", repo,
+                     "--body", f"Repair claim released by reconciler: {reason}."],
+                    capture_output=True, timeout=30, cwd=cwd,
+                )
+                if _is_rate_limit_error(r_comment):
+                    raise _GraphQLRateLimited(
+                        f"release comment rate-limited for PR #{pr_num}")
+                clear_pr_claim(pr_num)
+                released += 1
+                log(f"check_dead_pr_claimed_prs: released repair claim on PR #{pr_num} ({reason})")
+            except (subprocess.TimeoutExpired, OSError):
                 continue
-            import re as _re
-            m = _re.search(r'Claimed PR repair by session `([^`]+)`', cdata.get("body", ""))
-            if not m:
-                continue
-            owner_uuid = m.group(1)
-            try:
-                from datetime import datetime
-                created_at = cdata.get("created_at", "")
-                claim_ts = datetime.fromisoformat(created_at.replace("Z", "+00:00")).timestamp()
-            except (ValueError, TypeError):
-                continue
-            age = now_epoch - claim_ts
-            if age < grace_seconds:
-                continue  # Too fresh, might be a claim mid-write
-            if owner_uuid in live_uuids:
-                continue  # Owner is alive — leave their label alone
-            to_release.append((pr_num, f"untracked: owner {owner_uuid[:8]} not live (age {int(age)}s)"))
-            continue
-
-        owner_uuid = entry.get("session_uuid", "")
-        if owner_uuid in live_uuids:
-            continue  # Still being worked on
-
-        claimed_at = entry.get("claimed_at", 0)
-        age = now_epoch - claimed_at if claimed_at else stale_seconds + 1
-        if age < grace_seconds:
-            continue
-        to_release.append((pr_num, f"owner {owner_uuid[:8]} no longer live (age {int(age)}s)"))
-
-    # 3. Issue the releases.
-    released = 0
-    for pr_num, reason in to_release:
-        try:
-            r = subprocess.run(
-                ["gh", "pr", "edit", str(pr_num), "--repo", repo,
-                 "--remove-label", "repair-claimed"],
-                capture_output=True, timeout=30, cwd=cwd,
-            )
-            if r.returncode != 0:
-                continue
-            subprocess.run(
-                ["gh", "pr", "comment", str(pr_num), "--repo", repo,
-                 "--body", f"Repair claim released by reconciler: {reason}."],
-                capture_output=True, timeout=30, cwd=cwd,
-            )
-            clear_pr_claim(pr_num)
-            released += 1
-            log(f"check_dead_pr_claimed_prs: released repair claim on PR #{pr_num} ({reason})")
-        except (subprocess.TimeoutExpired, OSError):
-            continue
+    except _GraphQLRateLimited as e:
+        log(f"check_dead_pr_claimed_prs: aborting sweep — {e}")
 
     # 4. Clean history entries for PRs that no longer have the label
     #    (claim was cleared by claim-pr-repair itself, or the PR merged/closed).
@@ -4879,7 +5071,6 @@ def agent_process_main(config: dict, agent_id: str | None = None,
 
     iteration = 0
     consecutive_wait = 0  # Consecutive dispatch-returned-None iterations (for backoff)
-    last_housekeeping = 0.0  # Wall-clock time of last housekeeping run
     HOUSEKEEPING_INTERVAL = 600  # seconds between housekeeping runs (check-blocked, dead claims)
     while not state.finishing:
         iteration += 1
@@ -4938,33 +5129,49 @@ def agent_process_main(config: dict, agent_id: str | None = None,
         state.write()
 
         # --- Housekeeping (time-based, every 10 minutes to conserve GH API calls) ---
-        now_hk = time.time()
-        if now_hk - last_housekeeping > HOUSEKEEPING_INTERVAL:
-            last_housekeeping = now_hk
-            try:
-                coordination(config, "check-blocked")
-            except Exception:
-                pass
-            try:
-                check_dead_claimed_issues(config)
-            except Exception:
-                pass
-            try:
-                reconcile_untracked_github_claims()
-            except Exception:
-                pass
-            try:
-                check_dead_pr_claimed_prs(config)
-            except Exception:
-                pass
-            try:
-                cleanup_stale_worktrees(config, verbose=True)
-            except Exception:
-                pass
-            try:
-                cleanup_stale_branches(config, verbose=True)
-            except Exception:
-                pass
+        # Globally serialised across agents via fcntl.flock so N agents don't
+        # each fire their own sweep per window. The stamp file is written at
+        # the *end* of the sweep, so a crash mid-sweep doesn't suppress the
+        # next attempt for a full HOUSEKEEPING_INTERVAL.
+        with _housekeeping_filelock() as owns_sweep:
+            if owns_sweep and _housekeeping_due(HOUSEKEEPING_INTERVAL):
+                # GitHub-touching steps: skip when GraphQL quota is low. The
+                # quota probe itself uses REST and is cached for 30s, so this
+                # gate is free when quota is healthy. `_gh_quota_ok()` is
+                # threshold-based and fail-open, so the per-call sentinel
+                # raised from `_release_claim` and friends is the inner
+                # protection if quota goes from healthy to exhausted mid-sweep.
+                if _gh_quota_ok():
+                    try:
+                        coordination(config, "check-blocked")
+                    except Exception:
+                        pass
+                    try:
+                        check_dead_claimed_issues(config)
+                    except Exception:
+                        pass
+                    try:
+                        reconcile_untracked_github_claims()
+                    except Exception:
+                        pass
+                    try:
+                        check_dead_pr_claimed_prs(config)
+                    except Exception:
+                        pass
+                else:
+                    log(f"Agent {short_id}: housekeeping skipping GitHub steps — "
+                        f"GraphQL quota low (remaining="
+                        f"{_gh_quota_cache.get('graphql_remaining')})")
+                # Local housekeeping always runs — these never touch GitHub.
+                try:
+                    cleanup_stale_worktrees(config, verbose=True)
+                except Exception:
+                    pass
+                try:
+                    cleanup_stale_branches(config, verbose=True)
+                except Exception:
+                    pass
+                _housekeeping_mark_done()
 
         # --- Disk-space guard ---
         # Pause dispatch when free disk drops below the configured threshold.
