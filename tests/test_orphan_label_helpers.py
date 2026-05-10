@@ -64,44 +64,73 @@ class FetchBlockedDepsQueryTests(unittest.TestCase):
 
 
 class FetchHasPrLinksTests(unittest.TestCase):
+    """Three-step lookup: list has-pr issues → look up each issue's
+    closedByPullRequestsReferences → look up each referenced PR's state
+    via `gh pr view`. The reference objects do NOT contain a `state`
+    field, so a one-shot `select(.state == "OPEN")` filter would
+    always return empty and the housekeeping cycle would clear
+    `has-pr` from every legitimate issue."""
+
+    def _stub_run(self, calls):
+        """Build a fake_run that dispatches by argv shape, returning
+        canned stdout from the `calls` dict keyed on (argv[1], argv[2])."""
+        def fake_run(argv, **kwargs):
+            r = mock.Mock()
+            r.returncode = 0
+            r.stderr = ""
+            key = (argv[1], argv[2])
+            if key == ("issue", "list"):
+                r.stdout = calls.pop("issue_list", "[]")
+            elif key == ("issue", "view"):
+                # argv[3] is the issue number string
+                r.stdout = calls.pop(f"issue_view_{argv[3]}", "[]")
+            elif key == ("pr", "view"):
+                r.stdout = calls.pop(f"pr_view_{argv[3]}", "UNKNOWN")
+            else:
+                r.stdout = ""
+            return r
+        return fake_run
+
     def test_records_open_linked_pr(self):
-        list_payload = json.dumps([{"number": 3006}])
-        view_payload = json.dumps([3015])
+        # #3006 has an open linked PR #3015 — must show up.
+        with mock.patch.object(subprocess, "run", side_effect=self._stub_run({
+            "issue_list": json.dumps([{"number": 3006}]),
+            "issue_view_3006": json.dumps([3015]),
+            "pr_view_3015": "OPEN",
+        })):
+            self.assertEqual(cli.fetch_has_pr_links(), {3006: [3015]})
 
-        calls = iter([list_payload, view_payload])
+    def test_merged_linked_pr_yields_empty_list_orphan(self):
+        # #3016 has a linked PR but it's already merged — orphan; the
+        # entry must still be present (empty list) so the TUI can
+        # render `[PR ?]` and the housekeeping cycle can clean up.
+        with mock.patch.object(subprocess, "run", side_effect=self._stub_run({
+            "issue_list": json.dumps([{"number": 3016}]),
+            "issue_view_3016": json.dumps([3020]),
+            "pr_view_3020": "MERGED",
+        })):
+            self.assertEqual(cli.fetch_has_pr_links(), {3016: []})
 
-        def fake_run(argv, **kwargs):
-            r = mock.Mock()
-            r.returncode = 0
-            r.stdout = next(calls)
-            r.stderr = ""
-            return r
+    def test_orphan_with_no_linked_prs_at_all(self):
+        # The hand-applied `has-pr` case from the original incident:
+        # closedByPullRequestsReferences itself is empty.
+        with mock.patch.object(subprocess, "run", side_effect=self._stub_run({
+            "issue_list": json.dumps([{"number": 2564}]),
+            "issue_view_2564": "[]",
+        })):
+            self.assertEqual(cli.fetch_has_pr_links(), {2564: []})
 
-        with mock.patch.object(subprocess, "run", side_effect=fake_run):
-            result = cli.fetch_has_pr_links()
-
-        self.assertEqual(result, {3006: [3015]})
-
-    def test_orphan_has_pr_yields_empty_list(self):
-        # The TUI relies on the *presence* of the key (with empty list)
-        # to render `[PR ?]`, so the orphan stands out before housekeeping
-        # clears it. The key must be retained, not dropped.
-        list_payload = json.dumps([{"number": 2564}])
-        view_payload = "[]"
-
-        calls = iter([list_payload, view_payload])
-
-        def fake_run(argv, **kwargs):
-            r = mock.Mock()
-            r.returncode = 0
-            r.stdout = next(calls)
-            r.stderr = ""
-            return r
-
-        with mock.patch.object(subprocess, "run", side_effect=fake_run):
-            result = cli.fetch_has_pr_links()
-
-        self.assertEqual(result, {2564: []})
+    def test_open_and_closed_links_keeps_only_open(self):
+        # The relevant filter: an issue may have one merged PR
+        # (historically) and one open PR (the in-flight one). Only the
+        # open one should appear in the result.
+        with mock.patch.object(subprocess, "run", side_effect=self._stub_run({
+            "issue_list": json.dumps([{"number": 4000}]),
+            "issue_view_4000": json.dumps([4001, 4002]),
+            "pr_view_4001": "MERGED",
+            "pr_view_4002": "OPEN",
+        })):
+            self.assertEqual(cli.fetch_has_pr_links(), {4000: [4002]})
 
     def test_no_has_pr_issues_returns_empty_without_view_calls(self):
         list_payload = "[]"
@@ -109,7 +138,7 @@ class FetchHasPrLinksTests(unittest.TestCase):
 
         def fake_run(argv, **kwargs):
             nonlocal view_called
-            if argv[:3] == ["gh", "issue", "view"]:
+            if argv[:3] == ["gh", "issue", "view"] or argv[:3] == ["gh", "pr", "view"]:
                 view_called = True
             r = mock.Mock()
             r.returncode = 0
