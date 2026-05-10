@@ -21,7 +21,8 @@
 #   coordination claim N                      — claim an issue for this session (label + comment)
 #   coordination skip N "reason"              — mark a claimed issue as replan (stale/wrong assumptions)
 #   coordination add-dep N M                  — add depends-on: #M to issue #N's body; add blocked label if #M is open
-#   coordination check-blocked                — unblock issues whose dependencies are all closed
+#   coordination check-blocked                — unblock issues whose dependencies are all closed; remove orphan blocked from issues with no depends-on lines
+#   coordination check-has-pr                 — remove orphan has-pr from issues with no open linked PR
 #   coordination release-stale-claims [SECS]  — release claimed issues with no activity for SECS seconds (default 14400 = 4h)
 #   coordination lock-planner                 — acquire advisory planner lock (20min TTL)
 #   coordination unlock-planner               — release planner lock early
@@ -397,6 +398,20 @@ cmd_create_pr() {
     existing_pr="$(gh pr list --repo "$REPO" --head "$BRANCH" --json number --jq '.[0].number // empty')"
     if [[ -n "$existing_pr" ]]; then
         echo "PR #$existing_pr already exists for branch $BRANCH. Enabling auto-merge."
+        # Defensive guard for the full-PR path: refuse to set `has-pr` on
+        # the issue unless the existing PR's body contains a closing keyword
+        # for it. Otherwise GitHub will not auto-close the issue when the PR
+        # merges, leaving an orphan `has-pr` label that silently excludes
+        # the issue from `list-unclaimed` and `queue-depth` forever.
+        if [[ "$partial" == false ]]; then
+            local existing_body
+            existing_body="$(gh pr view "$existing_pr" --repo "$REPO" --json body --jq .body 2>/dev/null || true)"
+            if ! grep -qiE "(closes|fixes|resolves) #${issue_num}\b" <<<"$existing_body"; then
+                die "PR #$existing_pr body does not reference 'Closes #${issue_num}'.
+Refusing to set 'has-pr' on issue #${issue_num} — the label would become orphan after merge.
+Either edit the PR body to add 'Closes #${issue_num}', or rerun 'coordination create-pr ${issue_num} --partial'."
+            fi
+        fi
         gh pr merge "$existing_pr" --repo "$REPO" --auto --squash --delete-branch || \
             echo "warning: auto-merge not available (branch protection may not be set up)"
         if [[ "$partial" == true ]]; then
@@ -1051,7 +1066,17 @@ cmd_check_blocked() {
 
         local deps
         deps="$(echo "$body" | grep -oE 'depends-on: #[0-9]+' | grep -oE '[0-9]+' || true)"
-        [[ -z "$deps" ]] && continue
+        if [[ -z "$deps" ]]; then
+            # Orphan blocked: no `depends-on:` lines in body. The label was
+            # applied without recording any dependency, so check-blocked has
+            # no condition under which it could ever clear it. Remove and
+            # log so the issue re-enters the work queue.
+            gh issue edit "$num" --repo "$REPO" --remove-label blocked
+            gh issue comment "$num" --repo "$REPO" \
+                --body "Orphan \`blocked\` removed: issue body has no \`depends-on: #N\` lines, so the label could not be auto-cleared. Use \`coordination add-dep\` to record dependencies properly."
+            echo "Cleared orphan blocked on #$num (no depends-on lines in body)"
+            continue
+        fi
 
         local all_closed=true
         while read -r dep_num; do
@@ -1068,6 +1093,51 @@ cmd_check_blocked() {
             gh issue edit "$num" --repo "$REPO" --remove-label blocked
             echo "Unblocked issue #$num (all dependencies resolved)"
         fi
+    done
+}
+
+# --- check-has-pr ---
+# Scan open `has-pr` issues and remove the label from those with no open
+# linked PR (i.e. every PR that referenced the issue via Closes/Fixes/Resolves
+# has merged or been closed without GitHub auto-closing the issue, so the
+# label is stale and silently excludes the issue from the work queue).
+cmd_check_has_pr() {
+    local issues
+    issues="$(gh issue list --repo "$REPO" --label has-pr --state open --limit 50 \
+        --json number,title)"
+
+    echo "$issues" | jq -c '.[]' | \
+    while read -r issue_json; do
+        local num title
+        num="$(echo "$issue_json" | jq -r '.number')"
+        title="$(echo "$issue_json" | jq -r '.title')"
+
+        local open_prs
+        open_prs="$(gh issue view "$num" --repo "$REPO" \
+            --json closedByPullRequestsReferences \
+            --jq '[.closedByPullRequestsReferences[] | select(.state == "OPEN") | .number] | join(",")' \
+            2>/dev/null || true)"
+
+        if [[ -n "$open_prs" ]]; then
+            continue
+        fi
+
+        # No open linked PRs. Collect any closed/merged ones to attribute
+        # in the audit comment.
+        local prior_prs
+        prior_prs="$(gh issue view "$num" --repo "$REPO" \
+            --json closedByPullRequestsReferences \
+            --jq '[.closedByPullRequestsReferences[] | "#\(.number) (\(.state | ascii_downcase))"] | join(", ")' \
+            2>/dev/null || echo "")"
+        local prior_msg=""
+        if [[ -n "$prior_prs" && "$prior_prs" != "" ]]; then
+            prior_msg=" Last linked PRs: ${prior_prs}."
+        fi
+
+        gh issue edit "$num" --repo "$REPO" --remove-label has-pr
+        gh issue comment "$num" --repo "$REPO" \
+            --body "Orphan \`has-pr\` removed: no open PR currently references this issue with \`Closes #${num}\`.${prior_msg} If decomposition is in flight, use \`coordination add-dep\` to record sub-issue dependencies; the directive will become \`blocked\` until they close."
+        echo "Cleared orphan has-pr on #$num ($title)"
     done
 }
 
@@ -1210,6 +1280,7 @@ case "${1:-}" in
     skip)            shift; cmd_skip "$@" ;;
     add-dep)                shift; cmd_add_dep "$@" ;;
     check-blocked)          cmd_check_blocked ;;
+    check-has-pr)           cmd_check_has_pr ;;
     release-stale-claims)   shift; cmd_release_stale_claims "$@" ;;
     lock-planner)           cmd_lock_planner ;;
     unlock-planner)         cmd_unlock_planner ;;
@@ -1223,5 +1294,5 @@ case "${1:-}" in
     set-min-queue)       shift; cmd_set_min_queue "$@" ;;
     read-issue)          shift; cmd_read_issue "$@" ;;
     *)               die "unknown command: ${1:-}
-Usage: coordination {orient|plan [--label L] [--critical-path]|create-pr|claim-fix|close-pr|list-pr-repair|claim-pr-repair|mark-pr-salvaged|close-pr-unsalvageable|list-unclaimed [--label L]|queue-depth [L]|critical-path-depth|claim|skip|add-dep|check-blocked|release-stale-claims|lock-planner|unlock-planner|lock-status|force-unlock-planner|return-to-human|check-return-to-human|clear-return-to-human|nothing-to-plan|set-target|set-min-queue|read-issue}" ;;
+Usage: coordination {orient|plan [--label L] [--critical-path]|create-pr|claim-fix|close-pr|list-pr-repair|claim-pr-repair|mark-pr-salvaged|close-pr-unsalvageable|list-unclaimed [--label L]|queue-depth [L]|critical-path-depth|claim|skip|add-dep|check-blocked|check-has-pr|release-stale-claims|lock-planner|unlock-planner|lock-status|force-unlock-planner|return-to-human|check-return-to-human|clear-return-to-human|nothing-to-plan|set-target|set-min-queue|read-issue}" ;;
 esac

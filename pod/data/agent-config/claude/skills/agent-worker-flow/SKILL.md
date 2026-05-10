@@ -27,7 +27,8 @@ The `gh` CLI defaults to the current repo, so `--repo` is not needed.
 | `coordination claim N` | Claim issue #N — adds `claimed` label + comment, detects races |
 | `coordination skip N "reason"` | Mark claimed issue as needing replan — removes `claimed`, adds `replan` label |
 | `coordination add-dep N M` | Add `depends-on: #M` to issue #N's body; adds `blocked` label if #M is open |
-| `coordination check-blocked` | Unblock issues whose `depends-on` dependencies are all closed |
+| `coordination check-blocked` | Unblock issues whose `depends-on` dependencies are all closed; remove orphan `blocked` from issues whose body has no `depends-on:` lines |
+| `coordination check-has-pr` | Remove orphan `has-pr` from open issues that have no currently-open PR closing them (post audit comment) |
 | `coordination release-stale-claims [SECS]` | Release claimed issues with no PR after SECS seconds (default 4h); **manual use only** |
 | `coordination lock-planner` | Acquire advisory planner lock (20min TTL) |
 | `coordination unlock-planner` | Release planner lock early |
@@ -40,6 +41,18 @@ worker claims it (adds label: `claimed`) → worker creates PR closing it
 Issues marked `replan` (by skip, partial completion, or worker-led
 decomposition) are handled by the next planner. Issues with `has-pr` are
 excluded from `list-unclaimed` and `queue-depth`.
+
+**Never apply `has-pr` manually.** The label is set automatically by
+`coordination create-pr` (full path) and cleared by GitHub's auto-close
+on merge of a `Closes #N` PR. Hand-applying it desynchronises the label
+from any actual PR — when the supposed PR closes or merges without
+`Closes #N`, the issue stays `has-pr` forever and is silently excluded
+from the work queue. If you want to "park" an issue while sub-issues
+do the work, use `coordination add-dep <parent> <sub>` for each
+sub-issue: the parent becomes `blocked`, and `check-blocked` auto-clears
+the label when all subs close. The orphan-label housekeeping cycle
+(`check-has-pr`, `check-blocked`) auto-removes mis-applied labels and
+posts an audit comment on the issue.
 
 **Partial completion**: worker uses `--partial` → label swaps to
 `replan`. A planner creates a new issue for remaining work, then closes
