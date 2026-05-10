@@ -18,6 +18,8 @@ from unittest import mock
 
 from pod import cli
 
+from _gh_helpers import fake_response, patch_client
+
 
 def _result(stdout: str = "", stderr: str = "", returncode: int = 0):
     """Build a fake subprocess.run result."""
@@ -70,87 +72,80 @@ class ReleaseClaimIdempotenceTests(unittest.TestCase):
     def test_closed_issue_no_label_returns_true_without_graphql(self):
         """The most common stale-history case: issue closed long ago, label
         already removed. Pre-fix this triggered the 777-failure loop."""
-        calls: list[list[str]] = []
-
-        def fake_run(argv, **kwargs):
-            calls.append(list(argv))
-            if argv[:2] == ["gh", "api"]:
-                return _result(stdout='{"state": "closed", "labels": ["agent-plan"]}\n')
-            raise AssertionError(f"unexpected gh call: {argv}")
-
-        with mock.patch.object(cli.subprocess, "run", side_effect=fake_run):
+        probe = fake_response(200, body={"state": "closed",
+                                         "labels": [{"name": "agent-plan"}]})
+        with patch_client(routes={
+            ("GET", "/repos/acme/widgets/issues/42"): probe,
+        }) as client, mock.patch.object(cli.subprocess, "run") as run:
             self.assertTrue(cli._release_claim("42", "uuid-x", restart_count=0))
         # Only the REST probe ran — no `gh issue view` (CAS), no
         # `gh issue edit`, no `gh issue comment`.
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0][:2], ["gh", "api"])
-        self.assertNotIn("--remove-label", " ".join(calls[0]))
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(client.calls[0]["method"], "GET")
+        run.assert_not_called()
 
     def test_open_issue_no_label_returns_true_without_graphql(self):
         """Concurrent reconciler removed the label; we must not re-edit."""
-        calls: list[list[str]] = []
-
-        def fake_run(argv, **kwargs):
-            calls.append(list(argv))
-            if argv[:2] == ["gh", "api"]:
-                return _result(stdout='{"state": "open", "labels": ["agent-plan"]}\n')
-            raise AssertionError(f"unexpected gh call: {argv}")
-
-        with mock.patch.object(cli.subprocess, "run", side_effect=fake_run):
+        probe = fake_response(200, body={"state": "open",
+                                         "labels": [{"name": "agent-plan"}]})
+        with patch_client(routes={
+            ("GET", "/repos/acme/widgets/issues/99"): probe,
+        }) as client, mock.patch.object(cli.subprocess, "run") as run:
             self.assertTrue(cli._release_claim("99", "uuid-x", restart_count=0))
-        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(client.calls), 1)
+        run.assert_not_called()
 
     def test_closed_with_label_returns_true_leaves_label_alone(self):
         """Closed issue still carrying `claimed` is the quota-safe terminal
         case — accept the stale label rather than spend GraphQL cleaning it."""
-        calls: list[list[str]] = []
-
-        def fake_run(argv, **kwargs):
-            calls.append(list(argv))
-            if argv[:2] == ["gh", "api"]:
-                return _result(stdout='{"state": "closed", "labels": ["claimed", "agent-plan"]}\n')
-            raise AssertionError(f"unexpected gh call: {argv}")
-
-        with mock.patch.object(cli.subprocess, "run", side_effect=fake_run):
+        probe = fake_response(200, body={"state": "closed",
+                                         "labels": [{"name": "claimed"},
+                                                    {"name": "agent-plan"}]})
+        with patch_client(routes={
+            ("GET", "/repos/acme/widgets/issues/100"): probe,
+        }) as client, mock.patch.object(cli.subprocess, "run") as run:
             self.assertTrue(cli._release_claim("100", "uuid-x", restart_count=0))
-        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(client.calls), 1)
+        run.assert_not_called()
 
     def test_open_with_label_runs_full_path(self):
         """Real release: REST probe → CAS → edit → comment, all succeed."""
-        calls: list[list[str]] = []
+        probe = fake_response(200, body={"state": "open",
+                                         "labels": [{"name": "claimed"}]})
 
-        def fake_run(argv, **kwargs):
-            calls.append(list(argv))
-            if argv[:2] == ["gh", "api"]:
-                return _result(stdout='{"state": "open", "labels": ["claimed"]}\n')
-            if argv[:3] == ["gh", "issue", "view"]:
+        def gh_cli_handler(*argv):
+            if argv[:2] == ("issue", "view"):
                 return _result(stdout='"Claimed by session `uuid-x` on branch `agent/abcd`"\n')
-            if argv[:3] == ["gh", "issue", "edit"]:
+            if argv[:2] == ("issue", "edit"):
                 return _result(returncode=0)
-            if argv[:3] == ["gh", "issue", "comment"]:
+            if argv[:2] == ("issue", "comment"):
                 return _result(returncode=0)
-            raise AssertionError(f"unexpected gh call: {argv}")
+            raise AssertionError(f"unexpected gh_cli: {argv}")
 
-        with mock.patch.object(cli.subprocess, "run", side_effect=fake_run):
+        with patch_client(routes={
+            ("GET", "/repos/acme/widgets/issues/123"): probe,
+        }, gh_cli_handler=gh_cli_handler) as client:
             self.assertTrue(cli._release_claim("123", "uuid-x", restart_count=0))
-        verbs = [c[1] if c[1] == "api" else f"{c[1]} {c[2]}" for c in calls]
-        self.assertEqual(verbs, ["api", "issue view", "issue edit", "issue comment"])
+        # REST probe ran first.
+        self.assertEqual(client.calls[0]["method"], "GET")
 
     def test_probe_failure_falls_through_to_legacy_path(self):
         """If the REST probe itself errors, behave like the old code:
         proceed to the CAS + edit path."""
-        def fake_run(argv, **kwargs):
-            if argv[:2] == ["gh", "api"]:
-                return _result(returncode=1, stderr="probe failed")
-            if argv[:3] == ["gh", "issue", "view"]:
-                return _result(stdout='"Claimed by session `uuid-x`"\n')
-            if argv[:3] == ["gh", "issue", "edit"]:
-                return _result(returncode=0)
-            if argv[:3] == ["gh", "issue", "comment"]:
-                return _result(returncode=0)
-            raise AssertionError(f"unexpected: {argv}")
+        probe = fake_response(500, body={"message": "probe failed"})
 
-        with mock.patch.object(cli.subprocess, "run", side_effect=fake_run):
+        def gh_cli_handler(*argv):
+            if argv[:2] == ("issue", "view"):
+                return _result(stdout='"Claimed by session `uuid-x`"\n')
+            if argv[:2] == ("issue", "edit"):
+                return _result(returncode=0)
+            if argv[:2] == ("issue", "comment"):
+                return _result(returncode=0)
+            raise AssertionError(f"unexpected gh_cli: {argv}")
+
+        with patch_client(routes={
+            ("GET", "/repos/acme/widgets/issues/7"): probe,
+        }, gh_cli_handler=gh_cli_handler):
             self.assertTrue(cli._release_claim("7", "uuid-x", restart_count=0))
 
 
@@ -167,72 +162,86 @@ class ReleaseClaimSentinelTests(unittest.TestCase):
         self._patch_repo.stop()
 
     def test_sentinel_raised_on_rest_probe_rate_limit(self):
-        def fake_run(argv, **kwargs):
-            if argv[:2] == ["gh", "api"]:
-                return _result(returncode=1, stderr="API rate limit exceeded")
-            raise AssertionError(f"unexpected: {argv}")
-
-        with mock.patch.object(cli.subprocess, "run", side_effect=fake_run):
+        # The REST probe now goes through the layer; a 403 surfaces as
+        # `resp.status == 403`, which `_release_claim` translates to the
+        # `_GraphQLRateLimited` sentinel.
+        probe = fake_response(403, body={"message": "rate limit exceeded"})
+        with patch_client(routes={
+            ("GET", "/repos/acme/widgets/issues/42"): probe,
+        }), mock.patch.object(cli.subprocess, "run") as run:
             with self.assertRaises(cli._GraphQLRateLimited):
                 cli._release_claim("42", "uuid-x", restart_count=0)
+        run.assert_not_called()
 
     def test_sentinel_raised_on_cas_rate_limit(self):
-        def fake_run(argv, **kwargs):
-            if argv[:2] == ["gh", "api"]:
-                return _result(stdout='{"state": "open", "labels": ["claimed"]}\n')
-            if argv[:3] == ["gh", "issue", "view"]:
+        probe = fake_response(200, body={"state": "open",
+                                         "labels": [{"name": "claimed"}]})
+
+        def gh_cli_handler(*argv):
+            if argv[:2] == ("issue", "view"):
                 return _result(returncode=1, stderr="GraphQL: API rate limit exceeded")
             raise AssertionError(f"unexpected: {argv}")
 
-        with mock.patch.object(cli.subprocess, "run", side_effect=fake_run):
+        with patch_client(routes={
+            ("GET", "/repos/acme/widgets/issues/42"): probe,
+        }, gh_cli_handler=gh_cli_handler):
             with self.assertRaises(cli._GraphQLRateLimited):
                 cli._release_claim("42", "uuid-x", restart_count=0)
 
     def test_sentinel_raised_on_edit_rate_limit(self):
         """Regression test for the critical bug Codex flagged: the original
         `except Exception: return False` would have swallowed this."""
-        def fake_run(argv, **kwargs):
-            if argv[:2] == ["gh", "api"]:
-                return _result(stdout='{"state": "open", "labels": ["claimed"]}\n')
-            if argv[:3] == ["gh", "issue", "view"]:
+        probe = fake_response(200, body={"state": "open",
+                                         "labels": [{"name": "claimed"}]})
+
+        def gh_cli_handler(*argv):
+            if argv[:2] == ("issue", "view"):
                 return _result(stdout='"Claimed by session `uuid-x`"\n')
-            if argv[:3] == ["gh", "issue", "edit"]:
+            if argv[:2] == ("issue", "edit"):
                 return _result(returncode=1, stderr="GraphQL: API rate limit already exceeded for user ID 1")
             raise AssertionError(f"unexpected: {argv}")
 
-        with mock.patch.object(cli.subprocess, "run", side_effect=fake_run):
+        with patch_client(routes={
+            ("GET", "/repos/acme/widgets/issues/42"): probe,
+        }, gh_cli_handler=gh_cli_handler):
             with self.assertRaises(cli._GraphQLRateLimited):
                 cli._release_claim("42", "uuid-x", restart_count=0)
 
     def test_sentinel_raised_on_comment_rate_limit(self):
-        def fake_run(argv, **kwargs):
-            if argv[:2] == ["gh", "api"]:
-                return _result(stdout='{"state": "open", "labels": ["claimed"]}\n')
-            if argv[:3] == ["gh", "issue", "view"]:
+        probe = fake_response(200, body={"state": "open",
+                                         "labels": [{"name": "claimed"}]})
+
+        def gh_cli_handler(*argv):
+            if argv[:2] == ("issue", "view"):
                 return _result(stdout='"Claimed by session `uuid-x`"\n')
-            if argv[:3] == ["gh", "issue", "edit"]:
+            if argv[:2] == ("issue", "edit"):
                 return _result(returncode=0)
-            if argv[:3] == ["gh", "issue", "comment"]:
+            if argv[:2] == ("issue", "comment"):
                 return _result(returncode=1, stderr="rate limit")
             raise AssertionError(f"unexpected: {argv}")
 
-        with mock.patch.object(cli.subprocess, "run", side_effect=fake_run):
+        with patch_client(routes={
+            ("GET", "/repos/acme/widgets/issues/42"): probe,
+        }, gh_cli_handler=gh_cli_handler):
             with self.assertRaises(cli._GraphQLRateLimited):
                 cli._release_claim("42", "uuid-x", restart_count=0)
 
     def test_normal_edit_failure_returns_false_not_sentinel(self):
         """Non-rate-limit failures still return False so the caller can
         re-queue. The sentinel is reserved for actual quota exhaustion."""
-        def fake_run(argv, **kwargs):
-            if argv[:2] == ["gh", "api"]:
-                return _result(stdout='{"state": "open", "labels": ["claimed"]}\n')
-            if argv[:3] == ["gh", "issue", "view"]:
+        probe = fake_response(200, body={"state": "open",
+                                         "labels": [{"name": "claimed"}]})
+
+        def gh_cli_handler(*argv):
+            if argv[:2] == ("issue", "view"):
                 return _result(stdout='"Claimed by session `uuid-x`"\n')
-            if argv[:3] == ["gh", "issue", "edit"]:
-                return _result(returncode=1, stderr=b"HTTP 404")
+            if argv[:2] == ("issue", "edit"):
+                return _result(returncode=1, stderr="HTTP 404")
             raise AssertionError(f"unexpected: {argv}")
 
-        with mock.patch.object(cli.subprocess, "run", side_effect=fake_run):
+        with patch_client(routes={
+            ("GET", "/repos/acme/widgets/issues/42"): probe,
+        }, gh_cli_handler=gh_cli_handler):
             self.assertFalse(cli._release_claim("42", "uuid-x", restart_count=0))
 
 
