@@ -23,6 +23,17 @@ These are direct instructions from the project owner. Treat them as highest prio
 - **Do not create issues that overlap with or supersede a `human-oversight` issue**
 - **Do not close `human-oversight` issues** — only the owner closes them
 - **Do not add `replan` to `human-oversight` issues** — they stay open until done
+- **Do not hand-apply `has-pr` to a `human-oversight` issue** to "park" it
+  while sub-issues do the work. `has-pr` is owned by `coordination create-pr`
+  alone — applied automatically when a PR with `Closes #N` is opened, removed
+  automatically when GitHub auto-closes the issue on merge. Manual
+  application desynchronises the label from any real PR; when the partial
+  PR merges (without `Closes #N`) the issue stays `has-pr` forever and is
+  silently excluded from the work queue. To park a decomposed directive
+  cleanly, run `coordination add-dep <directive> <sub-issue>` for each open
+  sub-issue: the directive becomes `blocked` and auto-unblocks when all
+  subs close. The housekeeping cycle (`check-has-pr`, `check-blocked`) will
+  remove orphan labels and post an audit comment.
 - If a `human-oversight` issue is already claimed, continue to Step 2 (workers are on it)
 - If unclaimed, prioritise creating any supporting infrastructure issues first, then exit
   — the next worker will claim the directive itself

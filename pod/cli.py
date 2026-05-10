@@ -1832,13 +1832,18 @@ def fetch_issues_and_prs() -> list[GHItem]:
 
 
 def fetch_blocked_deps() -> dict[int, list[int]]:
-    """Fetch open depends-on dependencies for blocked issues (closed deps filtered out)."""
+    """Fetch open depends-on dependencies for blocked issues (closed deps filtered out).
+
+    Queries every open `blocked` issue regardless of family label
+    (`agent-plan`, `human-oversight`, etc.) so the TUI can render
+    `[Blocked on #N]` annotations consistently.
+    """
     import re as _re
     cwd = str(PROJECT_DIR)
     try:
         r = subprocess.run(
-            ["gh", "issue", "list", "--label", "agent-plan", "--label", "blocked",
-             "--state", "open", "--limit", "20", "--json", "number,body"],
+            ["gh", "issue", "list", "--label", "blocked",
+             "--state", "open", "--limit", "40", "--json", "number,body"],
             capture_output=True, text=True, timeout=30, cwd=cwd,
         )
         if r.returncode != 0:
@@ -1862,6 +1867,52 @@ def fetch_blocked_deps() -> dict[int, list[int]]:
 
         return {num: filtered for num, deps in raw.items()
                 if (filtered := [d for d in deps if d in open_nums])}
+    except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError):
+        return {}
+
+
+def fetch_has_pr_links() -> dict[int, list[int]]:
+    """Fetch open linked PRs for each open `has-pr` issue.
+
+    Returned dict maps issue number → list of OPEN PR numbers that
+    reference the issue via `Closes #N` (GitHub's `closedByPullRequestsReferences`).
+    An empty list means the `has-pr` label is orphan: every PR that
+    once linked the issue has merged or been closed without
+    auto-closing it. The caller should still emit the entry so the
+    TUI can flag the orphan; auto-cleanup happens in housekeeping
+    via `coordination check-has-pr`.
+    """
+    cwd = str(PROJECT_DIR)
+    try:
+        r = subprocess.run(
+            ["gh", "issue", "list", "--label", "has-pr",
+             "--state", "open", "--limit", "40", "--json", "number"],
+            capture_output=True, text=True, timeout=30, cwd=cwd,
+        )
+        if r.returncode != 0:
+            return {}
+
+        issue_nums = [iss["number"] for iss in json.loads(r.stdout)]
+        if not issue_nums:
+            return {}
+
+        result: dict[int, list[int]] = {}
+        for num in issue_nums:
+            r2 = subprocess.run(
+                ["gh", "issue", "view", str(num),
+                 "--json", "closedByPullRequestsReferences",
+                 "--jq", "[.closedByPullRequestsReferences[] "
+                        "| select(.state == \"OPEN\") | .number]"],
+                capture_output=True, text=True, timeout=15, cwd=cwd,
+            )
+            if r2.returncode == 0:
+                try:
+                    result[num] = json.loads(r2.stdout) or []
+                except json.JSONDecodeError:
+                    result[num] = []
+            else:
+                result[num] = []
+        return result
     except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError):
         return {}
 
@@ -5075,7 +5126,7 @@ def agent_process_main(config: dict, agent_id: str | None = None,
 
     iteration = 0
     consecutive_wait = 0  # Consecutive dispatch-returned-None iterations (for backoff)
-    HOUSEKEEPING_INTERVAL = 600  # seconds between housekeeping runs (check-blocked, dead claims)
+    HOUSEKEEPING_INTERVAL = 600  # seconds between housekeeping runs (check-blocked, check-has-pr, dead claims)
     while not state.finishing:
         iteration += 1
         state.loop_iteration = iteration
@@ -5148,6 +5199,10 @@ def agent_process_main(config: dict, agent_id: str | None = None,
                 if _gh_quota_ok():
                     try:
                         coordination(config, "check-blocked")
+                    except Exception:
+                        pass
+                    try:
+                        coordination(config, "check-has-pr")
                     except Exception:
                         pass
                     try:
@@ -5675,6 +5730,8 @@ def _tui_main(stdscr, config: dict):
     items_fetch_time = 0.0
     cached_blocked_deps: dict[int, list[int]] = {}
     blocked_deps_fetch_time = 0.0
+    cached_has_pr_links: dict[int, list[int]] = {}
+    has_pr_links_fetch_time = 0.0
     cached_lock_status: str | None = None  # "locked" or "unlocked"
     lock_fetch_time = 0.0
     # (The repair worker type, if configured, is dispatched directly by
@@ -5713,7 +5770,8 @@ def _tui_main(stdscr, config: dict):
 
     # Background fetch infrastructure: all GH/coordination calls run in daemon
     # threads so the TUI never blocks on network I/O.
-    _bg_data: dict = {"queue": None, "items": None, "blocked_deps": None, "lock_status": None,
+    _bg_data: dict = {"queue": None, "items": None, "blocked_deps": None,
+                      "has_pr_links": None, "lock_status": None,
                       "return_to_human": None}
     _bg_active: set = set()
     _bg_mutex = threading.Lock()
@@ -5804,6 +5862,9 @@ def _tui_main(stdscr, config: dict):
         if now - blocked_deps_fetch_time > CACHE_SECS_SLOW:
             _bg_fetch("blocked_deps", fetch_blocked_deps)
             blocked_deps_fetch_time = now
+        if now - has_pr_links_fetch_time > CACHE_SECS_SLOW:
+            _bg_fetch("has_pr_links", fetch_has_pr_links)
+            has_pr_links_fetch_time = now
         # Return-to-human signal: planner labels sentinel issue when no work remains.
         # Poll continuously so we observe both label re-applications (planner re-fires
         # after each empty-queue tick) and external clears (`gh issue edit --remove-label`).
@@ -5828,6 +5889,8 @@ def _tui_main(stdscr, config: dict):
                 cached_items = _bg_data["items"]
             if _bg_data["blocked_deps"] is not None:
                 cached_blocked_deps = _bg_data["blocked_deps"]
+            if _bg_data["has_pr_links"] is not None:
+                cached_has_pr_links = _bg_data["has_pr_links"]
             if _bg_data["lock_status"] is not None:
                 cached_lock_status = _bg_data["lock_status"]
             if _bg_data["return_to_human"] is not None:
@@ -6062,6 +6125,14 @@ def _tui_main(stdscr, config: dict):
                 if "blocked" in item.labels and item.number in cached_blocked_deps:
                     deps = cached_blocked_deps[item.number]
                     title = f"[Blocked on {', '.join(f'#{d}' for d in deps)}] {title}"
+                elif "has-pr" in item.labels and item.kind == "issue":
+                    if item.number in cached_has_pr_links:
+                        prs = cached_has_pr_links[item.number]
+                        if prs:
+                            tag = "PR " + ", ".join(f"#{p}" for p in prs)
+                        else:
+                            tag = "PR ?"
+                        title = f"[{tag}] {title}"
                 # Truncate title to fit
                 prefix_len = 31
                 max_title = width - prefix_len - 1
