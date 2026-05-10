@@ -1881,6 +1881,13 @@ def fetch_has_pr_links() -> dict[int, list[int]]:
     auto-closing it. The caller should still emit the entry so the
     TUI can flag the orphan; auto-cleanup happens in housekeeping
     via `coordination check-has-pr`.
+
+    Note on the two-step lookup: `gh issue view --json
+    closedByPullRequestsReferences` returns objects with
+    `id`/`number`/`repository`/`url` only — no `state` — so we have
+    to dereference each PR via `gh pr view --json state` to filter
+    out closed/merged ones. Has-pr issues are typically few (≤ 10),
+    so the N+1 cost is bounded.
     """
     cwd = str(PROJECT_DIR)
     try:
@@ -1901,17 +1908,28 @@ def fetch_has_pr_links() -> dict[int, list[int]]:
             r2 = subprocess.run(
                 ["gh", "issue", "view", str(num),
                  "--json", "closedByPullRequestsReferences",
-                 "--jq", "[.closedByPullRequestsReferences[] "
-                        "| select(.state == \"OPEN\") | .number]"],
+                 "--jq", "[.closedByPullRequestsReferences[].number]"],
                 capture_output=True, text=True, timeout=15, cwd=cwd,
             )
-            if r2.returncode == 0:
-                try:
-                    result[num] = json.loads(r2.stdout) or []
-                except json.JSONDecodeError:
-                    result[num] = []
-            else:
+            if r2.returncode != 0:
                 result[num] = []
+                continue
+            try:
+                refs = json.loads(r2.stdout) or []
+            except json.JSONDecodeError:
+                result[num] = []
+                continue
+
+            open_prs: list[int] = []
+            for pr_num in refs:
+                r3 = subprocess.run(
+                    ["gh", "pr", "view", str(pr_num),
+                     "--json", "state", "--jq", ".state"],
+                    capture_output=True, text=True, timeout=15, cwd=cwd,
+                )
+                if r3.returncode == 0 and r3.stdout.strip() == "OPEN":
+                    open_prs.append(pr_num)
+            result[num] = open_prs
         return result
     except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError):
         return {}

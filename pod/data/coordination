@@ -1112,26 +1112,42 @@ cmd_check_has_pr() {
         num="$(echo "$issue_json" | jq -r '.number')"
         title="$(echo "$issue_json" | jq -r '.title')"
 
-        local open_prs
-        open_prs="$(gh issue view "$num" --repo "$REPO" \
+        # `gh issue view --json closedByPullRequestsReferences` returns
+        # objects without a `state` field, so we have to dereference each
+        # linked PR via `gh pr view --json state` to filter out
+        # closed/merged ones. (A previous version filtered with
+        # `select(.state == "OPEN")` directly on the references and
+        # always returned empty, which would have removed `has-pr` from
+        # every legitimate issue on the next housekeeping cycle.)
+        local pr_nums
+        pr_nums="$(gh issue view "$num" --repo "$REPO" \
             --json closedByPullRequestsReferences \
-            --jq '[.closedByPullRequestsReferences[] | select(.state == "OPEN") | .number] | join(",")' \
+            --jq '.closedByPullRequestsReferences[].number' \
             2>/dev/null || true)"
 
-        if [[ -n "$open_prs" ]]; then
+        local has_open_pr=false
+        local pr_states=""
+        if [[ -n "$pr_nums" ]]; then
+            while read -r pr; do
+                [[ -z "$pr" ]] && continue
+                local pr_state
+                pr_state="$(gh pr view "$pr" --repo "$REPO" --json state --jq .state 2>/dev/null || echo UNKNOWN)"
+                local label
+                label="$(echo "$pr_state" | tr '[:upper:]' '[:lower:]')"
+                pr_states="${pr_states:+$pr_states, }#${pr} (${label})"
+                if [[ "$pr_state" == "OPEN" ]]; then
+                    has_open_pr=true
+                fi
+            done <<< "$pr_nums"
+        fi
+
+        if [[ "$has_open_pr" == true ]]; then
             continue
         fi
 
-        # No open linked PRs. Collect any closed/merged ones to attribute
-        # in the audit comment.
-        local prior_prs
-        prior_prs="$(gh issue view "$num" --repo "$REPO" \
-            --json closedByPullRequestsReferences \
-            --jq '[.closedByPullRequestsReferences[] | "#\(.number) (\(.state | ascii_downcase))"] | join(", ")' \
-            2>/dev/null || echo "")"
         local prior_msg=""
-        if [[ -n "$prior_prs" && "$prior_prs" != "" ]]; then
-            prior_msg=" Last linked PRs: ${prior_prs}."
+        if [[ -n "$pr_states" ]]; then
+            prior_msg=" Last linked PRs: ${pr_states}."
         fi
 
         gh issue edit "$num" --repo "$REPO" --remove-label has-pr
