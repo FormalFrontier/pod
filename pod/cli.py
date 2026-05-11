@@ -6294,11 +6294,26 @@ def _tui_main(stdscr, config: dict):
             MAX_INDENT = 6
             by_num_active = {it.number: it for it in active}
 
-            def _raw_parents(item):
-                if item.kind != "issue":
-                    return []
-                return (list(cached_blocked_deps.get(item.number, []))
-                        + list(cached_has_pr_links.get(item.number, [])))
+            # Precompute raw parents per issue, split by edge kind so the
+            # annotation can keep dependency-issue and closing-PR wording
+            # distinct ("Blocked on" vs "PR"). `raw_parents_of` is the
+            # concatenation in tree-pick priority order (blocked deps first,
+            # PR links second — pure heuristic).
+            raw_blocked_of: dict[int, list[int]] = {}
+            raw_pr_of: dict[int, list[int]] = {}
+            raw_parents_of: dict[int, list[int]] = {}
+            for it in active:
+                if it.kind != "issue":
+                    continue
+                bd = list(cached_blocked_deps.get(it.number, []))
+                pl = list(cached_has_pr_links.get(it.number, []))
+                if bd:
+                    raw_blocked_of[it.number] = bd
+                if pl:
+                    raw_pr_of[it.number] = pl
+                combined = bd + pl
+                if combined:
+                    raw_parents_of[it.number] = combined
 
             parent_of: dict[int, int | None] = {}
 
@@ -6314,7 +6329,7 @@ def _tui_main(stdscr, config: dict):
 
             for it in active:
                 chosen: int | None = None
-                for p in _raw_parents(it):
+                for p in raw_parents_of.get(it.number, ()):
                     if (p in by_num_active and p != it.number
                             and not _would_cycle(it.number, p)):
                         chosen = p
@@ -6343,18 +6358,30 @@ def _tui_main(stdscr, config: dict):
             def _annotation(item) -> str:
                 if item.kind != "issue":
                     return ""
-                raw = _raw_parents(item)
                 chosen_p = parent_of.get(item.number)
+                raw_b = raw_blocked_of.get(item.number, [])
+                raw_p = raw_pr_of.get(item.number, [])
                 parts: list[str] = []
-                if raw:
-                    if chosen_p is None:
+                if chosen_p is None:
+                    # Root row: show everything it's waiting on, split by kind.
+                    if raw_b:
                         parts.append("Blocked on "
-                                     + ", ".join(f"#{n}" for n in raw))
-                    else:
-                        others = [n for n in raw if n != chosen_p]
-                        if others:
-                            parts.append("Also blocked on "
-                                         + ", ".join(f"#{n}" for n in others))
+                                     + ", ".join(f"#{n}" for n in raw_b))
+                    if raw_p:
+                        parts.append("PR "
+                                     + ", ".join(f"#{n}" for n in raw_p))
+                else:
+                    # Nested: list off-tree parents, preserving issue-vs-PR
+                    # wording so an unchosen closing PR doesn't masquerade
+                    # as a blocked-dep number.
+                    other_b = [n for n in raw_b if n != chosen_p]
+                    other_p = [n for n in raw_p if n != chosen_p]
+                    if other_b:
+                        parts.append("Also blocked on "
+                                     + ", ".join(f"#{n}" for n in other_b))
+                    if other_p:
+                        parts.append("PR "
+                                     + ", ".join(f"#{n}" for n in other_p))
                 # Orphan `has-pr` label (every named PR has merged/closed).
                 if ("has-pr" in item.labels
                         and cached_has_pr_links.get(item.number) == []):
