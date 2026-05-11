@@ -6284,13 +6284,117 @@ def _tui_main(stdscr, config: dict):
             active = [it for it in cached_items if it.state not in ("closed", "merged")]
             inactive = [it for it in cached_items if it.state in ("closed", "merged")]
             slots_for_inactive = max(0, max_item_rows - len(active))
-            # inactive is already sorted newest-first; take from the front
-            selected = active + inactive[:slots_for_inactive]
-            # Restore original sort order across the combined set
-            selected_nums = {id(it) for it in selected}
-            items_to_show = [it for it in cached_items if id(it) in selected_nums]
-            displayed_items = items_to_show
-            items_shown = len(items_to_show)
+            inactive_tail = inactive[:slots_for_inactive]
+
+            # Build a tree over the active set under the rule "a parent is a
+            # blocker": things indent under whatever they are waiting on, so
+            # an issue with open `depends-on:` deps indents under those deps,
+            # and a `has-pr` issue indents under its open closing PR. Cycles
+            # are broken arbitrarily but deterministically (first-input wins).
+            MAX_INDENT = 6
+            by_num_active = {it.number: it for it in active}
+
+            # Precompute raw parents per issue, split by edge kind so the
+            # annotation can keep dependency-issue and closing-PR wording
+            # distinct ("Blocked on" vs "PR"). `raw_parents_of` is the
+            # concatenation in tree-pick priority order (blocked deps first,
+            # PR links second — pure heuristic).
+            raw_blocked_of: dict[int, list[int]] = {}
+            raw_pr_of: dict[int, list[int]] = {}
+            raw_parents_of: dict[int, list[int]] = {}
+            for it in active:
+                if it.kind != "issue":
+                    continue
+                bd = list(cached_blocked_deps.get(it.number, []))
+                pl = list(cached_has_pr_links.get(it.number, []))
+                if bd:
+                    raw_blocked_of[it.number] = bd
+                if pl:
+                    raw_pr_of[it.number] = pl
+                combined = bd + pl
+                if combined:
+                    raw_parents_of[it.number] = combined
+
+            parent_of: dict[int, int | None] = {}
+
+            def _would_cycle(child_num: int, candidate: int) -> bool:
+                cur: int | None = candidate
+                seen: set[int] = set()
+                while cur is not None and cur not in seen:
+                    if cur == child_num:
+                        return True
+                    seen.add(cur)
+                    cur = parent_of.get(cur)
+                return False
+
+            for it in active:
+                chosen: int | None = None
+                for p in raw_parents_of.get(it.number, ()):
+                    if (p in by_num_active and p != it.number
+                            and not _would_cycle(it.number, p)):
+                        chosen = p
+                        break
+                parent_of[it.number] = chosen
+
+            children_of: dict[int, list] = {it.number: [] for it in active}
+            roots: list = []
+            for it in active:
+                p = parent_of[it.number]
+                if p is None:
+                    roots.append(it)
+                else:
+                    children_of[p].append(it)
+
+            active_rows: list[tuple] = []  # (item, depth)
+
+            def _dfs(node, depth: int):
+                active_rows.append((node, depth))
+                for ch in children_of[node.number]:
+                    _dfs(ch, depth + 1)
+
+            for r in roots:
+                _dfs(r, 0)
+
+            def _annotation(item) -> str:
+                if item.kind != "issue":
+                    return ""
+                chosen_p = parent_of.get(item.number)
+                raw_b = raw_blocked_of.get(item.number, [])
+                raw_p = raw_pr_of.get(item.number, [])
+                parts: list[str] = []
+                if chosen_p is None:
+                    # Root row: show everything it's waiting on, split by kind.
+                    if raw_b:
+                        parts.append("Blocked on "
+                                     + ", ".join(f"#{n}" for n in raw_b))
+                    if raw_p:
+                        parts.append("PR "
+                                     + ", ".join(f"#{n}" for n in raw_p))
+                else:
+                    # Nested: list off-tree parents, preserving issue-vs-PR
+                    # wording so an unchosen closing PR doesn't masquerade
+                    # as a blocked-dep number.
+                    other_b = [n for n in raw_b if n != chosen_p]
+                    other_p = [n for n in raw_p if n != chosen_p]
+                    if other_b:
+                        parts.append("Also blocked on "
+                                     + ", ".join(f"#{n}" for n in other_b))
+                    if other_p:
+                        parts.append("PR "
+                                     + ", ".join(f"#{n}" for n in other_p))
+                # Orphan `has-pr` label (every named PR has merged/closed).
+                if ("has-pr" in item.labels
+                        and cached_has_pr_links.get(item.number) == []):
+                    parts.append("PR ?")
+                return "".join(f"[{p}] " for p in parts)
+
+            render_rows: list[tuple] = []  # (item, depth, annotation)
+            for it, d in active_rows:
+                render_rows.append((it, d, _annotation(it)))
+            for it in inactive_tail:
+                render_rows.append((it, 0, ""))
+
+            items_shown = len(render_rows)
 
             items_start_row = agents_end + 1  # skip 1 blank line
             _addstr(stdscr, items_start_row, 0, "─" * min(width, 80), curses.color_pair(4))
@@ -6298,7 +6402,7 @@ def _tui_main(stdscr, config: dict):
             item_hdr = " " + item_fmt.format("#", "State", "When", "Title")
             _addstr(stdscr, items_start_row + 1, 0, item_hdr[:width], curses.A_DIM)
 
-            for j, item in enumerate(items_to_show):
+            for j, (item, depth, annotation) in enumerate(render_rows):
                 irow = items_start_row + 2 + j
                 if irow >= height - footer_fixed:
                     items_shown = j
@@ -6332,18 +6436,8 @@ def _tui_main(stdscr, config: dict):
                 kind_prefix = "PR" if item.kind == "pr" else "I"
                 state_display = f"{kind_prefix} {state_str}"
 
-                title = item.title
-                if "blocked" in item.labels and item.number in cached_blocked_deps:
-                    deps = cached_blocked_deps[item.number]
-                    title = f"[Blocked on {', '.join(f'#{d}' for d in deps)}] {title}"
-                elif "has-pr" in item.labels and item.kind == "issue":
-                    if item.number in cached_has_pr_links:
-                        prs = cached_has_pr_links[item.number]
-                        if prs:
-                            tag = "PR " + ", ".join(f"#{p}" for p in prs)
-                        else:
-                            tag = "PR ?"
-                        title = f"[{tag}] {title}"
+                indent = " " * (2 * min(depth, MAX_INDENT))
+                title = indent + annotation + item.title
                 # Truncate title to fit
                 prefix_len = 31
                 max_title = width - prefix_len - 1
@@ -6360,6 +6454,10 @@ def _tui_main(stdscr, config: dict):
                     attr = curses.color_pair(5) | curses.A_BOLD
 
                 _addstr(stdscr, irow, 0, line[:width], attr)
+
+            # Sync displayed_items to actually-rendered rows so selection
+            # navigation (and `o`/open) indexes match what is on screen.
+            displayed_items = [it for (it, _, _) in render_rows[:items_shown]]
 
         # --- Clamp items selection (now that items_shown is known) ---
         if selected_section == "items":
