@@ -1530,8 +1530,10 @@ def cmd_check_blocked(ctx: CoordinationContext, argv: list[str]) -> int:
                 "issue", "view", str(d), "--repo", ctx.repo,
                 "--json", "state", "--jq", ".state", timeout=15,
             )
+            # PRs share the issue number space; `gh issue view` on a merged
+            # PR returns "MERGED", not "CLOSED". Both count as terminal.
             state = sr.stdout.strip() if sr.returncode == 0 else "UNKNOWN"
-            if state != "CLOSED":
+            if state not in ("CLOSED", "MERGED"):
                 all_closed = False
                 break
         if all_closed:

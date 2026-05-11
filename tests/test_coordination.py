@@ -676,6 +676,53 @@ class CheckBlockedTests(unittest.TestCase):
         self.assertIn("Unblocked issue #10", buf.getvalue())
         self.assertIn("--remove-label", edits[0])
 
+    def test_unblocks_when_dep_is_merged_pr(self):
+        # PRs share the issue number space; `gh issue view` on a merged PR
+        # returns "MERGED" not "CLOSED". The label must still be cleared.
+        edits = []
+
+        def handler(*argv):
+            if argv[:2] == ("issue", "list"):
+                return _gh_result(stdout=json.dumps([{
+                    "number": 10,
+                    "body": "depends-on: #5",
+                }]))
+            if argv[:2] == ("issue", "view") and "state" in argv:
+                return _gh_result(stdout="MERGED")
+            if argv[:2] == ("issue", "edit"):
+                edits.append(argv)
+                return _gh_result()
+            return _gh_result()
+
+        with _capture_stdout() as buf, patch_client(gh_cli_handler=handler):
+            rc = coordination.cmd_check_blocked(_make_ctx(), [])
+        self.assertEqual(rc, 0)
+        self.assertIn("Unblocked issue #10", buf.getvalue())
+        self.assertIn("--remove-label", edits[0])
+
+    def test_keeps_blocked_when_dep_state_unknown(self):
+        # A failed `gh issue view` (UNKNOWN state) must not strip the label —
+        # transient gh errors shouldn't silently unblock.
+        edits = []
+
+        def handler(*argv):
+            if argv[:2] == ("issue", "list"):
+                return _gh_result(stdout=json.dumps([{
+                    "number": 10,
+                    "body": "depends-on: #5",
+                }]))
+            if argv[:2] == ("issue", "view") and "state" in argv:
+                return _gh_result(returncode=1, stdout="")
+            if argv[:2] == ("issue", "edit"):
+                edits.append(argv)
+                return _gh_result()
+            return _gh_result()
+
+        with _capture_stdout(), patch_client(gh_cli_handler=handler):
+            rc = coordination.cmd_check_blocked(_make_ctx(), [])
+        self.assertEqual(rc, 0)
+        self.assertEqual(edits, [])
+
     def test_keeps_blocked_when_dep_still_open(self):
         edits = []
 
