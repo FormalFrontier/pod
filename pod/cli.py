@@ -2819,6 +2819,135 @@ def _security_fail(slug: str, msg: str, *, auth_hint: bool = False) -> None:
     sys.exit(1)
 
 
+def _fetch_repo_security_meta(slug: str) -> tuple[dict | None, int | None]:
+    """Fetch visibility + interaction-limit metadata for `slug`.
+
+    Tries GraphQL first (one round-trip, the B3 burner shape), then falls
+    back to REST (two calls: `GET /repos/{slug}` and `GET
+    /repos/{slug}/interaction-limits`) when GraphQL is unusable. The two
+    REST buckets are independent of the GraphQL bucket on GitHub, so this
+    fallback is the difference between "pod refuses to start" and "pod
+    starts" when GraphQL is rate-limited.
+
+    Returns `(meta, last_status)`:
+      meta — dict `{"visibility": str, "ability": dict | None}` on success,
+             or `None` if both transports failed.
+             `ability` is `None` when no interaction limit is set, else
+             `{"limit": str (lowercased), "expiresAt": str | None}`.
+      last_status — the HTTP status of the last failing transport, used
+             by the caller to print an auth hint on 401/403. `None` when
+             the failure was non-HTTP (exception, empty body).
+
+    Raises `FileNotFoundError` if `gh` is missing — caller handles.
+    """
+    owner, _, name = slug.partition("/")
+    client = gh.get_client()
+    last_status: int | None = None
+
+    def _normalize_gql(body: dict) -> dict | None:
+        repo_node = ((body.get("data") or {}).get("repository") or {})
+        visibility = (repo_node.get("visibility") or "").lower()
+        if not visibility:
+            return None
+        ability_raw = repo_node.get("interactionAbility") or None
+        if ability_raw:
+            have_raw = ability_raw.get("limit") or ""
+            ability = {
+                "limit": have_raw.lower() if isinstance(have_raw, str) else "",
+                "expiresAt": ability_raw.get("expiresAt"),
+            }
+        else:
+            ability = None
+        return {"visibility": visibility, "ability": ability}
+
+    # Smart routing: GraphQL is one round-trip vs REST's two, so we prefer
+    # it normally. But if its bucket is near-empty while REST has budget,
+    # skip straight to REST — a guaranteed-to-fail GraphQL call burns the
+    # bucket further and delays the inevitable fallback.
+    skip_graphql = False
+    try:
+        rates = client.rate()
+        g = rates.get("graphql")
+        c = rates.get("core")
+        if (g is not None and g.limit and g.remaining < 100
+                and c is not None and c.limit and c.remaining > 200):
+            skip_graphql = True
+    except Exception:
+        pass
+
+    # --- GraphQL attempt ---
+    if not skip_graphql:
+        try:
+            resp = client.graphql(
+                "query($owner: String!, $name: String!) {"
+                "  repository(owner: $owner, name: $name) {"
+                "    visibility"
+                "    interactionAbility { limit expiresAt origin }"
+                "  }"
+                "}",
+                variables={"owner": owner, "name": name},
+            )
+        except FileNotFoundError:
+            raise
+        except Exception:
+            resp = None
+        if resp is not None:
+            if resp.ok():
+                meta = _normalize_gql(resp.body() or {})
+                if meta is not None:
+                    return (meta, None)
+                # Status 200 but empty data (GraphQL `errors` block,
+                # typically RATE_LIMITED) — fall through to REST.
+            else:
+                last_status = resp.status
+
+    # --- REST fallback (independent rate-limit bucket) ---
+    try:
+        repo_resp = client.get(f"/repos/{slug}")
+    except FileNotFoundError:
+        raise
+    except Exception:
+        return (None, last_status)
+    if not repo_resp.ok():
+        return (None, repo_resp.status)
+    repo_body = repo_resp.body() or {}
+    visibility = (repo_body.get("visibility") or "").lower()
+    if not visibility:
+        # Older REST shape lacks `visibility`; derive from the `private`
+        # boolean, which has always been present.
+        priv = repo_body.get("private")
+        if priv is True:
+            visibility = "private"
+        elif priv is False:
+            visibility = "public"
+        else:
+            return (None, repo_resp.status)
+    if visibility != "public":
+        return ({"visibility": visibility, "ability": None}, None)
+
+    try:
+        lim_resp = client.get(f"/repos/{slug}/interaction-limits")
+    except FileNotFoundError:
+        raise
+    except Exception:
+        return (None, None)
+    # The endpoint returns 204 No Content, or 200 with an empty / no-limit
+    # body, when no limit is set.
+    if lim_resp.status == 204:
+        return ({"visibility": visibility, "ability": None}, None)
+    if not lim_resp.ok():
+        return (None, lim_resp.status)
+    lim_body = lim_resp.body() or {}
+    have_raw = lim_body.get("limit") if isinstance(lim_body, dict) else ""
+    if not have_raw:
+        return ({"visibility": visibility, "ability": None}, None)
+    ability = {
+        "limit": have_raw.lower() if isinstance(have_raw, str) else "",
+        "expiresAt": lim_body.get("expires_at"),
+    }
+    return ({"visibility": visibility, "ability": ability}, None)
+
+
 def check_repo_security(config: dict) -> None:
     """Refuse to dispatch agents if the repo's GitHub interaction limits are
     missing, too lax, or expiring soon.
@@ -2850,71 +2979,49 @@ def check_repo_security(config: dict) -> None:
     minimum = sec.get("minimum_interaction_limit", "collaborators_only")
     min_days = sec.get("minimum_expiry_days", 7)
 
-    # REST (`gh api repos/{slug}`) instead of `gh repo view --json` so the
-    # security gate doesn't fail closed when the GraphQL bucket is exhausted.
-    # The slug comes from the local git remote (`_get_repo()`), which is also
-    # API-free.
     slug = _get_repo()
 
-    # Disk cache: skip the REST roundtrip if a successful check for this
+    # Disk cache: skip the API round-trip if a successful check for this
     # repo is on file and still satisfies the current policy. Bounded by
     # _SECURITY_DISK_TTL_SECONDS so transitions are caught.
     if _load_security_cache(slug, minimum, min_days):
         _security_last_ok = now
         return
 
-    # B3 burner rewrite: a single GraphQL query returns visibility +
-    # interactionAbility in one round-trip instead of two REST calls.
-    owner, _, name = slug.partition("/")
     try:
-        resp = gh.get_client().graphql(
-            "query($owner: String!, $name: String!) {"
-            "  repository(owner: $owner, name: $name) {"
-            "    visibility"
-            "    interactionAbility { limit expiresAt origin }"
-            "  }"
-            "}",
-            variables={"owner": owner, "name": name},
-        )
+        meta, last_status = _fetch_repo_security_meta(slug)
     except FileNotFoundError:
         print("pod: security: `gh` CLI not found; cannot verify interaction limits.",
               file=sys.stderr)
         sys.exit(1)
-    except Exception as e:
-        print(f"pod: security: failed to query repo: {e}", file=sys.stderr)
-        sys.exit(1)
-    if not resp.ok():
-        err = f"HTTP {resp.status}"
-        print(f"pod: security: cannot determine repo visibility: {err}",
-              file=sys.stderr)
-        if resp.status in (401, 403):
-            print("    → run `gh auth status` / `gh auth login` and retry.",
+    if meta is None:
+        if last_status is not None:
+            print(f"pod: security: cannot determine repo visibility: HTTP {last_status}",
                   file=sys.stderr)
-        sys.exit(1)
-    body = resp.body() or {}
-    repo_node = ((body.get("data") or {}).get("repository") or {})
-    visibility = (repo_node.get("visibility") or "").lower()
-    if not visibility:
-        print("pod: security: cannot determine repo visibility: empty response",
-              file=sys.stderr)
+            if last_status in (401, 403):
+                print("    → run `gh auth status` / `gh auth login` and retry.",
+                      file=sys.stderr)
+        else:
+            print("pod: security: cannot determine repo visibility: "
+                  "GraphQL and REST both unavailable", file=sys.stderr)
+            print("    → run `gh api rate_limit` to inspect; "
+                  "if both buckets are dry, wait for reset.", file=sys.stderr)
         sys.exit(1)
 
+    visibility = meta["visibility"]
     if visibility != "public":
         _save_security_cache(slug, visibility=visibility)
         _security_last_ok = now
         return
 
-    ability = repo_node.get("interactionAbility") or None
+    ability = meta["ability"]
     if not ability:
         _security_fail(slug,
             "no interaction limit set on this public repo. "
             "Random GitHub users can post issues/comments whose contents "
             "feed into pod agent prompts.")
 
-    # GraphQL `InteractionAbility` enum: COLLABORATORS_ONLY / etc.
-    # Convert to lowercase REST shape for ranking against config.
-    have_raw = ability.get("limit") or ""
-    have = have_raw.lower() if isinstance(have_raw, str) else ""
+    have = ability.get("limit") or ""
     if _INTERACTION_LIMIT_RANK.get(have, 0) < _INTERACTION_LIMIT_RANK.get(minimum, 0):
         _security_fail(slug,
             f"interaction limit is `{have or 'unknown'}`, "
