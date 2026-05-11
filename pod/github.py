@@ -27,6 +27,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import threading
 import time
 import urllib.parse
@@ -397,6 +398,10 @@ class GitHubClient:
         self._last_call_at: float = 0.0
         self._rate_cap_hz = rate_cap_hz
         self._backpressure_threshold = backpressure_threshold
+        # Per-reset-window dedupe for the low-water quota warning emitted
+        # by `_record_rate`. Keyed by bucket → the reset_at of the window
+        # for which a warning has already been printed.
+        self._quota_warn_state: dict[str, float] = {}
 
         self._client = httpx.Client(
             base_url=f"https://api.{host}",
@@ -452,7 +457,32 @@ class GitHubClient:
                             observed_at=time.time())
         with self._lock:
             self._rate[resource] = snap
+        self._maybe_warn_quota_low(snap)
         return snap
+
+    # When a bucket falls below this many remaining calls and the reset is
+    # still far enough away that backpressure can't paper over it, emit a
+    # one-shot stderr warning so the user knows quota is being burned and
+    # can investigate via `pod gh-stats`. Tuned slightly above the
+    # backpressure threshold so the warning fires before the layer starts
+    # sleeping.
+    _QUOTA_LOW_THRESHOLD = 100
+
+    def _maybe_warn_quota_low(self, snap: RateSnapshot) -> None:
+        if not snap.limit or snap.remaining >= self._QUOTA_LOW_THRESHOLD:
+            return
+        with self._lock:
+            last = self._quota_warn_state.get(snap.bucket, 0.0)
+            if last == snap.reset_at:
+                return
+            self._quota_warn_state[snap.bucket] = snap.reset_at
+        reset_iso = _iso_at(snap.reset_at) or "unknown"
+        secs_to_reset = max(0, int(snap.reset_at - time.time()))
+        sys.stderr.write(
+            f"pod: gh-quota: {snap.bucket} bucket low: "
+            f"{snap.remaining}/{snap.limit} remaining, "
+            f"resets at {reset_iso} (~{secs_to_reset}s); "
+            f"run `pod gh-stats` to see which callers are burning quota.\n")
 
     def _backpressure(self, bucket: str) -> None:
         """Sleep before the next call if the bucket is near exhaustion or

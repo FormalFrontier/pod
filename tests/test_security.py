@@ -216,7 +216,8 @@ class SecurityCheckTests(unittest.TestCase):
                 cli.check_repo_security({})
 
     def test_gh_api_network_error_fails_closed(self):
-        # GraphQL 5xx → fail-closed exit 1.
+        # GraphQL 5xx → REST fallback (no routes set → 404 default) →
+        # fail-closed exit 1.
         with patch_client(routes={
             ("POST", "/graphql"): fake_response(
                 500, body={"message": "server error"}),
@@ -224,6 +225,106 @@ class SecurityCheckTests(unittest.TestCase):
                               return_value=_git_remote_mock("o/r")):
             with self.assertRaises(SystemExit):
                 cli.check_repo_security({})
+
+    def test_rest_fallback_when_graphql_rate_limited(self):
+        # GraphQL returns 200 with a RATE_LIMITED error block and no
+        # `data` — the empty-data path that previously failed-closed.
+        # With the fallback, pod fetches `/repos/{slug}` and
+        # `/repos/{slug}/interaction-limits` via REST and succeeds.
+        rest_repo = {"visibility": "public", "private": False}
+        rest_limit = {"limit": "collaborators_only",
+                      "origin": "repository",
+                      "expires_at": _iso(180)}
+        with patch_client(routes={
+            ("POST", "/graphql"): fake_response(200, body={
+                "errors": [{"type": "RATE_LIMITED",
+                            "message": "API rate limit exceeded"}],
+                "data": None,
+            }),
+            ("GET", "/repos/owner/repo"): fake_response(200, body=rest_repo),
+            ("GET", "/repos/owner/repo/interaction-limits"):
+                fake_response(200, body=rest_limit),
+        }), mock.patch.object(cli.subprocess, "run",
+                              return_value=_git_remote_mock("owner/repo")):
+            cli.check_repo_security({})  # no exit
+
+    def test_rest_fallback_when_graphql_5xx(self):
+        # GraphQL returns 5xx → REST fallback path serves valid data.
+        rest_repo = {"visibility": "public", "private": False}
+        rest_limit = {"limit": "collaborators_only",
+                      "origin": "repository",
+                      "expires_at": _iso(180)}
+        with patch_client(routes={
+            ("POST", "/graphql"): fake_response(
+                502, body={"message": "bad gateway"}),
+            ("GET", "/repos/owner/repo"): fake_response(200, body=rest_repo),
+            ("GET", "/repos/owner/repo/interaction-limits"):
+                fake_response(200, body=rest_limit),
+        }), mock.patch.object(cli.subprocess, "run",
+                              return_value=_git_remote_mock("owner/repo")):
+            cli.check_repo_security({})  # no exit
+
+    def test_rest_fallback_visibility_via_private_flag(self):
+        # Older REST shape: no `visibility` field, only `private` boolean.
+        # Private repos skip the interaction-limits requirement.
+        rest_repo = {"private": True}  # no `visibility` key
+        with patch_client(routes={
+            ("POST", "/graphql"): fake_response(200, body={
+                "errors": [{"type": "RATE_LIMITED"}], "data": None,
+            }),
+            ("GET", "/repos/owner/repo"): fake_response(200, body=rest_repo),
+        }), mock.patch.object(cli.subprocess, "run",
+                              return_value=_git_remote_mock("owner/repo")):
+            cli.check_repo_security({})  # no exit
+
+    def test_rest_fallback_no_limit_set(self):
+        # Public repo, REST interaction-limits returns 204 (no limit set).
+        rest_repo = {"private": False, "visibility": "public"}
+        with patch_client(routes={
+            ("POST", "/graphql"): fake_response(200, body={
+                "errors": [{"type": "RATE_LIMITED"}], "data": None,
+            }),
+            ("GET", "/repos/owner/repo"): fake_response(200, body=rest_repo),
+            ("GET", "/repos/owner/repo/interaction-limits"):
+                fake_response(204, body=None),
+        }), mock.patch.object(cli.subprocess, "run",
+                              return_value=_git_remote_mock("owner/repo")):
+            with self.assertRaises(SystemExit):
+                cli.check_repo_security({})
+
+    def test_smart_routing_skips_graphql_when_bucket_dry(self):
+        # When `client.rate()` reports graphql near-empty and core
+        # healthy, the helper goes straight to REST and never POSTs to
+        # /graphql. This avoids burning the bucket further on a call
+        # that would fail anyway.
+        from pod.github import RateSnapshot
+
+        rest_repo = {"private": False, "visibility": "public"}
+        rest_limit = {"limit": "collaborators_only",
+                      "origin": "repository",
+                      "expires_at": _iso(180)}
+        routes = {
+            ("GET", "/repos/owner/repo"): fake_response(200, body=rest_repo),
+            ("GET", "/repos/owner/repo/interaction-limits"):
+                fake_response(200, body=rest_limit),
+        }
+        with patch_client(routes=routes) as client, \
+                mock.patch.object(cli.subprocess, "run",
+                                   return_value=_git_remote_mock("owner/repo")):
+            # Override the fake client's `rate()` for this test only.
+            client.rate = lambda: {
+                "core": RateSnapshot(bucket="core", limit=5000,
+                                     remaining=4999),
+                "graphql": RateSnapshot(bucket="graphql", limit=5000,
+                                        remaining=10),  # near-dry
+            }
+            cli.check_repo_security({})
+            # No POST /graphql call should have been issued.
+            self.assertFalse(
+                any(c["method"] == "POST" and c["path"] == "/graphql"
+                    for c in client.calls),
+                f"smart routing failed; calls={client.calls}",
+            )
 
 
 class SecurityCacheTests(unittest.TestCase):
