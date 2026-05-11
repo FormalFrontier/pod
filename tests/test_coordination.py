@@ -731,6 +731,108 @@ class CreatePrProtectedFilesTests(unittest.TestCase):
 # Dispatch / main
 # ---------------------------------------------------------------------------
 
+class ReleaseOrphanClaimsTests(unittest.TestCase):
+    """Liveness-based orphan-claim sweep — releases claims whose owning
+    session UUID is no longer in `.pod/agents/`, regardless of age."""
+
+    def _ctx_with_agents(self, tmp: Path, live_uuids: list[str]) -> coordination.CoordinationContext:
+        (tmp / ".pod" / "agents").mkdir(parents=True)
+        for i, u in enumerate(live_uuids):
+            (tmp / ".pod" / "agents" / f"agent{i}.json").write_text(json.dumps({
+                "short_id": f"abcd{i}",
+                "uuid": u,
+                "status": "running",
+                "pid": os.getpid(),
+            }))
+        ctx = _make_ctx()
+        ctx.git_toplevel = str(tmp)
+        return ctx
+
+    def test_releases_when_owner_not_in_local_agents(self):
+        with tempfile.TemporaryDirectory() as td:
+            ctx = self._ctx_with_agents(Path(td), live_uuids=["live-uuid"])
+            calls = []
+            def fake_run(*argv, **kw):
+                calls.append(argv)
+                if argv[:2] == ("issue", "list"):
+                    return _gh_result(stdout=json.dumps([
+                        {"number": 42, "title": "orphan"},
+                    ]))
+                if argv[:2] == ("issue", "view"):
+                    return _gh_result(stdout=json.dumps(
+                        "Claimed by session `dead-uuid` on branch `agent/x`"))
+                return _gh_result()
+            with patch_client(gh_cli_handler=fake_run), _capture_stdout() as out:
+                rc = coordination.cmd_release_orphan_claims(ctx, [])
+            self.assertEqual(rc, 0)
+            # Saw label-remove + comment for the orphan.
+            verbs = [(c[0], c[1], c[2]) for c in calls
+                     if len(c) >= 3 and c[0] == "issue"]
+            self.assertIn(("issue", "edit", "42"), verbs)
+            self.assertIn(("issue", "comment", "42"), verbs)
+            self.assertIn("orphan", out.getvalue().lower())
+
+    def test_skips_when_owner_still_in_local_agents(self):
+        with tempfile.TemporaryDirectory() as td:
+            ctx = self._ctx_with_agents(Path(td), live_uuids=["live-uuid"])
+            calls = []
+            def fake_run(*argv, **kw):
+                calls.append(argv)
+                if argv[:2] == ("issue", "list"):
+                    return _gh_result(stdout=json.dumps([
+                        {"number": 42, "title": "still-claimed"},
+                    ]))
+                if argv[:2] == ("issue", "view"):
+                    return _gh_result(stdout=json.dumps(
+                        "Claimed by session `live-uuid` on branch `agent/x`"))
+                return _gh_result()
+            with patch_client(gh_cli_handler=fake_run), _capture_stdout():
+                rc = coordination.cmd_release_orphan_claims(ctx, [])
+            self.assertEqual(rc, 0)
+            verbs = [(c[0], c[1], c[2]) for c in calls
+                     if len(c) >= 3 and c[0] == "issue"]
+            self.assertNotIn(("issue", "edit", "42"), verbs)
+            self.assertNotIn(("issue", "comment", "42"), verbs)
+
+    def test_skips_dead_status_agents(self):
+        # Agents marked dead/stopped/killed are not considered live owners.
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / ".pod" / "agents").mkdir(parents=True)
+            (Path(td) / ".pod" / "agents" / "a.json").write_text(json.dumps({
+                "short_id": "abcd0", "uuid": "ghost-uuid",
+                "status": "dead", "pid": 0,
+            }))
+            ctx = _make_ctx()
+            ctx.git_toplevel = td
+            calls = []
+            def fake_run(*argv, **kw):
+                calls.append(argv)
+                if argv[:2] == ("issue", "list"):
+                    return _gh_result(stdout=json.dumps([
+                        {"number": 7, "title": "orphan"},
+                    ]))
+                if argv[:2] == ("issue", "view"):
+                    return _gh_result(stdout=json.dumps(
+                        "Claimed by session `ghost-uuid` on branch `agent/x`"))
+                return _gh_result()
+            with patch_client(gh_cli_handler=fake_run), _capture_stdout():
+                rc = coordination.cmd_release_orphan_claims(ctx, [])
+            self.assertEqual(rc, 0)
+            verbs = [(c[0], c[1], c[2]) for c in calls
+                     if len(c) >= 3 and c[0] == "issue"]
+            self.assertIn(("issue", "edit", "7"), verbs)
+
+    def test_refuses_without_agents_directory(self):
+        # No `.pod/agents/` → can't make a liveness decision → exit 1.
+        with tempfile.TemporaryDirectory() as td:
+            ctx = _make_ctx()
+            ctx.git_toplevel = td
+            with patch_client():
+                with contextlib.redirect_stderr(io.StringIO()):
+                    rc = coordination.cmd_release_orphan_claims(ctx, [])
+            self.assertEqual(rc, 1)
+
+
 class DispatchTests(unittest.TestCase):
     def test_unknown_command_dies(self):
         with mock.patch.object(coordination, "_ensure_auth"):

@@ -30,6 +30,7 @@ The `gh` CLI defaults to the current repo, so `--repo` is not needed.
 | `coordination check-blocked` | Unblock issues whose `depends-on` dependencies are all closed; remove orphan `blocked` from issues whose body has no `depends-on:` lines |
 | `coordination check-has-pr` | Remove orphan `has-pr` from open issues that have no currently-open PR closing them (post audit comment) |
 | `coordination release-stale-claims [SECS]` | Release claimed issues with no PR after SECS seconds (default 4h); **manual use only** |
+| `coordination release-orphan-claims` | Release claims whose owning session UUID is no longer in `.pod/agents/` (liveness-based, no age threshold); **manual use only** |
 | `coordination lock-planner` | Acquire advisory planner lock (20min TTL) |
 | `coordination unlock-planner` | Release planner lock early |
 | `coordination critical-path-depth [L]` | Count unclaimed critical-path issues; optional label filter |

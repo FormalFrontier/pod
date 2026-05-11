@@ -1644,6 +1644,120 @@ def cmd_release_stale_claims(ctx: CoordinationContext,
 
 
 # ---------------------------------------------------------------------------
+# Subcommand: release-orphan-claims
+# ---------------------------------------------------------------------------
+
+def _live_session_uuids(ctx: CoordinationContext) -> set[str] | None:
+    """Read live agent session UUIDs from `<repo>/.pod/agents/*.json`.
+
+    Returns the set, or `None` if the agents directory is unreadable / not
+    found — callers treat `None` as "can't make a liveness decision" and
+    fall back to age-based heuristics.
+    """
+    import json as _json
+    pod_dir = Path(ctx.git_toplevel) / ".pod" / "agents"
+    if not pod_dir.is_dir():
+        return None
+    live: set[str] = set()
+    try:
+        for p in pod_dir.glob("*.json"):
+            if p.name.endswith(".tmp"):
+                continue
+            try:
+                d = _json.loads(p.read_text())
+            except (OSError, _json.JSONDecodeError):
+                continue
+            if d.get("status") in ("dead", "stopped", "killed"):
+                continue
+            uid = d.get("uuid")
+            if isinstance(uid, str) and uid:
+                live.add(uid)
+    except OSError:
+        return None
+    return live
+
+
+def cmd_release_orphan_claims(ctx: CoordinationContext,
+                                argv: list[str]) -> int:
+    """Liveness-based orphan-claim sweep: release any `claimed` issue whose
+    owning session UUID is not present in `.pod/agents/*.json`.
+
+    Complements `release-stale-claims` (age-based) and the housekeeping
+    `reconcile_untracked_github_claims` loop (10-min cadence, 60s grace).
+    Runs on demand, no grace period, no GitHub-time math — local agent
+    state is authoritative for whether a session is still running.
+
+    Exits non-zero if the local agents directory cannot be read, so the
+    caller doesn't mistake an "infrastructure problem" for "no orphans".
+    Otherwise prints one line per released claim and returns 0.
+    """
+    live = _live_session_uuids(ctx)
+    if live is None:
+        sys.stderr.write(
+            "release-orphan-claims: cannot read .pod/agents/ — "
+            "refusing to release without liveness data\n")
+        return 1
+
+    client = gh.get_client()
+    r = client.gh_cli(
+        "issue", "list", "--repo", ctx.repo, "--label", "claimed",
+        "--state", "open", "--limit", "100", "--json", "number,title",
+        timeout=30,
+    )
+    if r.returncode != 0:
+        sys.stderr.write(f"release-orphan-claims: gh issue list failed: "
+                         f"{r.stderr.strip()}\n")
+        return 1
+    issues = _safe_json(r.stdout, default=[]) or []
+
+    claim_re = re.compile(r'Claimed by session `([^`]+)`')
+    released = 0
+    for it in issues:
+        num = it.get("number")
+        title = it.get("title", "") or ""
+        if not isinstance(num, int):
+            continue
+        cr = client.gh_cli(
+            "issue", "view", str(num), "--repo", ctx.repo,
+            "--json", "comments",
+            "--jq",
+            '[.comments[] | select(.body | startswith("Claimed by session"))] '
+            '| sort_by(.createdAt) | last | .body // ""',
+            timeout=30,
+        )
+        body = cr.stdout.strip().strip('"') if cr.returncode == 0 else ""
+        if not body:
+            # No parseable claim comment — leave for age-based sweep.
+            continue
+        m = claim_re.search(body)
+        if not m:
+            continue
+        owner_uuid = m.group(1)
+        if owner_uuid in live:
+            continue  # owner alive — keep
+
+        # Owner not in live set → release.
+        e1 = client.gh_cli("issue", "edit", str(num), "--repo", ctx.repo,
+                            "--remove-label", "claimed", timeout=15)
+        if e1.returncode != 0:
+            sys.stderr.write(f"#{num}: label remove failed: "
+                             f"{e1.stderr.strip()}\n")
+            continue
+        client.gh_cli(
+            "issue", "comment", str(num), "--repo", ctx.repo,
+            "--body",
+            f"Orphan claim released — owning session `{owner_uuid}` is "
+            f"no longer in the local agent table. Available for reclaim.",
+            timeout=30,
+        )
+        print(f"Released orphan claim on #{num} ({title}, owner {owner_uuid[:8]})")
+        released += 1
+    if released == 0:
+        print("No orphan claims found.")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Lock family
 # ---------------------------------------------------------------------------
 
@@ -1916,6 +2030,7 @@ _COMMANDS = {
     "check-blocked": cmd_check_blocked,
     "check-has-pr": cmd_check_has_pr,
     "release-stale-claims": cmd_release_stale_claims,
+    "release-orphan-claims": cmd_release_orphan_claims,
     "lock-planner": cmd_lock_planner,
     "unlock-planner": cmd_unlock_planner,
     "lock-status": cmd_lock_status,
@@ -1936,7 +2051,7 @@ _USAGE = (
     "close-pr|list-pr-repair|claim-pr-repair|mark-pr-salvaged|"
     "close-pr-unsalvageable|list-unclaimed [--label L]|queue-depth [L]|"
     "critical-path-depth|claim|skip|add-dep|check-blocked|check-has-pr|"
-    "release-stale-claims|lock-planner|unlock-planner|lock-status|"
+    "release-stale-claims|release-orphan-claims|lock-planner|unlock-planner|lock-status|"
     "force-unlock-planner|return-to-human|check-return-to-human|"
     "clear-return-to-human|nothing-to-plan|set-target|set-min-queue|"
     "read-issue}"

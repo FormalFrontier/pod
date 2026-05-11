@@ -115,9 +115,9 @@ class ReconcileBatchTests(unittest.TestCase):
         self.assertIn(("issue", "comment", "42"), verbs)
 
     def test_grace_period_skips_fresh_claim(self):
-        # 60 seconds old < 600s grace period.
+        # 30 seconds old < 60s grace period.
         node = _claim_node(42, comments=[
-            _claim_comment("dead-uuid", "abcd1234", _iso(seconds_ago=60)),
+            _claim_comment("dead-uuid", "abcd1234", _iso(seconds_ago=30)),
         ])
         with patch_client(routes={
             ("POST", "/graphql"): self._gql_response(node),

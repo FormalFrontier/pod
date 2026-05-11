@@ -204,6 +204,7 @@ it directly for debugging or manual intervention.
 | `add-dep <N> <M>` | Add `depends-on: #M` to issue #N; mark blocked if #M is open |
 | `check-blocked` | Unblock issues whose dependencies are all closed |
 | `release-stale-claims [seconds]` | Release claims older than threshold (default 4h) |
+| `release-orphan-claims` | Release claims whose owning session UUID is not in `.pod/agents/` (no age threshold) |
 
 ### PRs
 
