@@ -1,5 +1,9 @@
 import datetime
+import json
+import tempfile
+import time
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from pod import cli
@@ -49,6 +53,15 @@ class SecurityCheckTests(unittest.TestCase):
     def setUp(self):
         cli._security_last_ok = 0.0
         cli._cached_repo_name = None
+        # Redirect the disk cache to a private tempdir so tests don't
+        # pollute (or get polluted by) the source repo's .pod directory.
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self._cache_path = Path(self._tmp.name) / "security-cache.json"
+        p = mock.patch.object(cli, "_security_cache_path",
+                              return_value=self._cache_path)
+        p.start()
+        self.addCleanup(p.stop)
 
     def test_disabled_skips_all_checks(self):
         with mock.patch.object(cli.subprocess, "run") as run:
@@ -127,10 +140,11 @@ class SecurityCheckTests(unittest.TestCase):
         with mock.patch.object(cli.subprocess, "run", side_effect=fake) as run:
             cli.check_repo_security({})
             first_count = run.call_count
-            # Simulate TTL elapsing.
+            # Simulate both TTLs elapsing — in-memory and disk.
             cli._security_last_ok = (
                 cli._security_last_ok - cli._SECURITY_CHECK_TTL_SECONDS - 1
             )
+            self._cache_path.unlink(missing_ok=True)
             cli.check_repo_security({})
         self.assertGreater(run.call_count, first_count)
 
@@ -173,6 +187,179 @@ class SecurityCheckTests(unittest.TestCase):
         with mock.patch.object(cli.subprocess, "run", side_effect=fake_run):
             with self.assertRaises(SystemExit):
                 cli.check_repo_security({})
+
+
+class SecurityCacheTests(unittest.TestCase):
+    """The disk-persisted cache survives across pod invocations so the
+    REST visibility / interaction-limits round-trip happens at most
+    once per `_SECURITY_DISK_TTL_SECONDS` rather than once per pod
+    startup. These tests exercise the cache load / save / invalidate
+    paths directly."""
+
+    def setUp(self):
+        cli._security_last_ok = 0.0
+        cli._cached_repo_name = None
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self._cache_path = Path(self._tmp.name) / "security-cache.json"
+        p = mock.patch.object(cli, "_security_cache_path",
+                              return_value=self._cache_path)
+        p.start()
+        self.addCleanup(p.stop)
+
+    # --- _load_security_cache ---
+
+    def _seed(self, **fields):
+        payload = {
+            "slug": "owner/repo",
+            "checked_at": time.time(),
+            "visibility": "public",
+            "interaction_limit": "collaborators_only",
+            "expires_at": _iso(180),
+            **fields,
+        }
+        self._cache_path.write_text(json.dumps(payload))
+
+    def test_load_missing_file_returns_false(self):
+        self.assertFalse(self._cache_path.exists())
+        self.assertFalse(
+            cli._load_security_cache("owner/repo", "collaborators_only", 7))
+
+    def test_load_unreadable_json_returns_false(self):
+        self._cache_path.write_text("{not json")
+        self.assertFalse(
+            cli._load_security_cache("owner/repo", "collaborators_only", 7))
+
+    def test_load_slug_mismatch_returns_false(self):
+        self._seed(slug="other/repo")
+        self.assertFalse(
+            cli._load_security_cache("owner/repo", "collaborators_only", 7))
+
+    def test_load_stale_age_returns_false(self):
+        self._seed(checked_at=time.time() - cli._SECURITY_DISK_TTL_SECONDS - 1)
+        self.assertFalse(
+            cli._load_security_cache("owner/repo", "collaborators_only", 7))
+
+    def test_load_negative_age_returns_false(self):
+        # Clock skew: cache is from the future.
+        self._seed(checked_at=time.time() + 60)
+        self.assertFalse(
+            cli._load_security_cache("owner/repo", "collaborators_only", 7))
+
+    def test_load_private_visibility_returns_true(self):
+        # Private repos skip the interaction-limits check entirely; the
+        # cached visibility verdict is sufficient.
+        self._seed(visibility="private", interaction_limit=None,
+                   expires_at=None)
+        self.assertTrue(
+            cli._load_security_cache("owner/repo", "collaborators_only", 7))
+
+    def test_load_public_collaborators_only_returns_true(self):
+        self._seed()
+        self.assertTrue(
+            cli._load_security_cache("owner/repo", "collaborators_only", 7))
+
+    def test_load_public_too_lax_for_minimum_returns_false(self):
+        # Cache says contributors_only; current policy demands collaborators_only.
+        self._seed(interaction_limit="contributors_only")
+        self.assertFalse(
+            cli._load_security_cache("owner/repo", "collaborators_only", 7))
+
+    def test_load_public_expiring_soon_returns_false(self):
+        self._seed(expires_at=_iso(3))
+        self.assertFalse(
+            cli._load_security_cache("owner/repo", "collaborators_only", 7))
+
+    def test_load_public_no_expiry_returns_true(self):
+        self._seed(expires_at=None)
+        self.assertTrue(
+            cli._load_security_cache("owner/repo", "collaborators_only", 7))
+
+    def test_load_unparseable_expiry_returns_false(self):
+        self._seed(expires_at="not-a-date")
+        self.assertFalse(
+            cli._load_security_cache("owner/repo", "collaborators_only", 7))
+
+    # --- _save_security_cache ---
+
+    def test_save_writes_file_atomically(self):
+        cli._save_security_cache("owner/repo", visibility="public",
+                                 interaction_limit="collaborators_only",
+                                 expires_at=_iso(180))
+        self.assertTrue(self._cache_path.exists())
+        data = json.loads(self._cache_path.read_text())
+        self.assertEqual(data["slug"], "owner/repo")
+        self.assertEqual(data["visibility"], "public")
+        self.assertEqual(data["interaction_limit"], "collaborators_only")
+        self.assertIn("checked_at", data)
+
+    def test_save_creates_pod_dir_if_missing(self):
+        # Force the cache path under a not-yet-created subdirectory.
+        deep = Path(self._tmp.name) / "freshly-made" / "security-cache.json"
+        with mock.patch.object(cli, "_security_cache_path", return_value=deep):
+            cli._save_security_cache("owner/repo", visibility="private")
+        self.assertTrue(deep.exists())
+
+    def test_save_swallows_errors(self):
+        # If the path is unwritable, _save_security_cache must not raise —
+        # the cache is an optimisation, not a security boundary.
+        bad = Path("/nonexistent/cannot-create/file.json")
+        with mock.patch.object(cli, "_security_cache_path", return_value=bad):
+            cli._save_security_cache("owner/repo", visibility="public",
+                                     interaction_limit="collaborators_only",
+                                     expires_at=_iso(180))
+        # No exception means pass.
+
+    # --- check_repo_security integration ---
+
+    def test_check_uses_disk_cache_to_skip_rest(self):
+        # Seed a fresh disk cache; the security check must skip the REST
+        # round-trip entirely.
+        self._seed()
+        with mock.patch.object(cli, "_get_repo", return_value="owner/repo"), \
+             mock.patch.object(cli.subprocess, "run") as run:
+            cli.check_repo_security({})
+        run.assert_not_called()
+
+    def test_check_writes_disk_cache_on_success_private(self):
+        fake = _mock_run("private", "owner/repo", "{}")
+        with mock.patch.object(cli.subprocess, "run", side_effect=fake):
+            cli.check_repo_security({})
+        self.assertTrue(self._cache_path.exists())
+        data = json.loads(self._cache_path.read_text())
+        self.assertEqual(data["visibility"], "private")
+
+    def test_check_writes_disk_cache_on_success_public(self):
+        body = (
+            '{"limit":"collaborators_only","origin":"repository",'
+            '"expires_at":"' + _iso(180) + '"}'
+        )
+        fake = _mock_run("public", "owner/repo", body)
+        with mock.patch.object(cli.subprocess, "run", side_effect=fake):
+            cli.check_repo_security({})
+        self.assertTrue(self._cache_path.exists())
+        data = json.loads(self._cache_path.read_text())
+        self.assertEqual(data["visibility"], "public")
+        self.assertEqual(data["interaction_limit"], "collaborators_only")
+
+    def test_check_does_not_cache_on_failure(self):
+        # Visibility=public + missing interaction-limits → SystemExit;
+        # cache must not be written so the next run still tries fresh.
+        fake = _mock_run("public", "owner/repo", "{}")
+        with mock.patch.object(cli.subprocess, "run", side_effect=fake):
+            with self.assertRaises(SystemExit):
+                cli.check_repo_security({})
+        self.assertFalse(self._cache_path.exists())
+
+    def test_disk_cache_survives_in_memory_ttl_reset(self):
+        # The disk cache is the whole point: even if `_security_last_ok` is
+        # cleared (new process), a fresh disk cache lets us skip REST.
+        self._seed()
+        cli._security_last_ok = 0.0  # simulate fresh process
+        with mock.patch.object(cli, "_get_repo", return_value="owner/repo"), \
+             mock.patch.object(cli.subprocess, "run") as run:
+            cli.check_repo_security({})
+        run.assert_not_called()
 
 
 class ValidateSecurityConfigTests(unittest.TestCase):

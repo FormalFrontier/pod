@@ -2610,7 +2610,80 @@ _GH_AUTHOR_ASSOCIATIONS = {
 # detect limit removal/expiry inside long-running pod processes.
 _SECURITY_CHECK_TTL_SECONDS = 300
 
+# Disk-persisted version of the in-memory TTL: survives across `pod`
+# invocations so the TUI startup doesn't burn a REST call every time.
+# Bounded short enough that a private→public flip (or limit removal)
+# is caught within an hour even if `pod` is invoked back-to-back.
+_SECURITY_DISK_TTL_SECONDS = 3600
+
 _security_last_ok: float = 0.0
+
+
+def _security_cache_path() -> Path:
+    return PROJECT_DIR / ".pod" / "security-cache.json"
+
+
+def _load_security_cache(slug: str, minimum: str, min_days: float) -> bool:
+    """Return True if a recent successful check for `slug` is on disk and
+    still satisfies the current `[security]` policy. Reading the cache must
+    not itself fail-closed: any error returns False so we fall through to
+    the live check."""
+    p = _security_cache_path()
+    if not p.exists():
+        return False
+    try:
+        data = json.loads(p.read_text())
+    except Exception:
+        return False
+    if data.get("slug") != slug:
+        return False
+    try:
+        age = time.time() - float(data.get("checked_at", 0))
+    except (TypeError, ValueError):
+        return False
+    if age < 0 or age > _SECURITY_DISK_TTL_SECONDS:
+        return False
+    visibility = (data.get("visibility") or "").lower()
+    if visibility != "public":
+        # Non-public repos skip the interaction-limits check entirely;
+        # caching the visibility verdict is sufficient.
+        return True
+    have = data.get("interaction_limit") or ""
+    if _INTERACTION_LIMIT_RANK.get(have, 0) < _INTERACTION_LIMIT_RANK.get(minimum, 0):
+        return False
+    expires = data.get("expires_at")
+    if expires:
+        try:
+            t = datetime.datetime.fromisoformat(str(expires).replace("Z", "+00:00"))
+        except ValueError:
+            return False
+        delta = t - datetime.datetime.now(datetime.timezone.utc)
+        if (delta.total_seconds() / 86400) < min_days:
+            return False
+    return True
+
+
+def _save_security_cache(slug: str, *, visibility: str,
+                         interaction_limit: str | None = None,
+                         expires_at: str | None = None) -> None:
+    """Persist a successful check verdict so subsequent invocations can
+    skip the REST calls. Errors here are non-fatal: the cache is an
+    optimisation, not a security boundary."""
+    try:
+        p = _security_cache_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "slug": slug,
+            "checked_at": time.time(),
+            "visibility": visibility,
+            "interaction_limit": interaction_limit,
+            "expires_at": expires_at,
+        }
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, indent=2))
+        tmp.replace(p)
+    except Exception:
+        pass
 
 
 def validate_security_config(cfg: dict) -> None:
@@ -2718,6 +2791,14 @@ def check_repo_security(config: dict) -> None:
     # The slug comes from the local git remote (`_get_repo()`), which is also
     # API-free.
     slug = _get_repo()
+
+    # Disk cache: skip the REST roundtrip if a successful check for this
+    # repo is on file and still satisfies the current policy. Bounded by
+    # _SECURITY_DISK_TTL_SECONDS so transitions are caught.
+    if _load_security_cache(slug, minimum, min_days):
+        _security_last_ok = now
+        return
+
     try:
         r = subprocess.run(
             ["gh", "api", f"repos/{slug}", "--jq", ".visibility"],
@@ -2740,6 +2821,7 @@ def check_repo_security(config: dict) -> None:
     visibility = r.stdout.strip().lower()
 
     if visibility != "public":
+        _save_security_cache(slug, visibility=visibility)
         _security_last_ok = now
         return
 
@@ -2788,6 +2870,8 @@ def check_repo_security(config: dict) -> None:
                 f"interaction limit `{have}` expires in {days:.1f} days "
                 f"(< {min_days}-day threshold).")
 
+    _save_security_cache(slug, visibility=visibility,
+                         interaction_limit=have, expires_at=expires)
     _security_last_ok = now
 
 
