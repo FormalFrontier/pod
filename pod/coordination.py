@@ -384,15 +384,16 @@ def _check_provenance(issue_num: int | str) -> tuple[bool, str]:
 # ---------------------------------------------------------------------------
 
 _UNCLAIMED_EXCLUDE = {"claimed", "blocked", "has-pr", "replan"}
+_REPLAN_EXCLUDE = {"claimed", "blocked", "has-pr"}
 
 
-def _unclaimed_filter(items: list[dict]) -> list[dict]:
-    """Apply the bash jq filter inline: exclude {claimed, blocked, has-pr,
-    replan}; sort critical-path first, then by createdAt."""
+def _filtered_issues(items: list[dict], exclude: set[str]) -> list[dict]:
+    """Apply the bash jq filter inline: drop items whose labels intersect
+    `exclude`; sort critical-path first, then by createdAt."""
     out = []
     for it in items:
         names = {l.get("name") for l in (it.get("labels") or [])}
-        if names & _UNCLAIMED_EXCLUDE:
+        if names & exclude:
             continue
         out.append(it)
     out.sort(key=lambda it: (
@@ -401,6 +402,12 @@ def _unclaimed_filter(items: list[dict]) -> list[dict]:
         it.get("createdAt", "") or it.get("created_at", "") or "",
     ))
     return out
+
+
+def _unclaimed_filter(items: list[dict]) -> list[dict]:
+    """Apply the bash jq filter inline: exclude {claimed, blocked, has-pr,
+    replan}; sort critical-path first, then by createdAt."""
+    return _filtered_issues(items, _UNCLAIMED_EXCLUDE)
 
 
 def _unclaimed_issues(ctx: CoordinationContext,
@@ -435,6 +442,23 @@ def _unclaimed_issues(ctx: CoordinationContext,
         if n is not None and n not in seen:
             seen[n] = x
     return _unclaimed_filter(list(seen.values()))
+
+
+def _replan_issues(ctx: CoordinationContext) -> list[dict]:
+    """Return `agent-plan + replan` issues filtered through the trusted-
+    author gate. `human-oversight` is intentionally excluded — those
+    issues have an owner-closes-only policy and must not be auto-replanned.
+    """
+    include = ["--include-untrusted"] if ctx.include_untrusted else []
+    args = ["--label", "agent-plan", "--label", "replan",
+            "--state", "open", "--limit", "500",
+            "--json", "number,title,labels,createdAt", *include]
+    out = _filter_trusted_issues(args)
+    try:
+        items = _safe_json(out, default=[])
+    except ValueError:
+        items = []
+    return _filtered_issues(items, _REPLAN_EXCLUDE)
 
 
 def _safe_json(s: str, default=None):
@@ -994,6 +1018,22 @@ def cmd_list_pr_repair(ctx: CoordinationContext, argv: list[str]) -> int:
                 break
         if is_stuck:
             print(f"#{pr_num} [stuck] {p.get('title','')}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: list-replan
+# ---------------------------------------------------------------------------
+
+def cmd_list_replan(ctx: CoordinationContext, argv: list[str]) -> int:
+    """List `agent-plan + replan` issues ready for /replan triage.
+
+    Goes through the same trusted-author gate as `list-unclaimed`.
+    Excludes `claimed`, `blocked`, `has-pr`. `human-oversight` is
+    excluded by construction (we only ask for `agent-plan`).
+    """
+    for it in _replan_issues(ctx):
+        print(f"#{it.get('number')} {it.get('title','')}")
     return 0
 
 
@@ -2020,6 +2060,7 @@ _COMMANDS = {
     "claim-fix": cmd_claim_fix,
     "close-pr": cmd_close_pr,
     "list-pr-repair": cmd_list_pr_repair,
+    "list-replan": cmd_list_replan,
     "claim-pr-repair": cmd_claim_pr_repair,
     "mark-pr-salvaged": cmd_mark_pr_salvaged,
     "close-pr-unsalvageable": cmd_close_pr_unsalvageable,
@@ -2050,7 +2091,7 @@ _COMMANDS = {
 _USAGE = (
     "Usage: coordination "
     "{orient|plan [--label L] [--critical-path]|create-pr|claim-fix|"
-    "close-pr|list-pr-repair|claim-pr-repair|mark-pr-salvaged|"
+    "close-pr|list-pr-repair|list-replan|claim-pr-repair|mark-pr-salvaged|"
     "close-pr-unsalvageable|list-unclaimed [--label L]|queue-depth [L]|"
     "critical-path-depth|claim|skip|add-dep|check-blocked|check-has-pr|"
     "release-stale-claims|release-orphan-claims|lock-planner|unlock-planner|lock-status|"
