@@ -628,6 +628,18 @@ class IsTrustedTests(unittest.TestCase):
 class ProvenanceCacheTests(unittest.TestCase):
     def setUp(self):
         cli._provenance_cache.clear()
+        # Isolate the cross-process disk cache: each test gets a fresh
+        # tempdir so persisted provenance from a prior test (or a real
+        # pod run in the cwd) can't leak in.
+        self._cache_tmp = tempfile.TemporaryDirectory()
+        self._disk_patch = mock.patch.object(
+            cli, "_PROVENANCE_DISK_CACHE",
+            cli._ProvenanceDiskCache(Path(self._cache_tmp.name)))
+        self._disk_patch.start()
+
+    def tearDown(self):
+        self._disk_patch.stop()
+        self._cache_tmp.cleanup()
 
     def _patch_fetch(self, prov):
         # Patch the fetcher and visibility check; return mock for assertions.
@@ -655,10 +667,14 @@ class ProvenanceCacheTests(unittest.TestCase):
         prov = _prov()
         with self._patch_fetch(prov):
             cli.check_issue_provenance("o/r", 1, {})
-            # Age the cached entry past TTL.
-            cached = cli._provenance_cache[("o/r", 1)]
-            cached.fetched_at -= cli._provenance_ttl({}) + 1
-            cli.check_issue_provenance("o/r", 1, {})
+            # Age the cached entry past TTL by simulating a clock
+            # advance for the next read; both the in-process entry and
+            # the disk entry are stamped at the original fetch time, so
+            # bumping `time.time` past the TTL invalidates both.
+            ttl = cli._provenance_ttl({})
+            with mock.patch.object(cli.time, "time",
+                                    return_value=time.time() + ttl + 1):
+                cli.check_issue_provenance("o/r", 1, {})
             self.assertEqual(cli.fetch_issue_provenance.call_count, 2)
 
     def test_private_repo_short_circuits(self):
@@ -675,6 +691,41 @@ class ProvenanceCacheTests(unittest.TestCase):
                 "o/r", 1, {"security": {"trust_only_collaborators": False}})
         self.assertTrue(ok)
         fetch.assert_not_called()
+
+    def test_disk_cache_serves_across_in_process_clears(self):
+        """Simulate the across-subprocess case: drop the in-process
+        cache and check_issue_provenance must still come back without
+        calling the fetcher because the disk tier holds the value."""
+        prov = _prov()
+        with self._patch_fetch(prov):
+            cli.check_issue_provenance("o/r", 1, {})
+            self.assertEqual(cli.fetch_issue_provenance.call_count, 1)
+            # Pretend we're a brand-new subprocess.
+            cli._provenance_cache.clear()
+            cli.check_issue_provenance("o/r", 1, {})
+            self.assertEqual(cli.fetch_issue_provenance.call_count, 1)
+
+
+class RepoPublicMemoTests(unittest.TestCase):
+    def setUp(self):
+        cli._REPO_PUBLIC_MEMO.clear()
+
+    def tearDown(self):
+        cli._REPO_PUBLIC_MEMO.clear()
+
+    def test_memoised_after_first_call(self):
+        """Three call sites used to hit /repos each tick; the per-
+        process memo must collapse that to one round-trip."""
+        from _gh_helpers import patch_client, fake_response
+        resp = fake_response(200, body={"visibility": "public"})
+        with mock.patch.object(cli, "_get_repo", return_value="o/r"), \
+             patch_client(routes={("GET", "/repos/o/r"): resp}) as client:
+            self.assertTrue(cli._is_repo_public({}))
+            self.assertTrue(cli._is_repo_public({}))
+            self.assertTrue(cli._is_repo_public({}))
+        gets = [c for c in client.calls
+                if c["method"] == "GET" and c["path"] == "/repos/o/r"]
+        self.assertEqual(len(gets), 1)
 
 
 class ValidateProvenanceConfigTests(unittest.TestCase):

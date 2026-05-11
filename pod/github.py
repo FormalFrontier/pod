@@ -604,17 +604,15 @@ class GitHubClient:
                 _allow_retry: bool = True,
                 _caller: str | None = None) -> GHResponse:
         method = method.upper()
-        # ETag conditional requests apply to GET/HEAD by spec, plus
-        # POST `/graphql` as a special case: GitHub honors
-        # `If-None-Match` on GraphQL POST queries, and a 304 response
-        # does not consume the primary GraphQL budget. The cache key
-        # incorporates a body hash so distinct queries get distinct
-        # entries (see `_ETagStore.key_for`).
-        is_graphql_post = (method == "POST"
-                            and isinstance(path_or_url, str)
-                            and path_or_url.endswith("/graphql"))
-        cacheable = cache == "etag" and (
-            method in ("GET", "HEAD") or is_graphql_post)
+        # ETag conditional requests are only useful on GET/HEAD. We
+        # used to also send `If-None-Match` on POST `/graphql` on the
+        # belief that GitHub returns 304 for unchanged queries, but
+        # field data (zero 304s out of ~14k GraphQL POSTs over four
+        # hours) shows the server ignores the header and bills every
+        # POST against the GraphQL bucket. The body-keyed value cache
+        # in cli.py (`_ProvenanceDiskCache`) is what actually keeps
+        # provenance fetches off the wire.
+        cacheable = cache == "etag" and method in ("GET", "HEAD")
 
         if path_or_url.startswith("http"):
             url = path_or_url

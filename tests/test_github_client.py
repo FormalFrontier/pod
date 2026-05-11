@@ -314,18 +314,17 @@ class RateMeterTests(_Tmp):
         finally:
             c.close()
 
-    def test_graphql_post_with_cache_etag_round_trip(self):
-        """GitHub honors `If-None-Match` on GraphQL POST queries (and a
-        304 doesn't consume the primary GraphQL budget). The layer must
-        send the conditional header on a repeated identical query and
-        serve the cached body on 304."""
+    def test_graphql_post_never_sends_if_none_match(self):
+        """GitHub's GraphQL endpoint does not honor conditional
+        requests — field data showed zero 304s out of ~14k POSTs over
+        four hours, with every POST debited from the GraphQL bucket.
+        The layer therefore must not send `If-None-Match` on `/graphql`
+        even when the caller passes `cache="etag"`, and must not
+        persist the response in the ETag store."""
         seen_if_none_match: list[str | None] = []
 
         def h(req: httpx.Request) -> httpx.Response:
             seen_if_none_match.append(req.headers.get("if-none-match"))
-            if req.headers.get("if-none-match") == '"v1"':
-                return httpx.Response(
-                    304, headers=_rl_headers(resource="graphql"))
             return _resp(200,
                           json_body={"data": {"repository": {"x": 1}}},
                           etag='"v1"',
@@ -333,36 +332,14 @@ class RateMeterTests(_Tmp):
 
         c = _client(h, cache_dir=self.cache_dir, log_path=self.log_path)
         try:
-            r1 = c.graphql("query Q { repository { x } }", cache="etag")
-            self.assertEqual(r1.status, 200)
-            self.assertFalse(r1.cache_hit)
-            r2 = c.graphql("query Q { repository { x } }", cache="etag")
-            self.assertEqual(r2.status, 304)
-            self.assertTrue(r2.cache_hit)
-            self.assertEqual(r2.body(),
-                              {"data": {"repository": {"x": 1}}})
+            c.graphql("query Q { repository { x } }", cache="etag")
+            c.graphql("query Q { repository { x } }", cache="etag")
         finally:
             c.close()
-        self.assertEqual(seen_if_none_match, [None, '"v1"'])
-
-    def test_graphql_body_in_cache_key(self):
-        """Two distinct GraphQL queries produce distinct cache
-        entries (cache key incorporates a body hash)."""
-        def h(req: httpx.Request) -> httpx.Response:
-            body = req.read().decode()
-            tag = '"vA"' if '"query A' in body else '"vB"'
-            return _resp(200, json_body={"q": body[:30]},
-                          etag=tag,
-                          headers={"x-ratelimit-resource": "graphql"})
-
-        c = _client(h, cache_dir=self.cache_dir, log_path=self.log_path)
-        try:
-            c.graphql("query A { ok }", cache="etag")
-            c.graphql("query B { ok }", cache="etag")
-        finally:
-            c.close()
-        files = list(self.cache_dir.iterdir())
-        self.assertEqual(len(files), 2)
+        self.assertEqual(seen_if_none_match, [None, None])
+        # Cache dir should be empty (or absent) — no GraphQL entry.
+        self.assertFalse(self.cache_dir.exists() and any(
+            self.cache_dir.iterdir()))
 
     def test_graphql_default_cache_none_not_cached(self):
         """`graphql()` defaults to cache='none' so plain calls go

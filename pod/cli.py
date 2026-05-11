@@ -3172,7 +3172,10 @@ class _IssueProvenance:
     fetched_at: float
 
 
-# Cache: {(repo, issue_num): _IssueProvenance}.
+# In-process cache: {(repo, issue_num): _IssueProvenance}. Kept for the
+# rare case of repeated checks inside one subprocess (e.g. CLI helpers
+# that read several issues). The cross-process tier below is what
+# actually keeps the GraphQL bucket from draining.
 _provenance_cache: dict[tuple[str, int], _IssueProvenance] = {}
 
 
@@ -3181,13 +3184,134 @@ def _provenance_ttl(config: dict) -> float:
     return float(sec.get("provenance_cache_seconds", 60))
 
 
+class _ProvenanceDiskCache:
+    """Cross-process TTL'd cache for issue provenance.
+
+    `cmd_filter_trusted_issues` runs as a fresh subprocess per
+    `coordination orient` / `list-unclaimed` tick, so an in-process
+    cache can't help across invocations. Each agent worktree ticks
+    independently, so with N agents and M open agent-plan issues the
+    naive cost is N*M GraphQL POSTs per tick. GitHub does not honor
+    `If-None-Match` on `/graphql` POSTs (field data: zero 304s out of
+    ~14k POSTs), so the layer's ETag store can't help either.
+
+    This is a plain on-disk value cache: one JSON file per
+    (repo, issue_num), keyed by sha256 of those fields so we don't
+    collide across repos. Atomic writes via tmp+rename. TTL is read
+    from `security.provenance_cache_seconds` (default 60s).
+    """
+
+    def __init__(self, root: Path):
+        self.root = root
+
+    @staticmethod
+    def _key(repo: str, issue_num: int) -> str:
+        return hashlib.sha256(f"{repo}#{issue_num}".encode()).hexdigest()
+
+    def _path_for(self, repo: str, issue_num: int) -> Path:
+        return self.root / f"{self._key(repo, issue_num)}.json"
+
+    def get(self, repo: str, issue_num: int,
+            ttl: float) -> _IssueProvenance | None:
+        p = self._path_for(repo, issue_num)
+        try:
+            raw = p.read_text()
+        except (OSError, FileNotFoundError):
+            return None
+        try:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            return None
+        fetched_at = float(data.get("fetched_at", 0.0))
+        if (time.time() - fetched_at) >= ttl:
+            return None
+        try:
+            comments = [
+                _ProvenanceComment(
+                    comment_id=int(c["comment_id"]),
+                    login=str(c.get("login", "")),
+                    association=str(c.get("association", "NONE")),
+                )
+                for c in (data.get("comments") or [])
+            ]
+            return _IssueProvenance(
+                repo=str(data["repo"]),
+                issue_num=int(data["issue_num"]),
+                author_login=str(data.get("author_login", "")),
+                author_association=str(
+                    data.get("author_association", "NONE")),
+                comments=comments,
+                fetched_at=fetched_at,
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def put(self, prov: _IssueProvenance) -> None:
+        try:
+            self.root.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return
+        payload = {
+            "repo": prov.repo,
+            "issue_num": prov.issue_num,
+            "author_login": prov.author_login,
+            "author_association": prov.author_association,
+            "comments": [
+                {"comment_id": c.comment_id, "login": c.login,
+                 "association": c.association}
+                for c in prov.comments
+            ],
+            "fetched_at": prov.fetched_at,
+        }
+        p = self._path_for(prov.repo, prov.issue_num)
+        tmp = p.with_suffix(".tmp")
+        try:
+            tmp.write_text(json.dumps(payload, separators=(",", ":")))
+            os.chmod(tmp, 0o600)
+            tmp.replace(p)
+        except OSError:
+            pass
+
+    def invalidate(self, repo: str, issue_num: int) -> None:
+        p = self._path_for(repo, issue_num)
+        try:
+            p.unlink()
+        except (OSError, FileNotFoundError):
+            pass
+
+
+_PROVENANCE_DISK_CACHE: _ProvenanceDiskCache | None = None
+
+
+def _provenance_disk_cache() -> _ProvenanceDiskCache:
+    global _PROVENANCE_DISK_CACHE
+    if _PROVENANCE_DISK_CACHE is None:
+        _PROVENANCE_DISK_CACHE = _ProvenanceDiskCache(
+            POD_DIR / "provenance-cache")
+    return _PROVENANCE_DISK_CACHE
+
+
+# Per-process memoisation. The current repo can't change inside one
+# subprocess, so caching the visibility verdict for the lifetime of the
+# process turns ~3 redundant calls per tick into 1. We still re-check
+# in fresh subprocesses, so a maintainer flipping the repo to private
+# is picked up on the next tick (~seconds, not minutes).
+_REPO_PUBLIC_MEMO: dict[str, bool] = {}
+
+
 def _is_repo_public(config: dict) -> bool:
     """Return True iff the current repo is public. Routed through the
-    layer (ETag-cached); fails closed by treating ambiguous results as
-    public so the security gate still runs.
+    layer (ETag-cached on the REST side); fails closed by treating
+    ambiguous results as public so the security gate still runs.
+
+    Memoised per process: three call sites used to fire on every tick;
+    they now share one round-trip.
     """
+    slug = _get_repo()
+    if slug in _REPO_PUBLIC_MEMO:
+        return _REPO_PUBLIC_MEMO[slug]
     try:
-        resp = gh.get_client().get(f"/repos/{_get_repo()}", timeout=15)
+        resp = gh.get_client().get(f"/repos/{slug}", timeout=15)
     except Exception:
         return True  # fail-closed: treat as public so we still check
     if not resp.ok():
@@ -3195,69 +3319,19 @@ def _is_repo_public(config: dict) -> bool:
     visibility = ((resp.body() or {}).get("visibility") or "").lower()
     if not visibility:
         return True
-    return visibility == "public"
+    result = visibility == "public"
+    _REPO_PUBLIC_MEMO[slug] = result
+    return result
 
 
-_PROVENANCE_QUERY = """
-query Provenance($owner: String!, $name: String!, $num: Int!) {
-  repository(owner: $owner, name: $name) {
-    issue(number: $num) {
-      author { login }
-      authorAssociation
-      comments(first: 100) {
-        nodes {
-          databaseId
-          author { login }
-          authorAssociation
-        }
-        pageInfo { hasNextPage endCursor }
-      }
-    }
-  }
-}
-"""
+def _parse_provenance_node(repo: str, issue_num: int,
+                            issue_node: dict) -> tuple[
+                                _IssueProvenance, bool]:
+    """Pull `_IssueProvenance` out of one GraphQL `issue` node.
 
-
-def fetch_issue_provenance(repo: str, issue_num: int) -> _IssueProvenance:
-    """Fetch the issue + its comments and bundle author/association data.
-
-    Burner-rewrite (B4): one GraphQL query returns issue author +
-    authorAssociation and the first 100 comments (with author +
-    association) in a single round-trip. Falls back to the REST path
-    for the rare case of >100 comments on a single agent-plan issue.
-    Raises RuntimeError on layer failure so callers can surface a
-    clear error.
-
-    ETag-cached: `cmd_filter_trusted_issues` runs as a fresh subprocess
-    per `coordination orient` / `list-unclaimed` tick, so the in-process
-    `_provenance_cache` doesn't help across invocations. The layer's
-    ETag store, on the other hand, lives on disk and is keyed by the
-    GraphQL request body (which includes `issue_num`), so a repeat
-    fetch of an unchanged issue serves a 304 that doesn't count against
-    the GraphQL bucket. This is the dominant GraphQL burner pre-fix.
+    Returns `(prov, has_next_page)`. The caller is responsible for
+    paginating remaining comments via REST when `has_next_page` is True.
     """
-    client = gh.get_client()
-    owner, _, name = repo.partition("/")
-    if not (owner and name):
-        raise RuntimeError(f"unparseable repo slug: {repo!r}")
-
-    resp = client.graphql(_PROVENANCE_QUERY,
-                          variables={"owner": owner, "name": name,
-                                     "num": issue_num},
-                          cache="etag")
-    if not resp.ok():
-        raise RuntimeError(
-            f"failed to fetch provenance for {repo}#{issue_num}: "
-            f"HTTP {resp.status}")
-    body = resp.body() or {}
-    issue_node = (((body.get("data") or {}).get("repository") or {})
-                  .get("issue") or {})
-    if not issue_node:
-        # GraphQL "errors" payload, or issue not found.
-        raise RuntimeError(
-            f"failed to fetch provenance for {repo}#{issue_num}: "
-            "GraphQL returned no issue node")
-
     author = (issue_node.get("author") or {}).get("login") or ""
     author_assoc = issue_node.get("authorAssociation") or "NONE"
 
@@ -3276,36 +3350,6 @@ def fetch_issue_provenance(repo: str, issue_num: int) -> _IssueProvenance:
         comments.append(_ProvenanceComment(
             comment_id=int(cid), login=login, association=assoc))
 
-    # Rare edge case: >100 comments. Fall back to the REST paginate path
-    # so we don't silently miss an untrusted commenter past the 100th
-    # row. This costs one extra page request via httpx.
-    if has_next:
-        for page in client.paginate(
-                f"/repos/{repo}/issues/{issue_num}/comments",
-                max_pages=20):
-            if not page.ok():
-                raise RuntimeError(
-                    f"failed to page comments for {repo}#{issue_num}: "
-                    f"HTTP {page.status}")
-            page_body = page.body() or []
-            if not isinstance(page_body, list):
-                continue
-            # The GraphQL first page already covered the first 100.
-            # The REST endpoint orders by created_at ascending (oldest
-            # first), so we re-extract everything here and deduplicate
-            # by id rather than guessing pagination cursors.
-            for rc in page_body:
-                if not isinstance(rc, dict):
-                    continue
-                rid = int(rc.get("id") or 0)
-                if not rid or any(c.comment_id == rid for c in comments):
-                    continue
-                comments.append(_ProvenanceComment(
-                    comment_id=rid,
-                    login=(rc.get("user") or {}).get("login", "") or "",
-                    association=rc.get("author_association", "NONE") or "NONE",
-                ))
-
     return _IssueProvenance(
         repo=repo,
         issue_num=issue_num,
@@ -3313,7 +3357,129 @@ def fetch_issue_provenance(repo: str, issue_num: int) -> _IssueProvenance:
         author_association=author_assoc,
         comments=comments,
         fetched_at=time.time(),
+    ), has_next
+
+
+def _paginate_comments_into(prov: _IssueProvenance) -> None:
+    """Append comments past the first 100 to `prov` via REST. Used as
+    the rare-case tail for issues with >100 comments. Mutates `prov`."""
+    client = gh.get_client()
+    for page in client.paginate(
+            f"/repos/{prov.repo}/issues/{prov.issue_num}/comments",
+            max_pages=20):
+        if not page.ok():
+            raise RuntimeError(
+                f"failed to page comments for "
+                f"{prov.repo}#{prov.issue_num}: HTTP {page.status}")
+        page_body = page.body() or []
+        if not isinstance(page_body, list):
+            continue
+        for rc in page_body:
+            if not isinstance(rc, dict):
+                continue
+            rid = int(rc.get("id") or 0)
+            if not rid or any(c.comment_id == rid for c in prov.comments):
+                continue
+            prov.comments.append(_ProvenanceComment(
+                comment_id=rid,
+                login=(rc.get("user") or {}).get("login", "") or "",
+                association=rc.get("author_association", "NONE") or "NONE",
+            ))
+
+
+# Cap on aliases per batched GraphQL query. GitHub's documented
+# limits allow much more (node-count caps in the thousands), but
+# response size grows with comment counts, so we keep batches modest.
+_PROVENANCE_BATCH_SIZE = 25
+
+
+def _build_provenance_batch_query(count: int) -> str:
+    """Build a single GraphQL query with `count` aliased `issue(...)`
+    selections. Each alias `i{k}` uses `$num{k}: Int!`."""
+    aliases = "\n".join(
+        f"    i{k}: issue(number: $num{k}) {{\n"
+        f"      author {{ login }}\n"
+        f"      authorAssociation\n"
+        f"      comments(first: 100) {{\n"
+        f"        nodes {{\n"
+        f"          databaseId\n"
+        f"          author {{ login }}\n"
+        f"          authorAssociation\n"
+        f"        }}\n"
+        f"        pageInfo {{ hasNextPage endCursor }}\n"
+        f"      }}\n"
+        f"    }}"
+        for k in range(count)
     )
+    var_decls = ", ".join(f"$num{k}: Int!" for k in range(count))
+    return (
+        f"query ProvenanceBatch($owner: String!, $name: String!, "
+        f"{var_decls}) {{\n"
+        f"  repository(owner: $owner, name: $name) {{\n"
+        f"{aliases}\n"
+        f"  }}\n"
+        f"}}\n"
+    )
+
+
+def fetch_issue_provenances(repo: str,
+                             issue_nums: list[int]
+                             ) -> dict[int, _IssueProvenance]:
+    """Fetch provenance for multiple issues with a single batched
+    GraphQL request per chunk of `_PROVENANCE_BATCH_SIZE` issues.
+
+    Returns a `{issue_num: _IssueProvenance}` dict. Missing or
+    inaccessible issues are simply absent from the result; callers
+    treat absence as a fetch failure (fails-closed via
+    `check_issue_provenance`).
+
+    Does not consult the disk cache itself — callers (i.e.
+    `_cached_provenance`) are expected to filter cached issues out
+    before calling here.
+    """
+    client = gh.get_client()
+    owner, _, name = repo.partition("/")
+    if not (owner and name):
+        raise RuntimeError(f"unparseable repo slug: {repo!r}")
+
+    out: dict[int, _IssueProvenance] = {}
+    nums = list(dict.fromkeys(int(n) for n in issue_nums))  # dedup, ordered
+    for start in range(0, len(nums), _PROVENANCE_BATCH_SIZE):
+        chunk = nums[start:start + _PROVENANCE_BATCH_SIZE]
+        query = _build_provenance_batch_query(len(chunk))
+        variables: dict = {"owner": owner, "name": name}
+        for k, n in enumerate(chunk):
+            variables[f"num{k}"] = n
+        resp = client.graphql(query, variables=variables, cache="none")
+        if not resp.ok():
+            raise RuntimeError(
+                f"failed to fetch batched provenance for {repo}: "
+                f"HTTP {resp.status}")
+        body = resp.body() or {}
+        repo_node = (body.get("data") or {}).get("repository") or {}
+        for k, n in enumerate(chunk):
+            issue_node = repo_node.get(f"i{k}")
+            if not issue_node:
+                continue
+            prov, has_next = _parse_provenance_node(repo, n, issue_node)
+            if has_next:
+                _paginate_comments_into(prov)
+            out[n] = prov
+    return out
+
+
+def fetch_issue_provenance(repo: str, issue_num: int) -> _IssueProvenance:
+    """Single-issue fetch. Thin wrapper around the batched fetcher so
+    the parsing + REST tail-paginate code is shared.
+
+    Raises `RuntimeError` on layer failure or missing issue node.
+    """
+    got = fetch_issue_provenances(repo, [issue_num])
+    if issue_num not in got:
+        raise RuntimeError(
+            f"failed to fetch provenance for {repo}#{issue_num}: "
+            "GraphQL returned no issue node")
+    return got[issue_num]
 
 
 def is_trusted(provenance: _IssueProvenance, config: dict) -> tuple[bool, str]:
@@ -3345,17 +3511,67 @@ def is_trusted(provenance: _IssueProvenance, config: dict) -> tuple[bool, str]:
 
 def _cached_provenance(repo: str, issue_num: int, config: dict,
                         *, fresh: bool) -> _IssueProvenance:
-    """Shared cache entry point. `fresh=True` invalidates and re-fetches."""
+    """Shared cache entry point. Consults in-process first, then the
+    cross-process disk cache. `fresh=True` invalidates both tiers and
+    forces a refetch."""
     key = (repo, issue_num)
+    ttl = _provenance_ttl(config)
+    disk = _provenance_disk_cache()
     if fresh:
         _provenance_cache.pop(key, None)
+        disk.invalidate(repo, issue_num)
     else:
         cached = _provenance_cache.get(key)
-        if cached and (time.time() - cached.fetched_at) < _provenance_ttl(config):
+        if cached and (time.time() - cached.fetched_at) < ttl:
             return cached
+        on_disk = disk.get(repo, issue_num, ttl)
+        if on_disk is not None:
+            _provenance_cache[key] = on_disk
+            return on_disk
     prov = fetch_issue_provenance(repo, issue_num)
     _provenance_cache[key] = prov
+    disk.put(prov)
     return prov
+
+
+def _cached_provenances(repo: str, issue_nums: list[int], config: dict,
+                         *, fresh: bool) -> dict[int, _IssueProvenance]:
+    """Batched cache entry point. For each requested issue, return a
+    cached entry if available within TTL; otherwise group the misses
+    into one batched GraphQL fetch.
+
+    Returns `{issue_num: _IssueProvenance}`. Issues that couldn't be
+    fetched (e.g. deleted, transferred) are absent from the result, so
+    callers must treat absence as a fetch failure.
+    """
+    ttl = _provenance_ttl(config)
+    disk = _provenance_disk_cache()
+    out: dict[int, _IssueProvenance] = {}
+    misses: list[int] = []
+    for n in issue_nums:
+        key = (repo, n)
+        if fresh:
+            _provenance_cache.pop(key, None)
+            disk.invalidate(repo, n)
+            misses.append(n)
+            continue
+        cached = _provenance_cache.get(key)
+        if cached and (time.time() - cached.fetched_at) < ttl:
+            out[n] = cached
+            continue
+        on_disk = disk.get(repo, n, ttl)
+        if on_disk is not None:
+            _provenance_cache[key] = on_disk
+            out[n] = on_disk
+            continue
+        misses.append(n)
+    if misses:
+        fetched = fetch_issue_provenances(repo, misses)
+        for n, prov in fetched.items():
+            _provenance_cache[(repo, n)] = prov
+            disk.put(prov)
+            out[n] = prov
+    return out
 
 
 def check_issue_provenance(repo: str, issue_num: int, config: dict,
@@ -3432,11 +3648,28 @@ def cmd_filter_trusted_issues(config: dict, args) -> None:
     if not (sec_enabled and repo_public):
         filtered = items
     else:
+        # Batch the provenance fetch for every candidate issue in one
+        # GraphQL round-trip (with disk-cache hits short-circuiting
+        # before the network call). Previously this fired one POST per
+        # issue per tick per agent, draining the GraphQL bucket.
+        nums = [int(it.get("number", 0)) for it in items]
+        nums = [n for n in nums if n > 0]
+        try:
+            provs = _cached_provenances(repo, nums, config, fresh=False)
+        except RuntimeError as e:
+            print(f"pod: provenance batch failed: {e}", file=sys.stderr)
+            sys.exit(1)
         for it in items:
             num = int(it.get("number", 0))
             if num <= 0:
                 continue
-            ok, reason = check_issue_provenance(repo, num, config, fresh=False)
+            prov = provs.get(num)
+            if prov is None:
+                reason = (f"failed to fetch provenance for #{num}: "
+                          "no issue node")
+                ok = False
+            else:
+                ok, reason = is_trusted(prov, config)
             if ok:
                 filtered.append(it)
             elif args.include_untrusted:

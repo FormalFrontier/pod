@@ -160,11 +160,28 @@ class ReconcileBatchTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class ProvenanceBurnerTests(unittest.TestCase):
+    def setUp(self):
+        # Disk provenance cache leaks across tests (and from real pod
+        # runs in the cwd), so redirect it to a tempdir per test.
+        cli._provenance_cache.clear()
+        self._cache_tmp = tempfile.TemporaryDirectory()
+        self._disk_patch = mock.patch.object(
+            cli, "_PROVENANCE_DISK_CACHE",
+            cli._ProvenanceDiskCache(Path(self._cache_tmp.name)))
+        self._disk_patch.start()
+
+    def tearDown(self):
+        self._disk_patch.stop()
+        self._cache_tmp.cleanup()
+
     def _gql_response(self, *, author="alice",
                        author_assoc="OWNER",
                        comments=(),
-                       has_next=False):
-        body = {"data": {"repository": {"issue": {
+                       has_next=False,
+                       alias="i0"):
+        # The batched provenance query returns aliased nodes (i0, i1,
+        # ...) instead of `issue`. Single-issue fetches use alias `i0`.
+        body = {"data": {"repository": {alias: {
             "author": {"login": author},
             "authorAssociation": author_assoc,
             "comments": {
@@ -211,74 +228,80 @@ class ProvenanceBurnerTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 cli.fetch_issue_provenance("o/r", 42)
 
-    def test_etag_cached_repeat_serves_304(self):
-        """A repeat provenance fetch for the same issue must serve a
-        304 from the layer's ETag cache rather than burning a fresh
-        GraphQL call. This is the dominant GraphQL burner pre-fix —
-        `cmd_filter_trusted_issues` runs as a fresh subprocess per
-        `coordination orient` tick, so the in-process
-        `_provenance_cache` doesn't deduplicate across invocations.
-        The on-disk ETag cache does.
+    def test_disk_cache_short_circuits_repeat_fetch(self):
+        """A repeat `check_issue_provenance` for the same issue inside
+        the TTL must serve from the disk cache instead of issuing
+        another GraphQL POST. This is what keeps the GraphQL bucket
+        alive across the fresh subprocesses that `coordination orient`
+        ticks spawn — GitHub does not honor `If-None-Match` on
+        `/graphql` POSTs, so the layer-level ETag store can't help.
         """
-        import httpx
-        from pod import github as gh
-        from pod.github import GitHubClient
+        with patch_client(routes={
+            ("POST", "/graphql"): self._gql_response(
+                author="alice", author_assoc="OWNER",
+                comments=[(1, "alice", "OWNER")],
+            ),
+        }) as client, mock.patch.object(cli, "_is_repo_public",
+                                          return_value=True):
+            ok1, _ = cli.check_issue_provenance("o/r", 42, {})
+            graphql_after_first = sum(
+                1 for c in client.calls
+                if c["method"] == "POST" and c["path"] == "/graphql")
+            # Drop the in-process cache so we exercise the disk tier
+            # (this is what a fresh subprocess would see).
+            cli._provenance_cache.clear()
+            ok2, _ = cli.check_issue_provenance("o/r", 42, {})
+            graphql_after_second = sum(
+                1 for c in client.calls
+                if c["method"] == "POST" and c["path"] == "/graphql")
+        self.assertTrue(ok1)
+        self.assertTrue(ok2)
+        self.assertEqual(graphql_after_first, 1)
+        self.assertEqual(graphql_after_second, 1,
+                          "second fetch should hit the disk cache, "
+                          "not issue another GraphQL POST")
 
-        seen_if_none_match: list[str | None] = []
-
-        def handler(req: httpx.Request) -> httpx.Response:
-            seen_if_none_match.append(req.headers.get("if-none-match"))
-            base_headers = {
-                "x-ratelimit-limit": "5000",
-                "x-ratelimit-remaining": "4999",
-                "x-ratelimit-reset": str(int(time.time()) + 3600),
-                "x-ratelimit-resource": "graphql",
-            }
-            if req.headers.get("if-none-match") == '"prov-v1"':
-                return httpx.Response(304, headers=base_headers)
-            body = {"data": {"repository": {"issue": {
+    def test_batched_fetch_issues_one_graphql_per_chunk(self):
+        """`fetch_issue_provenances([n1, n2, ...])` must issue one
+        GraphQL POST per chunk of `_PROVENANCE_BATCH_SIZE` issues —
+        not one POST per issue."""
+        # Build a batched response with aliased issue nodes for the
+        # three requested issues.
+        body = {"data": {"repository": {
+            "i0": {
                 "author": {"login": "alice"},
                 "authorAssociation": "OWNER",
-                "comments": {
-                    "nodes": [{"databaseId": 1,
-                                "author": {"login": "alice"},
-                                "authorAssociation": "OWNER"}],
-                    "pageInfo": {"hasNextPage": False, "endCursor": None},
-                },
-            }}}}
-            return httpx.Response(200, json=body,
-                                   headers={**base_headers,
-                                            "etag": '"prov-v1"'})
-
-        with tempfile.TemporaryDirectory() as td:
-            cache_dir = Path(td) / "gh-cache"
-            log_path = Path(td) / "gh-access.log"
-            client = GitHubClient(
-                host="github.com",
-                token="t-test",
-                cache_dir=cache_dir,
-                log_path=log_path,
-                transport=httpx.MockTransport(handler),
-                trim_cache_on_init=False,
-                rate_cap_hz=0,
-            )
-            try:
-                with mock.patch.object(gh, "get_client",
-                                        return_value=client):
-                    p1 = cli.fetch_issue_provenance("o/r", 42)
-                    p2 = cli.fetch_issue_provenance("o/r", 42)
-            finally:
-                client.close()
-
-        # First call had no If-None-Match (cold cache); second sent
-        # the stored etag.
-        self.assertEqual(seen_if_none_match, [None, '"prov-v1"'])
-        # Both calls must return semantically identical results; the
-        # 304-served second response uses the cached body.
-        self.assertEqual(p1.author_login, p2.author_login)
-        self.assertEqual(p1.author_association, p2.author_association)
-        self.assertEqual([c.comment_id for c in p1.comments],
-                         [c.comment_id for c in p2.comments])
+                "comments": {"nodes": [],
+                              "pageInfo": {"hasNextPage": False,
+                                            "endCursor": None}},
+            },
+            "i1": {
+                "author": {"login": "bob"},
+                "authorAssociation": "MEMBER",
+                "comments": {"nodes": [],
+                              "pageInfo": {"hasNextPage": False,
+                                            "endCursor": None}},
+            },
+            "i2": {
+                "author": {"login": "carol"},
+                "authorAssociation": "COLLABORATOR",
+                "comments": {"nodes": [],
+                              "pageInfo": {"hasNextPage": False,
+                                            "endCursor": None}},
+            },
+        }}}
+        with patch_client(routes={
+            ("POST", "/graphql"): fake_response(200, body=body),
+        }) as client:
+            got = cli.fetch_issue_provenances("o/r", [10, 20, 30])
+        graphql_calls = [c for c in client.calls
+                          if c["method"] == "POST"
+                          and c["path"] == "/graphql"]
+        self.assertEqual(len(graphql_calls), 1)
+        self.assertEqual(set(got.keys()), {10, 20, 30})
+        self.assertEqual(got[10].author_login, "alice")
+        self.assertEqual(got[20].author_login, "bob")
+        self.assertEqual(got[30].author_login, "carol")
 
     def test_more_than_100_comments_falls_back_to_rest(self):
         # First page (GraphQL) has 100 comments AND hasNextPage=True.
