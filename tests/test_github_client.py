@@ -565,5 +565,139 @@ class CacheTrimTests(_Tmp):
         self.assertTrue((self.cache_dir / "b.json").exists())
 
 
+class LowWaterWarningTests(_Tmp):
+    """`_maybe_warn_quota_low` fires once per reset window when a bucket
+    dips below `_QUOTA_LOW_THRESHOLD`, and includes the top callers from
+    the rolling buffer (covering both `request()` and `gh_cli()` paths).
+    Suppressed when the reset is imminent so bursty callers near reset
+    don't get nagged."""
+
+    def _capture_stderr(self):
+        # Patch `sys.stderr.write` at the module level so writes from
+        # `_maybe_warn_quota_low` land in our list.
+        from pod import github as gh_mod
+        chunks: list[str] = []
+        return mock.patch.object(gh_mod.sys.stderr, "write",
+                                 side_effect=chunks.append), chunks
+
+    def test_warning_fires_once_per_reset_window(self):
+        reset = int(time.time()) + 1800  # 30 min away, well past time-gate
+
+        def h(req):
+            return _resp(200, json_body={},
+                         headers=_rl_headers(remaining=10, reset=reset))
+
+        c = _client(h, cache_dir=self.cache_dir, log_path=self.log_path)
+        try:
+            patcher, chunks = self._capture_stderr()
+            # Below `backpressure_threshold`=50, the layer would sleep
+            # for real between calls. Mute it so the test runs fast.
+            with patcher, mock.patch("pod.github.time.sleep"):
+                c.get("/a")
+                c.get("/b")
+                c.get("/c")
+            # Concatenate emitted stderr writes; should contain exactly
+            # one warning despite three low-bucket responses.
+            blob = "".join(chunks)
+            self.assertEqual(blob.count("pod: gh-quota: core bucket low"), 1,
+                             f"expected exactly one warning, got: {blob!r}")
+        finally:
+            c.close()
+
+    def test_warning_skipped_when_reset_is_imminent(self):
+        # Reset in 30 seconds — under the 120s time-gate.
+        reset = int(time.time()) + 30
+
+        def h(req):
+            return _resp(200, json_body={},
+                         headers=_rl_headers(remaining=5, reset=reset))
+
+        c = _client(h, cache_dir=self.cache_dir, log_path=self.log_path)
+        try:
+            patcher, chunks = self._capture_stderr()
+            with patcher:
+                c.get("/a")
+            self.assertEqual("".join(chunks), "",
+                             "warning should be suppressed near reset")
+        finally:
+            c.close()
+
+    def test_warning_lists_top_callers(self):
+        reset = int(time.time()) + 1800
+
+        def h(req):
+            return _resp(200, json_body={},
+                         headers=_rl_headers(remaining=50, reset=reset))
+
+        c = _client(h, cache_dir=self.cache_dir, log_path=self.log_path)
+        try:
+            # Seed the buffer with several "callers" by stuffing the
+            # deque directly — easier than constructing real stack
+            # frames per caller identity.
+            now = time.time()
+            with c._lock:
+                c._recent_calls.extend([
+                    (now, "cli.py:fetch_issues_and_prs:1", "core", "httpx"),
+                    (now, "cli.py:fetch_issues_and_prs:1", "core", "httpx"),
+                    (now, "cli.py:fetch_issues_and_prs:1", "core", "httpx"),
+                    (now, "cli.py:sync_claims:42", "core", "httpx"),
+                    (now, "cli.py:sync_claims:42", "core", "httpx"),
+                    (now, "cli.py:create_pr:99", "core", "gh"),
+                ])
+            patcher, chunks = self._capture_stderr()
+            # Remaining=50 is below backpressure_threshold=50 — the
+            # second call would block on a real sleep without this mute.
+            with patcher, mock.patch("pod.github.time.sleep"):
+                c.get("/trigger-warning")  # forces _maybe_warn_quota_low
+            blob = "".join(chunks)
+            self.assertIn("recent callers", blob)
+            self.assertIn("fetch_issues_and_prs", blob)
+            # gh_cli entries are tagged so the user knows they are
+            # subprocess-shape, not direct HTTP.
+            self.assertIn("(gh-cli)", blob)
+        finally:
+            c.close()
+
+    def test_gh_cli_path_records_in_buffer(self):
+        # `gh_cli` shells out via subprocess — verify the call is logged
+        # into the rolling buffer so the warning surfaces PR-heavy
+        # workflows that don't go through `request()`.
+        def h(req):
+            return _resp(200, json_body={}, headers=_rl_headers())
+
+        c = _client(h, cache_dir=self.cache_dir, log_path=self.log_path)
+        try:
+            with mock.patch("pod.github.subprocess.run") as run:
+                run.return_value = mock.Mock(returncode=0, stdout="", stderr="")
+                c.gh_cli("pr", "view", "42")
+            self.assertEqual(len(c._recent_calls), 1)
+            ts, caller, bucket, transport = c._recent_calls[0]
+            self.assertEqual(bucket, "core")
+            self.assertEqual(transport, "gh")
+        finally:
+            c.close()
+
+    def test_low_water_buckets_clears_after_reset(self):
+        reset_soon = int(time.time()) + 300  # 5 min away, past time-gate
+
+        def h(req):
+            return _resp(200, json_body={},
+                         headers=_rl_headers(remaining=10, reset=reset_soon))
+
+        c = _client(h, cache_dir=self.cache_dir, log_path=self.log_path)
+        try:
+            patcher, _ = self._capture_stderr()
+            with patcher, mock.patch("pod.github.time.sleep"):
+                c.get("/x")
+            # Bucket is in the low state.
+            self.assertEqual(c.low_water_buckets(), {"core"})
+            # Manually age out the warn state.
+            with c._lock:
+                c._quota_warn_state["core"] = time.time() - 10
+            self.assertEqual(c.low_water_buckets(), set())
+        finally:
+            c.close()
+
+
 if __name__ == "__main__":
     unittest.main()

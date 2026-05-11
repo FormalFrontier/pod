@@ -24,6 +24,7 @@ import datetime
 import hashlib
 import inspect
 import json
+import collections
 import os
 import re
 import subprocess
@@ -400,8 +401,15 @@ class GitHubClient:
         self._backpressure_threshold = backpressure_threshold
         # Per-reset-window dedupe for the low-water quota warning emitted
         # by `_record_rate`. Keyed by bucket → the reset_at of the window
-        # for which a warning has already been printed.
+        # for which a warning has already been printed. Survives until the
+        # reset_at passes, at which point `low_water_buckets()` stops
+        # reporting the bucket as low.
         self._quota_warn_state: dict[str, float] = {}
+        # Rolling buffer of recent calls, time-pruned on read, count-capped
+        # on write. Used by the low-water warning to embed the top callers
+        # in the last few minutes inline. Both `request()` and `gh_cli()`
+        # append here; transport disambiguates them in summaries.
+        self._recent_calls: collections.deque = collections.deque(maxlen=5000)
 
         self._client = httpx.Client(
             base_url=f"https://api.{host}",
@@ -467,22 +475,66 @@ class GitHubClient:
     # backpressure threshold so the warning fires before the layer starts
     # sleeping.
     _QUOTA_LOW_THRESHOLD = 100
+    # Skip the warning when the bucket is near reset anyway — a bursty
+    # caller hitting 99 remaining with 30s on the clock doesn't need a
+    # stderr nag every reset window.
+    _QUOTA_WARN_MIN_SECS_TO_RESET = 120
+    # Window over which we summarise recent callers in the warning. Tied
+    # to `_recent_calls` capacity (5000 entries) — at the per-process
+    # rate cap of 50/s, this is well over 1 minute of full saturation,
+    # which is plenty for "what caused the drop" diagnosis.
+    _QUOTA_WARN_CALLER_WINDOW_S = 300.0
+
+    def _remember_call(self, ts: float, caller: str, bucket: str,
+                       transport: str) -> None:
+        """Record an attempted call in the rolling buffer used by the
+        low-water warning. Called from both `request()` (before the
+        network round-trip, so attempts that error out still register)
+        and `gh_cli()`. Safe under `self._lock`."""
+        with self._lock:
+            self._recent_calls.append((ts, caller, bucket, transport))
 
     def _maybe_warn_quota_low(self, snap: RateSnapshot) -> None:
         if not snap.limit or snap.remaining >= self._QUOTA_LOW_THRESHOLD:
             return
+        secs_to_reset = max(0, int(snap.reset_at - time.time()))
+        if secs_to_reset < self._QUOTA_WARN_MIN_SECS_TO_RESET:
+            # Bucket will refill before any reasonable mitigation could
+            # take effect; don't bother the user.
+            return
+        cutoff = time.time() - self._QUOTA_WARN_CALLER_WINDOW_S
         with self._lock:
             last = self._quota_warn_state.get(snap.bucket, 0.0)
             if last == snap.reset_at:
                 return
             self._quota_warn_state[snap.bucket] = snap.reset_at
+            recent = [(c, t) for (ts, c, b, t) in self._recent_calls
+                      if ts >= cutoff and b == snap.bucket]
+        counts: collections.Counter = collections.Counter(
+            (c, t) for (c, t) in recent)
+        top = counts.most_common(3)
         reset_iso = _iso_at(snap.reset_at) or "unknown"
-        secs_to_reset = max(0, int(snap.reset_at - time.time()))
-        sys.stderr.write(
-            f"pod: gh-quota: {snap.bucket} bucket low: "
-            f"{snap.remaining}/{snap.limit} remaining, "
-            f"resets at {reset_iso} (~{secs_to_reset}s); "
-            f"run `pod gh-stats` to see which callers are burning quota.\n")
+        msg = (f"pod: gh-quota: {snap.bucket} bucket low: "
+               f"{snap.remaining}/{snap.limit} remaining, "
+               f"resets at {reset_iso} (~{secs_to_reset}s)")
+        if top:
+            parts = []
+            for (caller, transport), n in top:
+                suffix = " (gh-cli)" if transport == "gh" else ""
+                parts.append(f"{caller}{suffix} ×{n}")
+            msg += "; recent callers: " + ", ".join(parts)
+        msg += "; run `pod gh-stats` for full breakdown.\n"
+        sys.stderr.write(msg)
+
+    def low_water_buckets(self) -> set[str]:
+        """Names of buckets that have crossed the low-water threshold and
+        whose reset window has not yet passed. Used by the TUI header to
+        show a `graphql:!` / `core:!` indicator while quota is depleted —
+        keeps the warning visible even when curses overwrites stderr."""
+        now = time.time()
+        with self._lock:
+            return {b for b, ra in self._quota_warn_state.items()
+                    if ra > now}
 
     def _backpressure(self, bucket: str) -> None:
         """Sleep before the next call if the bucket is near exhaustion or
@@ -606,6 +658,10 @@ class GitHubClient:
 
         caller = _caller or self._caller()
         t0 = time.time()
+        # Record the attempt now so a network exception that aborts the
+        # request still shows up in the recent-callers buffer used by
+        # `_maybe_warn_quota_low`.
+        self._remember_call(t0, caller, bucket, "httpx")
         try:
             resp = self._client.request(
                 method, url, params=params, json=json,
@@ -766,6 +822,11 @@ class GitHubClient:
         if isinstance(input, bytes):
             text = False
         t0 = time.time()
+        # `gh_cli` burns the core bucket just like a direct HTTP call.
+        # Record it so PR-heavy workflows that lean on `gh pr ...` show up
+        # in the recent-callers summary instead of silently misattributing
+        # the bucket drain to the few HTTP calls in the window.
+        self._remember_call(t0, caller, "core", "gh")
         try:
             r = subprocess.run(
                 ["gh", *argv],
