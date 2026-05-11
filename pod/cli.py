@@ -46,6 +46,22 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
+from pod import github as gh
+
+
+def _gh_cli(*argv: str, timeout: float = 60,
+            input: bytes | str | None = None,
+            text: bool = True,
+            check: bool = False) -> subprocess.CompletedProcess:
+    """Run a `gh` porcelain subprocess through the layer.
+
+    Returns a `subprocess.CompletedProcess` so call sites keep the
+    `r.returncode` / `r.stdout` / `r.stderr` shape. Direct GitHub API
+    reads should use `gh.get_client().get(...)` instead, to take
+    advantage of ETag conditional requests."""
+    return gh.get_client().gh_cli(*argv, timeout=timeout, input=input,
+                                   text=text, check=check)
+
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
@@ -1662,15 +1678,18 @@ def _gh_rate_limit_wait() -> int:
     Returns 0 on error or if remaining >= 100.
     """
     try:
-        r = subprocess.run(
-            ["gh", "api", "rate_limit", "--jq",
-             '.resources.graphql | if .remaining < 100 then (.reset - now | ceil) else 0 end'],
-            capture_output=True, text=True, timeout=10, cwd=str(PROJECT_DIR))
-        if r.returncode == 0:
-            return max(0, int(float(r.stdout.strip())))
+        resp = gh.get_client().get("/rate_limit")
+        if not resp.ok():
+            return 0
+        body = resp.body() or {}
+        graphql = (body.get("resources", {}) or {}).get("graphql", {}) or {}
+        remaining = int(graphql.get("remaining", 0))
+        if remaining >= 100:
+            return 0
+        reset = int(graphql.get("reset", 0))
+        return max(0, reset - int(time.time()))
     except Exception:
-        pass
-    return 0
+        return 0
 
 
 def _clear_gh_cache():
@@ -1754,11 +1773,8 @@ def fetch_issues_and_prs() -> list[GHItem]:
     # All open issues (there should never be thousands of open ones)
     for label in ("agent-plan", "human-oversight"):
         try:
-            r = subprocess.run(
-                ["gh", "issue", "list", "--label", label, "--state", "open",
-                 "--limit", "500", issue_json],
-                capture_output=True, text=True, timeout=30, cwd=cwd,
-            )
+            r = _gh_cli("issue", "list", "--label", label, "--state", "open",
+                        "--limit", "500", issue_json, timeout=30)
             if r.returncode == 0:
                 for iss in json.loads(r.stdout):
                     if iss["number"] in seen_open:
@@ -1776,11 +1792,8 @@ def fetch_issues_and_prs() -> list[GHItem]:
     seen_closed: set[int] = set()
     for label in ("agent-plan", "human-oversight"):
         try:
-            r = subprocess.run(
-                ["gh", "issue", "list", "--label", label, "--state", "closed",
-                 "--limit", "30", issue_json],
-                capture_output=True, text=True, timeout=30, cwd=cwd,
-            )
+            r = _gh_cli("issue", "list", "--label", label, "--state", "closed",
+                        "--limit", "30", issue_json, timeout=30)
             if r.returncode == 0:
                 for iss in json.loads(r.stdout):
                     if iss["number"] in seen_closed or iss["number"] in seen_open:
@@ -1797,10 +1810,10 @@ def fetch_issues_and_prs() -> list[GHItem]:
 
     # PRs (open + recently closed/merged)
     try:
-        r = subprocess.run(
-            ["gh", "pr", "list", "--state", "all", "--limit", "15",
-             "--json", "number,title,labels,statusCheckRollup,state,createdAt,updatedAt,closedAt,mergedAt"],
-            capture_output=True, text=True, timeout=30, cwd=cwd,
+        r = _gh_cli(
+            "pr", "list", "--state", "all", "--limit", "15",
+            "--json", "number,title,labels,statusCheckRollup,state,createdAt,updatedAt,closedAt,mergedAt",
+            timeout=30,
         )
         if r.returncode == 0:
             for pr in json.loads(r.stdout):
@@ -1839,12 +1852,11 @@ def fetch_blocked_deps() -> dict[int, list[int]]:
     `[Blocked on #N]` annotations consistently.
     """
     import re as _re
-    cwd = str(PROJECT_DIR)
     try:
-        r = subprocess.run(
-            ["gh", "issue", "list", "--label", "blocked",
-             "--state", "open", "--limit", "40", "--json", "number,body"],
-            capture_output=True, text=True, timeout=30, cwd=cwd,
+        r = _gh_cli(
+            "issue", "list", "--label", "blocked",
+            "--state", "open", "--limit", "40", "--json", "number,body",
+            timeout=30,
         )
         if r.returncode != 0:
             return {}
@@ -1858,10 +1870,10 @@ def fetch_blocked_deps() -> dict[int, list[int]]:
             return {}
 
         # Fetch open issue numbers to filter out closed deps
-        r2 = subprocess.run(
-            ["gh", "issue", "list", "--state", "open", "--limit", "100",
-             "--json", "number", "--jq", "[.[].number]"],
-            capture_output=True, text=True, timeout=30, cwd=cwd,
+        r2 = _gh_cli(
+            "issue", "list", "--state", "open", "--limit", "100",
+            "--json", "number", "--jq", "[.[].number]",
+            timeout=30,
         )
         open_nums: set[int] = set(json.loads(r2.stdout)) if r2.returncode == 0 else set()
 
@@ -1889,12 +1901,11 @@ def fetch_has_pr_links() -> dict[int, list[int]]:
     out closed/merged ones. Has-pr issues are typically few (≤ 10),
     so the N+1 cost is bounded.
     """
-    cwd = str(PROJECT_DIR)
     try:
-        r = subprocess.run(
-            ["gh", "issue", "list", "--label", "has-pr",
-             "--state", "open", "--limit", "40", "--json", "number"],
-            capture_output=True, text=True, timeout=30, cwd=cwd,
+        r = _gh_cli(
+            "issue", "list", "--label", "has-pr",
+            "--state", "open", "--limit", "40", "--json", "number",
+            timeout=30,
         )
         if r.returncode != 0:
             return {}
@@ -1905,11 +1916,11 @@ def fetch_has_pr_links() -> dict[int, list[int]]:
 
         result: dict[int, list[int]] = {}
         for num in issue_nums:
-            r2 = subprocess.run(
-                ["gh", "issue", "view", str(num),
-                 "--json", "closedByPullRequestsReferences",
-                 "--jq", "[.closedByPullRequestsReferences[].number]"],
-                capture_output=True, text=True, timeout=15, cwd=cwd,
+            r2 = _gh_cli(
+                "issue", "view", str(num),
+                "--json", "closedByPullRequestsReferences",
+                "--jq", "[.closedByPullRequestsReferences[].number]",
+                timeout=15,
             )
             if r2.returncode != 0:
                 result[num] = []
@@ -1922,10 +1933,10 @@ def fetch_has_pr_links() -> dict[int, list[int]]:
 
             open_prs: list[int] = []
             for pr_num in refs:
-                r3 = subprocess.run(
-                    ["gh", "pr", "view", str(pr_num),
-                     "--json", "state", "--jq", ".state"],
-                    capture_output=True, text=True, timeout=15, cwd=cwd,
+                r3 = _gh_cli(
+                    "pr", "view", str(pr_num),
+                    "--json", "state", "--jq", ".state",
+                    timeout=15,
                 )
                 if r3.returncode == 0 and r3.stdout.strip() == "OPEN":
                     open_prs.append(pr_num)
@@ -2209,14 +2220,15 @@ def _gh_quota_ok() -> bool:
         rem = _gh_quota_cache["graphql_remaining"]
         return rem is None or rem >= _GH_QUOTA_PAUSE_THRESHOLD
     try:
-        r = subprocess.run(
-            ["gh", "api", "rate_limit", "--jq", ".resources.graphql.remaining"],
-            capture_output=True, text=True, timeout=10,
-        )
-        if r.returncode == 0 and r.stdout.strip():
-            _gh_quota_cache["graphql_remaining"] = int(r.stdout.strip())
-            _gh_quota_cache["checked_at"] = now
-    except (subprocess.TimeoutExpired, OSError, ValueError):
+        resp = gh.get_client().get("/rate_limit", timeout=10)
+        if resp.ok():
+            graphql = ((resp.body() or {}).get("resources", {}) or {}
+                       ).get("graphql", {}) or {}
+            remaining = graphql.get("remaining")
+            if remaining is not None:
+                _gh_quota_cache["graphql_remaining"] = int(remaining)
+                _gh_quota_cache["checked_at"] = now
+    except Exception:
         pass  # keep previous reading (if any); treat unknown as OK
     rem = _gh_quota_cache["graphql_remaining"]
     return rem is None or rem >= _GH_QUOTA_PAUSE_THRESHOLD
@@ -2537,16 +2549,15 @@ def _get_base_branch() -> str:
     global _cached_base_branch
     if _cached_base_branch:
         return _cached_base_branch
-    # REST (`gh api repos/{slug}`) instead of `gh repo view --json` so this
-    # doesn't burn GraphQL quota on every cache miss.
+    # Direct REST via the access layer (ETag-cached after the first hit),
+    # so this doesn't burn GraphQL quota and steady-state cost is a 304.
     try:
-        r = subprocess.run(
-            ["gh", "api", f"repos/{_get_repo()}", "--jq", ".default_branch"],
-            capture_output=True, text=True, timeout=15, cwd=str(PROJECT_DIR),
-        )
-        if r.returncode == 0 and r.stdout.strip():
-            _cached_base_branch = r.stdout.strip()
-            return _cached_base_branch
+        resp = gh.get_client().get(f"/repos/{_get_repo()}", timeout=15)
+        if resp.ok():
+            db = ((resp.body() or {}).get("default_branch") or "").strip()
+            if db:
+                _cached_base_branch = db
+                return _cached_base_branch
     except Exception:
         pass
     return "master"
@@ -2576,13 +2587,12 @@ def _get_repo() -> str:
             return _cached_repo_name
     except Exception:
         pass
-    # Fallback: ask gh (REST). Only reached when the remote isn't a parseable
-    # GitHub URL — e.g. a non-default remote name or a deploy-key URL.
+    # Fallback: ask gh porcelain. Only reached when the remote isn't a
+    # parseable GitHub URL — e.g. a non-default remote name or a deploy-key
+    # URL. Routed through the layer so it's still logged.
     try:
-        r = subprocess.run(
-            ["gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"],
-            capture_output=True, text=True, timeout=15, cwd=str(PROJECT_DIR),
-        )
+        r = _gh_cli("repo", "view", "--json", "nameWithOwner",
+                    "-q", ".nameWithOwner", timeout=15)
         if r.returncode == 0 and r.stdout.strip():
             _cached_repo_name = r.stdout.strip()
             return _cached_repo_name
@@ -2800,10 +2810,7 @@ def check_repo_security(config: dict) -> None:
         return
 
     try:
-        r = subprocess.run(
-            ["gh", "api", f"repos/{slug}", "--jq", ".visibility"],
-            capture_output=True, text=True, timeout=15, cwd=str(PROJECT_DIR),
-        )
+        resp = gh.get_client().get(f"/repos/{slug}", timeout=15)
     except FileNotFoundError:
         print("pod: security: `gh` CLI not found; cannot verify interaction limits.",
               file=sys.stderr)
@@ -2811,14 +2818,19 @@ def check_repo_security(config: dict) -> None:
     except Exception as e:
         print(f"pod: security: failed to query repo: {e}", file=sys.stderr)
         sys.exit(1)
-    if r.returncode != 0 or not r.stdout.strip():
-        err = r.stderr.strip() or "empty response"
-        print(f"pod: security: cannot determine repo visibility: {err}", file=sys.stderr)
-        if "auth" in err.lower() or "login" in err.lower() or "401" in err:
+    if not resp.ok():
+        err = f"HTTP {resp.status}"
+        print(f"pod: security: cannot determine repo visibility: {err}",
+              file=sys.stderr)
+        if resp.status in (401, 403):
             print("    → run `gh auth status` / `gh auth login` and retry.",
                   file=sys.stderr)
         sys.exit(1)
-    visibility = r.stdout.strip().lower()
+    visibility = ((resp.body() or {}).get("visibility") or "").lower()
+    if not visibility:
+        print("pod: security: cannot determine repo visibility: empty response",
+              file=sys.stderr)
+        sys.exit(1)
 
     if visibility != "public":
         _save_security_cache(slug, visibility=visibility)
@@ -2826,24 +2838,17 @@ def check_repo_security(config: dict) -> None:
         return
 
     try:
-        r = subprocess.run(
-            ["gh", "api", f"repos/{slug}/interaction-limits"],
-            capture_output=True, text=True, timeout=15,
-        )
+        resp = gh.get_client().get(f"/repos/{slug}/interaction-limits",
+                                    timeout=15)
     except Exception as e:
         _security_fail(slug, f"failed to query interaction-limits: {e}")
-    if r.returncode != 0:
-        err = r.stderr.strip() or "gh api error"
-        is_auth = ("auth" in err.lower() or "login" in err.lower()
-                   or "401" in err or "403" in err)
+    if not resp.ok():
+        err = f"HTTP {resp.status}"
+        is_auth = resp.status in (401, 403)
         _security_fail(slug, f"failed to query interaction-limits: {err}",
                        auth_hint=is_auth)
 
-    body = r.stdout.strip() or "{}"
-    try:
-        data = json.loads(body)
-    except json.JSONDecodeError as e:
-        _security_fail(slug, f"unparseable interaction-limits response: {e}")
+    data = resp.body() or {}
 
     if not data:
         _security_fail(slug,
@@ -2915,56 +2920,47 @@ def _provenance_ttl(config: dict) -> float:
 
 
 def _is_repo_public(config: dict) -> bool:
-    """Return True iff the current repo is public. Uses the REST endpoint
-    (`gh api repos/{slug}`) to avoid GraphQL quota. Fails closed by
-    treating ambiguous results as public so the security gate still runs.
+    """Return True iff the current repo is public. Routed through the
+    layer (ETag-cached); fails closed by treating ambiguous results as
+    public so the security gate still runs.
     """
     try:
-        r = subprocess.run(
-            ["gh", "api", f"repos/{_get_repo()}", "--jq", ".visibility"],
-            capture_output=True, text=True, timeout=15, cwd=str(PROJECT_DIR),
-        )
+        resp = gh.get_client().get(f"/repos/{_get_repo()}", timeout=15)
     except Exception:
         return True  # fail-closed: treat as public so we still check
-    if r.returncode != 0 or not r.stdout.strip():
+    if not resp.ok():
         return True
-    return r.stdout.strip().lower() == "public"
+    visibility = ((resp.body() or {}).get("visibility") or "").lower()
+    if not visibility:
+        return True
+    return visibility == "public"
 
 
 def fetch_issue_provenance(repo: str, issue_num: int) -> _IssueProvenance:
     """Fetch the issue + its comments and bundle author/association data.
 
-    Two `gh api` calls per issue: one for the issue, one paginated for
-    comments. Raises subprocess.CalledProcessError on `gh` failure so
-    callers can surface a clear error.
+    Two layer-routed reads per issue: one for the issue, one paginated
+    for comments. ETag-cached, so steady-state cost is two 304s per
+    repeat. Raises RuntimeError on layer failure so callers can surface
+    a clear error.
     """
-    issue_r = subprocess.run(
-        ["gh", "api", f"repos/{repo}/issues/{issue_num}"],
-        capture_output=True, text=True, timeout=30, check=True,
-    )
-    issue = json.loads(issue_r.stdout)
-    comments_r = subprocess.run(
-        ["gh", "api", "--paginate", f"repos/{repo}/issues/{issue_num}/comments"],
-        capture_output=True, text=True, timeout=60, check=True,
-    )
-    # `gh api --paginate` concatenates JSON arrays; parse each line that's
-    # an array, falling back to a single document on no pagination.
+    client = gh.get_client()
+    issue_resp = client.get(f"/repos/{repo}/issues/{issue_num}", timeout=30)
+    if not issue_resp.ok():
+        raise RuntimeError(
+            f"failed to fetch issue {repo}#{issue_num}: HTTP {issue_resp.status}")
+    issue = issue_resp.body() or {}
+
     comments_raw: list = []
-    body = comments_r.stdout.strip()
-    if body:
-        # `gh` emits one or more arrays back-to-back (no separator).
-        # JSONDecoder.raw_decode handles that.
-        decoder = json.JSONDecoder()
-        idx = 0
-        while idx < len(body):
-            while idx < len(body) and body[idx].isspace():
-                idx += 1
-            if idx >= len(body):
-                break
-            obj, end = decoder.raw_decode(body, idx)
-            if isinstance(obj, list):
-                comments_raw.extend(obj)
-            idx = end
+    for page in client.paginate(f"/repos/{repo}/issues/{issue_num}/comments",
+                                 max_pages=10):
+        if not page.ok():
+            raise RuntimeError(
+                f"failed to page comments for {repo}#{issue_num}: "
+                f"HTTP {page.status}")
+        body = page.body() or []
+        if isinstance(body, list):
+            comments_raw.extend(body)
     comments = [
         _ProvenanceComment(
             comment_id=int(c.get("id", 0)),
@@ -3036,9 +3032,8 @@ def check_issue_provenance(repo: str, issue_num: int, config: dict,
         return True, ""
     try:
         prov = _cached_provenance(repo, issue_num, config, fresh=fresh)
-    except subprocess.CalledProcessError as e:
-        err = (e.stderr or "").strip() or "gh api error"
-        return False, f"failed to fetch provenance for #{issue_num}: {err}"
+    except RuntimeError as e:
+        return False, f"failed to fetch provenance for #{issue_num}: {e}"
     except (json.JSONDecodeError, ValueError) as e:
         return False, f"unparseable provenance response for #{issue_num}: {e}"
     return is_trusted(prov, config)
@@ -3071,19 +3066,19 @@ def cmd_filter_trusted_issues(config: dict, args) -> None:
     section, and directly by `plan.md` to replace inline `gh issue list`.
     """
     repo = _get_repo()
-    cmd = ["gh", "issue", "list", "--repo", repo]
+    argv: list[str] = ["issue", "list", "--repo", repo]
     for label in (args.label or []):
-        cmd += ["--label", label]
+        argv += ["--label", label]
     if args.state:
-        cmd += ["--state", args.state]
+        argv += ["--state", args.state]
     if args.limit:
-        cmd += ["--limit", str(args.limit)]
+        argv += ["--limit", str(args.limit)]
     # Always include the fields needed to filter, plus whatever the
     # caller asked for.
     requested = set((args.json or "number,title").split(","))
     requested |= {"number"}
-    cmd += ["--json", ",".join(sorted(requested))]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    argv += ["--json", ",".join(sorted(requested))]
+    r = _gh_cli(*argv, timeout=60)
     if r.returncode != 0:
         print(f"pod: gh issue list failed: {r.stderr.strip()}", file=sys.stderr)
         sys.exit(1)
@@ -3146,27 +3141,25 @@ def _release_claim(issue_str: str, session_uuid: str, restart_count: int) -> boo
     import re as _re
     repo = _get_repo()
 
-    # Idempotent fast path: REST probe (separate quota bucket from GraphQL).
+    client = gh.get_client()
+
+    # Idempotent fast path: REST probe via the layer (ETag-cached).
     # Catches the common stale-history case where the label was already
     # removed (by another reconciler, by hand, or by us on a previous run
     # whose history write was lost). Also handles closed issues.
     try:
-        r_probe = subprocess.run(
-            ["gh", "api", f"repos/{repo}/issues/{issue_str}",
-             "--jq", '{state, labels: [.labels[].name]}'],
-            capture_output=True, text=True, timeout=30, cwd=str(PROJECT_DIR),
-        )
-    except (subprocess.TimeoutExpired, OSError) as e:
+        r_probe = client.get(f"/repos/{repo}/issues/{issue_str}", timeout=30)
+    except Exception as e:
         log(f"_release_claim: probe failed for #{issue_str}: {e}; falling through")
         r_probe = None
     if r_probe is not None:
-        if _is_rate_limit_error(r_probe):
+        if r_probe.status == 403:
             raise _GraphQLRateLimited(f"REST probe rate-limited for #{issue_str}")
-        if r_probe.returncode == 0 and r_probe.stdout.strip():
+        if r_probe.ok():
             try:
-                probe = json.loads(r_probe.stdout)
+                probe = r_probe.body() or {}
                 state = probe.get("state", "")
-                labels = probe.get("labels", []) or []
+                labels = [l.get("name", "") for l in probe.get("labels", []) or []]
                 if "claimed" not in labels:
                     log(f"_release_claim: #{issue_str} already lacks 'claimed' label "
                         f"(state={state}); treating as released")
@@ -3175,18 +3168,17 @@ def _release_claim(issue_str: str, session_uuid: str, restart_count: int) -> boo
                     log(f"_release_claim: #{issue_str} is closed; leaving stale 'claimed' "
                         f"label in place (terminal success)")
                     return True
-            except (json.JSONDecodeError, ValueError) as e:
+            except (TypeError, ValueError) as e:
                 log(f"_release_claim: probe parse failed for #{issue_str}: {e}; falling through")
 
-    # GitHub-side CAS: verify latest claim comment is ours. This call is
-    # GraphQL-backed; the REST probe above ensures we only reach it when
-    # there's actual work to do.
+    # GitHub-side CAS: verify latest claim comment is ours. The REST
+    # probe above ensures we only reach this when there's real work.
     try:
-        r_cas = subprocess.run(
-            ["gh", "issue", "view", issue_str, "--repo", repo,
-             "--json", "comments",
-             "--jq", '[.comments[] | select(.body | startswith("Claimed by session"))] | sort_by(.createdAt) | last | .body'],
-            capture_output=True, text=True, timeout=60, cwd=str(PROJECT_DIR),
+        r_cas = _gh_cli(
+            "issue", "view", issue_str, "--repo", repo,
+            "--json", "comments",
+            "--jq", '[.comments[] | select(.body | startswith("Claimed by session"))] | sort_by(.createdAt) | last | .body',
+            timeout=60,
         )
     except (subprocess.TimeoutExpired, OSError) as e:
         log(f"Failed to release claim on #{issue_str}: CAS subprocess error: {e}")
@@ -3200,9 +3192,10 @@ def _release_claim(issue_str: str, session_uuid: str, restart_count: int) -> boo
             return False
 
     try:
-        r1 = subprocess.run(
-            ["gh", "issue", "edit", issue_str, "--repo", repo, "--remove-label", "claimed"],
-            capture_output=True, timeout=30, cwd=str(PROJECT_DIR),
+        r1 = _gh_cli(
+            "issue", "edit", issue_str, "--repo", repo,
+            "--remove-label", "claimed",
+            timeout=30,
         )
     except (subprocess.TimeoutExpired, OSError) as e:
         log(f"Failed to release claim on #{issue_str}: edit subprocess error: {e}")
@@ -3210,14 +3203,14 @@ def _release_claim(issue_str: str, session_uuid: str, restart_count: int) -> boo
     if _is_rate_limit_error(r1):
         raise _GraphQLRateLimited(f"edit rate-limited for #{issue_str}")
     if r1.returncode != 0:
-        log(f"Failed to remove claimed label on #{issue_str}: {r1.stderr.decode().strip()}")
+        log(f"Failed to remove claimed label on #{issue_str}: {r1.stderr.strip()}")
         return False
     msg = (f"Claim released — worker session `{session_uuid}` died after "
            f"{restart_count} restart attempt(s). Available for reclaim.")
     try:
-        r2 = subprocess.run(
-            ["gh", "issue", "comment", issue_str, "--repo", repo, "--body", msg],
-            capture_output=True, timeout=30, cwd=str(PROJECT_DIR),
+        r2 = _gh_cli(
+            "issue", "comment", issue_str, "--repo", repo,
+            "--body", msg, timeout=30,
         )
     except (subprocess.TimeoutExpired, OSError) as e:
         log(f"Failed to comment on #{issue_str}: {e}")
@@ -3225,7 +3218,7 @@ def _release_claim(issue_str: str, session_uuid: str, restart_count: int) -> boo
     if _is_rate_limit_error(r2):
         raise _GraphQLRateLimited(f"comment rate-limited for #{issue_str}")
     if r2.returncode != 0:
-        log(f"Failed to comment on #{issue_str}: {r2.stderr.decode().strip()}")
+        log(f"Failed to comment on #{issue_str}: {r2.stderr.strip()}")
         return False
     log(f"Released claim on #{issue_str}")
     return True
@@ -3237,13 +3230,12 @@ def sync_claims_from_github():
     that were running before a pod restart."""
     import re as _re
     repo = _get_repo()
-    cwd = str(PROJECT_DIR)
 
     try:
-        r = subprocess.run(
-            ["gh", "issue", "list", "--label", "agent-plan", "--label", "claimed",
-             "--state", "open", "--limit", "100", "--json", "number"],
-            capture_output=True, text=True, timeout=30, cwd=cwd,
+        r = _gh_cli(
+            "issue", "list", "--label", "agent-plan", "--label", "claimed",
+            "--state", "open", "--limit", "100", "--json", "number",
+            timeout=30,
         )
         if r.returncode != 0:
             return
@@ -3263,11 +3255,11 @@ def sync_claims_from_github():
                 continue  # Already tracked locally
             # Fetch comments to find the most recent claim comment
             try:
-                r = subprocess.run(
-                    ["gh", "issue", "view", str(issue_num), "--repo", repo,
-                     "--json", "comments",
-                     "--jq", '[.comments[] | select(.body | startswith("Claimed by session"))] | sort_by(.createdAt) | last | .body'],
-                    capture_output=True, text=True, timeout=60, cwd=cwd,
+                r = _gh_cli(
+                    "issue", "view", str(issue_num), "--repo", repo,
+                    "--json", "comments",
+                    "--jq", '[.comments[] | select(.body | startswith("Claimed by session"))] | sort_by(.createdAt) | last | .body',
+                    timeout=60,
                 )
                 if r.returncode != 0:
                     continue
@@ -3427,15 +3419,14 @@ def reconcile_untracked_github_claims():
     import re as _re
 
     repo = _get_repo()
-    cwd = str(PROJECT_DIR)
     grace_seconds = 600  # 10 minutes — don't release very fresh claims
 
     # 1. Query GitHub for all currently-claimed issues
     try:
-        r = subprocess.run(
-            ["gh", "issue", "list", "--label", "agent-plan", "--label", "claimed",
-             "--state", "open", "--limit", "100", "--json", "number"],
-            capture_output=True, text=True, timeout=30, cwd=cwd,
+        r = _gh_cli(
+            "issue", "list", "--label", "agent-plan", "--label", "claimed",
+            "--state", "open", "--limit", "100", "--json", "number",
+            timeout=30,
         )
         if _is_rate_limit_error(r):
             log("reconcile_untracked_github_claims: aborting — GraphQL rate-limited "
@@ -3479,11 +3470,11 @@ def reconcile_untracked_github_claims():
         for issue_num in sorted(untracked):
             # Fetch the latest "Claimed by session" comment for this issue
             try:
-                r = subprocess.run(
-                    ["gh", "issue", "view", str(issue_num), "--repo", repo,
-                     "--json", "comments",
-                     "--jq", '[.comments[] | select(.body | startswith("Claimed by session"))] | sort_by(.createdAt) | last | {body, created_at: .createdAt}'],
-                    capture_output=True, text=True, timeout=60, cwd=cwd,
+                r = _gh_cli(
+                    "issue", "view", str(issue_num), "--repo", repo,
+                    "--json", "comments",
+                    "--jq", '[.comments[] | select(.body | startswith("Claimed by session"))] | sort_by(.createdAt) | last | {body, created_at: .createdAt}',
+                    timeout=60,
                 )
                 if _is_rate_limit_error(r):
                     raise _GraphQLRateLimited(
@@ -3538,11 +3529,11 @@ def reconcile_untracked_github_claims():
 
             # Re-fetch latest claim owner before releasing (compare-and-swap)
             try:
-                r2 = subprocess.run(
-                    ["gh", "issue", "view", str(issue_num), "--repo", repo,
-                     "--json", "comments",
-                     "--jq", '[.comments[] | select(.body | startswith("Claimed by session"))] | sort_by(.createdAt) | last | .body'],
-                    capture_output=True, text=True, timeout=60, cwd=cwd,
+                r2 = _gh_cli(
+                    "issue", "view", str(issue_num), "--repo", repo,
+                    "--json", "comments",
+                    "--jq", '[.comments[] | select(.body | startswith("Claimed by session"))] | sort_by(.createdAt) | last | .body',
+                    timeout=60,
                 )
                 if _is_rate_limit_error(r2):
                     raise _GraphQLRateLimited(
@@ -3570,10 +3561,11 @@ def reconcile_untracked_github_claims():
             # Release the stale claim — first verify the label is still present
             # (prevents N parallel reconcilers from all posting release comments)
             try:
-                r_label_check = subprocess.run(
-                    ["gh", "issue", "view", str(issue_num), "--repo", repo,
-                     "--json", "labels", "--jq", '[.labels[].name] | any(. == "claimed")'],
-                    capture_output=True, text=True, timeout=30, cwd=cwd,
+                r_label_check = _gh_cli(
+                    "issue", "view", str(issue_num), "--repo", repo,
+                    "--json", "labels",
+                    "--jq", '[.labels[].name] | any(. == "claimed")',
+                    timeout=30,
                 )
                 if _is_rate_limit_error(r_label_check):
                     raise _GraphQLRateLimited(
@@ -3581,9 +3573,9 @@ def reconcile_untracked_github_claims():
                 if r_label_check.returncode != 0 or r_label_check.stdout.strip() != "true":
                     continue  # Label already removed by another reconciler
 
-                r3 = subprocess.run(
-                    ["gh", "issue", "edit", str(issue_num), "--repo", repo, "--remove-label", "claimed"],
-                    capture_output=True, timeout=30, cwd=cwd,
+                r3 = _gh_cli(
+                    "issue", "edit", str(issue_num), "--repo", repo,
+                    "--remove-label", "claimed", timeout=30,
                 )
                 if _is_rate_limit_error(r3):
                     raise _GraphQLRateLimited(
@@ -3593,9 +3585,9 @@ def reconcile_untracked_github_claims():
                 age_str = f"{int(age // 3600)}h{int((age % 3600) // 60)}m"
                 msg = (f"Stale claim released by reconciler — session `{owner_uuid}` "
                        f"is no longer running (claimed {age_str} ago). Available for reclaim.")
-                r_comment = subprocess.run(
-                    ["gh", "issue", "comment", str(issue_num), "--repo", repo, "--body", msg],
-                    capture_output=True, timeout=30, cwd=cwd,
+                r_comment = _gh_cli(
+                    "issue", "comment", str(issue_num), "--repo", repo,
+                    "--body", msg, timeout=30,
                 )
                 if _is_rate_limit_error(r_comment):
                     raise _GraphQLRateLimited(
@@ -3640,17 +3632,15 @@ def check_dead_pr_claimed_prs(config: dict):
     Fail-closed: any gh / parsing error on a specific PR skips it.
     """
     repo = _get_repo()
-    cwd = str(PROJECT_DIR)
     stuck_minutes = cfg_get(config, "repair", "stuck_ci_minutes", default=120)
     stale_seconds = int(stuck_minutes) * 60 * 2
 
     # 1. Find all open PRs carrying repair-claimed.
     try:
-        r = subprocess.run(
-            ["gh", "pr", "list", "--repo", repo, "--state", "open",
-             "--label", "repair-claimed", "--limit", "100",
-             "--json", "number"],
-            capture_output=True, text=True, timeout=30, cwd=cwd,
+        r = _gh_cli(
+            "pr", "list", "--repo", repo, "--state", "open",
+            "--label", "repair-claimed", "--limit", "100",
+            "--json", "number", timeout=30,
         )
         if _is_rate_limit_error(r):
             log("check_dead_pr_claimed_prs: aborting — GraphQL rate-limited "
@@ -3690,26 +3680,32 @@ def check_dead_pr_claimed_prs(config: dict):
                 #  - the comment is older than the grace window, AND
                 #  - its owner session is not live.
                 try:
-                    r = subprocess.run(
-                        ["gh", "api", "--paginate", f"repos/{repo}/issues/{pr_num}/comments",
-                         "--jq",
-                         '[.[] | select(.body | startswith("Claimed PR repair by session"))] '
-                         '| sort_by(.created_at) | last | {body, created_at}'],
-                        capture_output=True, text=True, timeout=30, cwd=cwd,
-                    )
-                    if _is_rate_limit_error(r):
-                        raise _GraphQLRateLimited(
-                            f"comment fetch rate-limited for PR #{pr_num}")
-                    if r.returncode != 0:
-                        continue
-                    blob = r.stdout.strip()
-                    if not blob or blob == "null":
+                    client = gh.get_client()
+                    latest: dict | None = None
+                    for page in client.paginate(
+                            f"/repos/{repo}/issues/{pr_num}/comments",
+                            max_pages=10):
+                        if not page.ok():
+                            if page.status == 403:
+                                raise _GraphQLRateLimited(
+                                    f"comment fetch rate-limited for PR #{pr_num}")
+                            break
+                        for c in (page.body() or []):
+                            if not isinstance(c, dict):
+                                continue
+                            body = c.get("body", "") or ""
+                            if not body.startswith("Claimed PR repair by session"):
+                                continue
+                            ca = c.get("created_at", "") or ""
+                            if latest is None or ca > (latest.get("created_at", "") or ""):
+                                latest = {"body": body, "created_at": ca}
+                    if latest is None:
                         # No claim comment at all — label is orphaned from a
                         # failed claim attempt. Grace-release.
                         to_release.append((pr_num, "orphaned label: no claim comment"))
                         continue
-                    cdata = json.loads(blob)
-                except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError):
+                    cdata = latest
+                except (TypeError, ValueError):
                     continue
                 import re as _re
                 m = _re.search(r'Claimed PR repair by session `([^`]+)`', cdata.get("body", ""))
@@ -3743,20 +3739,19 @@ def check_dead_pr_claimed_prs(config: dict):
         # 3. Issue the releases.
         for pr_num, reason in to_release:
             try:
-                r = subprocess.run(
-                    ["gh", "pr", "edit", str(pr_num), "--repo", repo,
-                     "--remove-label", "repair-claimed"],
-                    capture_output=True, timeout=30, cwd=cwd,
+                r = _gh_cli(
+                    "pr", "edit", str(pr_num), "--repo", repo,
+                    "--remove-label", "repair-claimed", timeout=30,
                 )
                 if _is_rate_limit_error(r):
                     raise _GraphQLRateLimited(
                         f"label remove rate-limited for PR #{pr_num}")
                 if r.returncode != 0:
                     continue
-                r_comment = subprocess.run(
-                    ["gh", "pr", "comment", str(pr_num), "--repo", repo,
-                     "--body", f"Repair claim released by reconciler: {reason}."],
-                    capture_output=True, timeout=30, cwd=cwd,
+                r_comment = _gh_cli(
+                    "pr", "comment", str(pr_num), "--repo", repo,
+                    "--body", f"Repair claim released by reconciler: {reason}.",
+                    timeout=30,
                 )
                 if _is_rate_limit_error(r_comment):
                     raise _GraphQLRateLimited(
@@ -6725,6 +6720,99 @@ def cmd_config(config: dict, args):
         print(CONFIG_PATH.read_text(), end="")
 
 
+def cmd_gh_stats(config: dict, args) -> None:
+    """Summarise `.pod/gh-access.log` to find which callers / paths are
+    consuming the most GitHub API budget.
+
+    The log is JSONL, one row per call. We aggregate by the column named
+    in `--by` and print: count, ETag-cache-hit ratio, total wall-ms,
+    total bytes (best-effort).
+    """
+    import collections
+
+    log_path = Path(args.log) if args.log else (POD_DIR / "gh-access.log")
+    if not log_path.exists():
+        print(f"No GitHub access log at {log_path}.", file=sys.stderr)
+        print("It is created on first GitHub interaction.", file=sys.stderr)
+        sys.exit(1)
+
+    # Parse --since.
+    units = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    s = args.since.strip().lower()
+    try:
+        if s and s[-1] in units:
+            since_seconds = int(s[:-1]) * units[s[-1]]
+        else:
+            since_seconds = int(s)  # seconds
+    except ValueError:
+        print(f"Invalid --since value: {args.since!r} "
+              "(expected e.g. 10m, 1h, 24h, 7d).", file=sys.stderr)
+        sys.exit(1)
+    cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
+        seconds=since_seconds)
+
+    # Aggregate.
+    by_key: dict[str, dict] = collections.defaultdict(
+        lambda: {"count": 0, "cache_hits": 0, "ms": 0, "bytes": 0,
+                 "errors": 0})
+    total = {"count": 0, "cache_hits": 0, "ms": 0, "bytes": 0, "errors": 0}
+
+    with open(log_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            ts = row.get("ts", "")
+            try:
+                row_dt = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if row_dt < cutoff:
+                continue
+            key = str(row.get(args.by, "?"))
+            for buf in (by_key[key], total):
+                buf["count"] += 1
+                if row.get("cache_hit"):
+                    buf["cache_hits"] += 1
+                buf["ms"] += int(row.get("ms") or 0)
+                buf["bytes"] += int(row.get("bytes") or 0)
+                if int(row.get("status") or 0) >= 400:
+                    buf["errors"] += 1
+
+    if total["count"] == 0:
+        print(f"No log rows in the last {args.since} window.")
+        return
+
+    rows = sorted(by_key.items(), key=lambda kv: kv[1]["count"], reverse=True)
+    rows = rows[: args.top]
+
+    # Format.
+    width = max((len(k) for k, _ in rows), default=10)
+    width = min(width, 70)
+    print(f"GitHub access log: {log_path}")
+    print(f"Window: last {args.since}  |  Group by: {args.by}  |  "
+          f"Top: {args.top}")
+    print(f"Total: {total['count']} calls  "
+          f"({100 * total['cache_hits'] / max(1, total['count']):.0f}% ETag-cache hit, "
+          f"{total['errors']} errors, "
+          f"{total['ms'] / 1000:.1f}s wall, "
+          f"{total['bytes'] / 1024:.1f} KiB body)")
+    print()
+    print(f"  {'#':>5}  {'cache%':>6}  {'errs':>4}  "
+          f"{'ms':>7}  {'KiB':>5}  {args.by}")
+    print(f"  {'-' * 5}  {'-' * 6}  {'-' * 4}  {'-' * 7}  {'-' * 5}  "
+          f"{'-' * width}")
+    for key, v in rows:
+        cache_pct = 100 * v["cache_hits"] / max(1, v["count"])
+        print(f"  {v['count']:>5}  {cache_pct:>5.0f}%  "
+              f"{v['errors']:>4}  {v['ms']:>7}  {v['bytes']/1024:>5.1f}  "
+              f"{key[:width]}")
+
+
 def cmd_cleanup(config: dict, args):
     """Remove stale worktrees that no running agent owns."""
     base = PROJECT_DIR / cfg_get(config, "project", "worktree_base", default="worktrees")
@@ -6833,11 +6921,8 @@ REQUIRED_LABELS = {
 def _ensure_github_labels():
     """Create any missing GitHub labels required by pod."""
     try:
-        r = subprocess.run(
-            ["gh", "label", "list", "--limit", "100", "--json", "name", "--jq", ".[].name"],
-            capture_output=True, text=True, timeout=15,
-            cwd=str(PROJECT_DIR),
-        )
+        r = _gh_cli("label", "list", "--limit", "100",
+                     "--json", "name", "--jq", ".[].name", timeout=15)
         if r.returncode != 0:
             print("  warning: could not list labels (gh CLI issue)")
             return
@@ -6845,11 +6930,9 @@ def _ensure_github_labels():
         created = []
         for label, color in REQUIRED_LABELS.items():
             if label not in existing:
-                cr = subprocess.run(
-                    ["gh", "label", "create", label, "--color", color,
-                     "--description", "pod coordination"],
-                    capture_output=True, text=True, timeout=15,
-                    cwd=str(PROJECT_DIR),
+                cr = _gh_cli(
+                    "label", "create", label, "--color", color,
+                    "--description", "pod coordination", timeout=15,
                 )
                 if cr.returncode == 0:
                     created.append(label)
@@ -6864,11 +6947,9 @@ def _ensure_github_labels():
 def _ensure_repo_merge_settings():
     """Enable auto-merge and squash merge on the GitHub repo (best effort)."""
     try:
-        r = subprocess.run(
-            ["gh", "repo", "edit", "--enable-auto-merge", "--enable-squash-merge"],
-            capture_output=True, text=True, timeout=15,
-            cwd=str(PROJECT_DIR),
-        )
+        r = _gh_cli("repo", "edit",
+                     "--enable-auto-merge", "--enable-squash-merge",
+                     timeout=15)
         if r.returncode == 0:
             print("  enabled auto-merge and squash merge on GitHub repo")
         else:
@@ -6896,17 +6977,18 @@ def _ensure_branch_protection(init_config):
         print("      then re-run `pod init`.")
         return
 
+    client = gh.get_client()
+    slug = _get_repo()
     try:
-        r = subprocess.run(
-            ["gh", "api", f"repos/{_get_repo()}", "--jq", ".default_branch"],
-            capture_output=True, text=True, timeout=15,
-            cwd=str(PROJECT_DIR),
-        )
-        if r.returncode != 0 or not r.stdout.strip():
+        resp = client.get(f"/repos/{slug}", timeout=15)
+        if not resp.ok():
             print("  warning: could not detect default branch (gh CLI issue)")
             return
-        default_branch = r.stdout.strip()
-    except (subprocess.TimeoutExpired, FileNotFoundError):
+        default_branch = ((resp.body() or {}).get("default_branch") or "").strip()
+        if not default_branch:
+            print("  warning: could not detect default branch (empty response)")
+            return
+    except Exception:
         print("  warning: could not detect default branch (gh CLI not available)")
         return
 
@@ -6923,23 +7005,19 @@ def _ensure_branch_protection(init_config):
     }
 
     try:
-        r = subprocess.run(
-            ["gh", "api",
-             f"repos/{{owner}}/{{repo}}/branches/{default_branch}/protection",
-             "-X", "PUT", "--input", "-"],
-            input=json.dumps(payload),
-            capture_output=True, text=True, timeout=15,
-            cwd=str(PROJECT_DIR),
+        resp = client.put(
+            f"/repos/{slug}/branches/{default_branch}/protection",
+            json=payload, timeout=15,
         )
-        if r.returncode == 0:
+        if resp.ok():
             print(f"  configured branch protection on `{default_branch}` "
                   f"(required: {', '.join(required)})")
         else:
             print(f"  warning: could not set branch protection on `{default_branch}` "
-                  f"(may need admin access)")
+                  f"(HTTP {resp.status} — may need admin access)")
             print(f"    → Settings → Branches → add rule for `{default_branch}`")
             print(f"      with required status checks: {', '.join(required)}")
-    except (subprocess.TimeoutExpired, FileNotFoundError):
+    except Exception:
         print("  warning: could not configure branch protection (gh CLI not available)")
 
 
@@ -7119,6 +7197,20 @@ def main():
     p_config.add_argument("--edit", action="store_true",
                            help="Open config in $EDITOR")
 
+    p_ghstats = sub.add_parser(
+        "gh-stats",
+        help="Aggregate .pod/gh-access.log to find which callers burn quota",
+    )
+    p_ghstats.add_argument("--since", default="1h",
+                            help="Window: e.g. 10m, 1h, 24h, 7d (default: 1h)")
+    p_ghstats.add_argument("--by", choices=("caller", "path", "bucket", "transport"),
+                            default="caller",
+                            help="Group rows by this column (default: caller)")
+    p_ghstats.add_argument("--top", type=int, default=20,
+                            help="Show this many top groups (default: 20)")
+    p_ghstats.add_argument("--log",
+                            help="Override log path (default: .pod/gh-access.log)")
+
     # Internal helpers shelled out to from the bundled `coordination` script.
     # Underscore-prefixed names keep them out of casual `--help` browsing.
     p_check = sub.add_parser("_check-provenance",
@@ -7180,6 +7272,8 @@ def main():
         cmd_log(config, args)
     elif args.command == "config":
         cmd_config(config, args)
+    elif args.command == "gh-stats":
+        cmd_gh_stats(config, args)
     elif args.command == "_check-provenance":
         cmd_check_provenance(config, args)
     elif args.command == "_filter-trusted-issues":

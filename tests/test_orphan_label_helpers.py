@@ -15,28 +15,34 @@ from unittest import mock
 
 from pod import cli
 
+from _gh_helpers import patch_client
+
+
+def _gh_result(stdout=""):
+    r = mock.Mock()
+    r.returncode = 0
+    r.stdout = stdout
+    r.stderr = ""
+    return r
+
 
 class FetchBlockedDepsQueryTests(unittest.TestCase):
     def test_query_does_not_filter_to_agent_plan(self):
         captured = {}
 
-        def fake_run(argv, **kwargs):
-            captured["argv"] = list(argv)
-            r = mock.Mock()
-            r.returncode = 0
-            r.stdout = "[]"
-            r.stderr = ""
-            return r
+        def gh_cli_handler(*argv):
+            # First call: list blocked. We capture it then return [].
+            if "list" in argv and "blocked" in argv:
+                captured["argv"] = ("gh",) + argv
+                return _gh_result("[]")
+            return _gh_result("[]")
 
-        with mock.patch.object(subprocess, "run", side_effect=fake_run):
+        with patch_client(gh_cli_handler=gh_cli_handler):
             cli.fetch_blocked_deps()
 
-        argv = captured["argv"]
+        argv = list(captured["argv"])
         self.assertEqual(argv[0], "gh")
         self.assertIn("--label", argv)
-        # The post-fix query must include `blocked` exactly once and must
-        # NOT include `agent-plan` (which would exclude human-oversight
-        # blocked issues like #2565 in the kim-em/hex repo).
         label_args = [argv[i + 1] for i, a in enumerate(argv) if a == "--label"]
         self.assertEqual(label_args, ["blocked"])
 
@@ -45,19 +51,14 @@ class FetchBlockedDepsQueryTests(unittest.TestCase):
                 "depends-on: #2563\n"
                 "depends-on: #2564\n")
         list_payload = json.dumps([{"number": 2565, "body": body}])
-        # second call returns the open-issue numbers list
         open_payload = json.dumps([2563, 2564])
 
         calls = iter([list_payload, open_payload])
 
-        def fake_run(argv, **kwargs):
-            r = mock.Mock()
-            r.returncode = 0
-            r.stdout = next(calls)
-            r.stderr = ""
-            return r
+        def gh_cli_handler(*argv):
+            return _gh_result(next(calls))
 
-        with mock.patch.object(subprocess, "run", side_effect=fake_run):
+        with patch_client(gh_cli_handler=gh_cli_handler):
             result = cli.fetch_blocked_deps()
 
         self.assertEqual(result, {2565: [2563, 2564]})
@@ -71,29 +72,23 @@ class FetchHasPrLinksTests(unittest.TestCase):
     always return empty and the housekeeping cycle would clear
     `has-pr` from every legitimate issue."""
 
-    def _stub_run(self, calls):
-        """Build a fake_run that dispatches by argv shape, returning
-        canned stdout from the `calls` dict keyed on (argv[1], argv[2])."""
-        def fake_run(argv, **kwargs):
-            r = mock.Mock()
-            r.returncode = 0
-            r.stderr = ""
-            key = (argv[1], argv[2])
+    def _stub_handler(self, calls):
+        """Build a gh_cli handler that dispatches by argv shape, returning
+        canned stdout from the `calls` dict keyed on (argv[0], argv[1])."""
+        def handler(*argv):
+            key = (argv[0], argv[1])
             if key == ("issue", "list"):
-                r.stdout = calls.pop("issue_list", "[]")
-            elif key == ("issue", "view"):
-                # argv[3] is the issue number string
-                r.stdout = calls.pop(f"issue_view_{argv[3]}", "[]")
-            elif key == ("pr", "view"):
-                r.stdout = calls.pop(f"pr_view_{argv[3]}", "UNKNOWN")
-            else:
-                r.stdout = ""
-            return r
-        return fake_run
+                return _gh_result(calls.pop("issue_list", "[]"))
+            if key == ("issue", "view"):
+                return _gh_result(calls.pop(f"issue_view_{argv[2]}", "[]"))
+            if key == ("pr", "view"):
+                return _gh_result(calls.pop(f"pr_view_{argv[2]}", "UNKNOWN"))
+            return _gh_result("")
+        return handler
 
     def test_records_open_linked_pr(self):
         # #3006 has an open linked PR #3015 — must show up.
-        with mock.patch.object(subprocess, "run", side_effect=self._stub_run({
+        with patch_client(gh_cli_handler=self._stub_handler({
             "issue_list": json.dumps([{"number": 3006}]),
             "issue_view_3006": json.dumps([3015]),
             "pr_view_3015": "OPEN",
@@ -104,7 +99,7 @@ class FetchHasPrLinksTests(unittest.TestCase):
         # #3016 has a linked PR but it's already merged — orphan; the
         # entry must still be present (empty list) so the TUI can
         # render `[PR ?]` and the housekeeping cycle can clean up.
-        with mock.patch.object(subprocess, "run", side_effect=self._stub_run({
+        with patch_client(gh_cli_handler=self._stub_handler({
             "issue_list": json.dumps([{"number": 3016}]),
             "issue_view_3016": json.dumps([3020]),
             "pr_view_3020": "MERGED",
@@ -114,7 +109,7 @@ class FetchHasPrLinksTests(unittest.TestCase):
     def test_orphan_with_no_linked_prs_at_all(self):
         # The hand-applied `has-pr` case from the original incident:
         # closedByPullRequestsReferences itself is empty.
-        with mock.patch.object(subprocess, "run", side_effect=self._stub_run({
+        with patch_client(gh_cli_handler=self._stub_handler({
             "issue_list": json.dumps([{"number": 2564}]),
             "issue_view_2564": "[]",
         })):
@@ -124,7 +119,7 @@ class FetchHasPrLinksTests(unittest.TestCase):
         # The relevant filter: an issue may have one merged PR
         # (historically) and one open PR (the in-flight one). Only the
         # open one should appear in the result.
-        with mock.patch.object(subprocess, "run", side_effect=self._stub_run({
+        with patch_client(gh_cli_handler=self._stub_handler({
             "issue_list": json.dumps([{"number": 4000}]),
             "issue_view_4000": json.dumps([4001, 4002]),
             "pr_view_4001": "MERGED",

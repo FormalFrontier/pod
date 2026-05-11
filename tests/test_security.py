@@ -1,3 +1,4 @@
+import contextlib
 import datetime
 import json
 import tempfile
@@ -8,40 +9,70 @@ from unittest import mock
 
 from pod import cli
 
+from _gh_helpers import fake_response, patch_client
 
-def _mock_run(visibility: str, slug: str, limit_response: str | None,
-              limit_returncode: int = 0):
-    """Return a fake subprocess.run that responds to the gh calls
-    check_repo_security makes. After the GraphQL-quota fix these are:
 
-      - `git remote get-url origin`     (slug detection, fully local)
-      - `gh api repos/{slug} --jq .visibility`
-      - `gh api repos/{slug}/interaction-limits`
+def _git_remote_mock(slug: str):
+    return mock.Mock(returncode=0, stderr="",
+                     stdout=f"git@github.com:{slug}.git\n")
+
+
+@contextlib.contextmanager
+def _mock_security(visibility: str, slug: str,
+                    limit_response: dict | str | None = None,
+                    limit_status: int = 200):
+    """Combine `git remote` (subprocess.run) + the GitHub access layer
+    (httpx via _FakeClient) for `check_repo_security`.
+
+    `limit_response` is a dict for the interaction-limits payload (or
+    "{}" string for the empty body — same shape `check_repo_security`
+    sees on a public repo with no limit).
     """
-    git_remote = mock.Mock(returncode=0, stderr="",
-                           stdout=f"git@github.com:{slug}.git\n")
+    if isinstance(limit_response, str):
+        # Backwards-compat with old "{}" / JSON-string callers.
+        try:
+            limit_body = json.loads(limit_response)
+        except (json.JSONDecodeError, TypeError):
+            limit_body = {}
+    else:
+        limit_body = limit_response or {}
 
-    repo_visibility = mock.Mock(returncode=0, stderr="",
-                                stdout=visibility + "\n")
+    routes = {
+        ("GET", f"/repos/{slug}"): fake_response(
+            200, body={"visibility": visibility}),
+    }
+    if visibility == "public":
+        if limit_status == 200:
+            routes[("GET", f"/repos/{slug}/interaction-limits")] = (
+                fake_response(200, body=limit_body))
+        else:
+            routes[("GET", f"/repos/{slug}/interaction-limits")] = (
+                fake_response(limit_status,
+                              body={"message": "interaction-limits failed"}))
 
-    api_limits = mock.Mock()
-    api_limits.returncode = limit_returncode
-    api_limits.stdout = limit_response if limit_response is not None else ""
-    api_limits.stderr = "" if limit_returncode == 0 else "API error"
+    git_remote = _git_remote_mock(slug)
 
     def fake_run(argv, **kwargs):
         if argv[:2] == ["git", "remote"]:
             return git_remote
-        if argv[:2] == ["gh", "api"]:
-            # Distinguish the visibility probe (path = repos/{slug}) from
-            # the interaction-limits probe (path = repos/{slug}/interaction-limits).
-            path = argv[2] if len(argv) > 2 else ""
-            if path.endswith("/interaction-limits"):
-                return api_limits
-            return repo_visibility
         raise AssertionError(f"unexpected subprocess call: {argv}")
 
-    return fake_run
+    with patch_client(routes=routes):
+        with mock.patch.object(cli.subprocess, "run", side_effect=fake_run):
+            yield
+
+
+# Backwards-compat shim: existing tests still call `_mock_run(...)` and
+# wrap it in `mock.patch.object(cli.subprocess, "run", side_effect=...)`.
+# Returning a tuple of (context_manager, dummy_side_effect) would force
+# rewriting every test; instead, expose `_mock_security` as the new
+# context manager and migrate call sites individually.
+def _mock_run(visibility: str, slug: str, limit_response: str | None,
+              limit_returncode: int = 0):
+    """Deprecated shim. Use `_mock_security(...)` directly with `with`."""
+    raise RuntimeError(
+        "_mock_run() shim removed; use `with _mock_security(...):` instead. "
+        "See test_security.py for examples.")
 
 
 def _iso(days_from_now: float) -> str:
@@ -69,122 +100,105 @@ class SecurityCheckTests(unittest.TestCase):
         run.assert_not_called()
 
     def test_private_repo_passes(self):
-        fake = _mock_run("private", "owner/repo", "{}")
-        with mock.patch.object(cli.subprocess, "run", side_effect=fake):
+        with _mock_security("private", "owner/repo"):
             cli.check_repo_security({})  # no exit
 
     def test_public_no_limit_refused(self):
-        fake = _mock_run("public", "owner/repo", "{}")
-        with mock.patch.object(cli.subprocess, "run", side_effect=fake):
+        with _mock_security("public", "owner/repo", limit_response={}):
             with self.assertRaises(SystemExit) as cm:
                 cli.check_repo_security({})
         self.assertEqual(cm.exception.code, 1)
 
     def test_public_collaborators_only_long_expiry_passes(self):
-        body = (
-            '{"limit":"collaborators_only","origin":"repository",'
-            '"expires_at":"' + _iso(180) + '"}'
-        )
-        fake = _mock_run("public", "owner/repo", body)
-        with mock.patch.object(cli.subprocess, "run", side_effect=fake):
+        body = {"limit": "collaborators_only",
+                "origin": "repository",
+                "expires_at": _iso(180)}
+        with _mock_security("public", "owner/repo", limit_response=body):
             cli.check_repo_security({})
 
     def test_public_limit_too_lax_refused(self):
-        body = (
-            '{"limit":"existing_users","origin":"repository",'
-            '"expires_at":"' + _iso(180) + '"}'
-        )
-        fake = _mock_run("public", "owner/repo", body)
-        with mock.patch.object(cli.subprocess, "run", side_effect=fake):
+        body = {"limit": "existing_users",
+                "origin": "repository",
+                "expires_at": _iso(180)}
+        with _mock_security("public", "owner/repo", limit_response=body):
             with self.assertRaises(SystemExit):
                 cli.check_repo_security({})
 
     def test_public_expiring_soon_refused(self):
-        body = (
-            '{"limit":"collaborators_only","origin":"repository",'
-            '"expires_at":"' + _iso(3) + '"}'
-        )
-        fake = _mock_run("public", "owner/repo", body)
-        with mock.patch.object(cli.subprocess, "run", side_effect=fake):
+        body = {"limit": "collaborators_only",
+                "origin": "repository",
+                "expires_at": _iso(3)}
+        with _mock_security("public", "owner/repo", limit_response=body):
             with self.assertRaises(SystemExit):
                 cli.check_repo_security({})
 
     def test_public_no_expiry_passes(self):
-        body = '{"limit":"collaborators_only","origin":"repository"}'
-        fake = _mock_run("public", "owner/repo", body)
-        with mock.patch.object(cli.subprocess, "run", side_effect=fake):
+        body = {"limit": "collaborators_only", "origin": "repository"}
+        with _mock_security("public", "owner/repo", limit_response=body):
             cli.check_repo_security({})
 
     def test_lower_minimum_accepts_weaker_limit(self):
-        body = (
-            '{"limit":"contributors_only","origin":"repository",'
-            '"expires_at":"' + _iso(180) + '"}'
-        )
-        fake = _mock_run("public", "owner/repo", body)
-        with mock.patch.object(cli.subprocess, "run", side_effect=fake):
+        body = {"limit": "contributors_only",
+                "origin": "repository",
+                "expires_at": _iso(180)}
+        with _mock_security("public", "owner/repo", limit_response=body):
             cli.check_repo_security(
                 {"security": {"minimum_interaction_limit": "contributors_only"}}
             )
 
     def test_ttl_skips_recheck(self):
-        fake = _mock_run("private", "owner/repo", "{}")
-        with mock.patch.object(cli.subprocess, "run", side_effect=fake) as run:
+        with _mock_security("private", "owner/repo") as _:
             cli.check_repo_security({})
-            first_count = run.call_count
-            cli.check_repo_security({})
-        # Within TTL — the second call must add zero subprocess invocations.
-        self.assertEqual(run.call_count, first_count)
+            # Within TTL — the second call must not hit the layer.
+            with patch_client() as client:
+                cli.check_repo_security({})
+                self.assertEqual(client.calls, [])
 
     def test_ttl_expires(self):
-        fake = _mock_run("private", "owner/repo", "{}")
-        with mock.patch.object(cli.subprocess, "run", side_effect=fake) as run:
+        with _mock_security("private", "owner/repo"):
             cli.check_repo_security({})
-            first_count = run.call_count
             # Simulate both TTLs elapsing — in-memory and disk.
             cli._security_last_ok = (
                 cli._security_last_ok - cli._SECURITY_CHECK_TTL_SECONDS - 1
             )
             self._cache_path.unlink(missing_ok=True)
-            cli.check_repo_security({})
-        self.assertGreater(run.call_count, first_count)
+            with patch_client(routes={
+                ("GET", "/repos/owner/repo"): fake_response(
+                    200, body={"visibility": "private"}),
+            }) as client, mock.patch.object(cli.subprocess, "run",
+                                              return_value=_git_remote_mock("owner/repo")):
+                cli.check_repo_security({})
+                self.assertTrue(any(c["method"] == "GET" for c in client.calls))
 
     def test_gh_not_found_fails_closed(self):
-        with mock.patch.object(cli.subprocess, "run", side_effect=FileNotFoundError):
+        # The layer fails to construct a client (no `gh auth token`); we
+        # surface the error as SystemExit per the existing contract.
+        with patch_client(routes={}, default=fake_response(
+                500, body={"message": "gh missing"})), \
+             mock.patch.object(cli.subprocess, "run",
+                                side_effect=FileNotFoundError):
             with self.assertRaises(SystemExit):
                 cli.check_repo_security({})
 
     def test_gh_repo_view_error_fails_closed(self):
         # Slug lookup (git remote) succeeds; the REST visibility probe fails.
-        git_remote = mock.Mock(returncode=0, stderr="",
-                               stdout="git@github.com:o/r.git\n")
-        bad = mock.Mock(returncode=1, stdout="", stderr="auth required")
-
-        def fake_run(argv, **kwargs):
-            if argv[:2] == ["git", "remote"]:
-                return git_remote
-            return bad
-
-        with mock.patch.object(cli.subprocess, "run", side_effect=fake_run):
+        with patch_client(routes={
+            ("GET", "/repos/o/r"): fake_response(
+                401, body={"message": "auth required"}),
+        }), mock.patch.object(cli.subprocess, "run",
+                              return_value=_git_remote_mock("o/r")):
             with self.assertRaises(SystemExit):
                 cli.check_repo_security({})
 
     def test_gh_api_network_error_fails_closed(self):
-        git_remote = mock.Mock(returncode=0, stderr="",
-                               stdout="git@github.com:o/r.git\n")
-        repo_visibility = mock.Mock(returncode=0, stderr="", stdout="public\n")
-        api_err = mock.Mock(returncode=1, stdout="", stderr="HTTP 500: server error")
-
-        def fake_run(argv, **kwargs):
-            if argv[:2] == ["git", "remote"]:
-                return git_remote
-            if argv[:2] == ["gh", "api"]:
-                path = argv[2] if len(argv) > 2 else ""
-                if path.endswith("/interaction-limits"):
-                    return api_err
-                return repo_visibility
-            raise AssertionError(f"unexpected subprocess call: {argv}")
-
-        with mock.patch.object(cli.subprocess, "run", side_effect=fake_run):
+        # Visibility probe succeeds (public); interaction-limits 500s.
+        with patch_client(routes={
+            ("GET", "/repos/o/r"): fake_response(
+                200, body={"visibility": "public"}),
+            ("GET", "/repos/o/r/interaction-limits"): fake_response(
+                500, body={"message": "server error"}),
+        }), mock.patch.object(cli.subprocess, "run",
+                              return_value=_git_remote_mock("o/r")):
             with self.assertRaises(SystemExit):
                 cli.check_repo_security({})
 
@@ -322,20 +336,17 @@ class SecurityCacheTests(unittest.TestCase):
         run.assert_not_called()
 
     def test_check_writes_disk_cache_on_success_private(self):
-        fake = _mock_run("private", "owner/repo", "{}")
-        with mock.patch.object(cli.subprocess, "run", side_effect=fake):
+        with _mock_security("private", "owner/repo"):
             cli.check_repo_security({})
         self.assertTrue(self._cache_path.exists())
         data = json.loads(self._cache_path.read_text())
         self.assertEqual(data["visibility"], "private")
 
     def test_check_writes_disk_cache_on_success_public(self):
-        body = (
-            '{"limit":"collaborators_only","origin":"repository",'
-            '"expires_at":"' + _iso(180) + '"}'
-        )
-        fake = _mock_run("public", "owner/repo", body)
-        with mock.patch.object(cli.subprocess, "run", side_effect=fake):
+        body = {"limit": "collaborators_only",
+                "origin": "repository",
+                "expires_at": _iso(180)}
+        with _mock_security("public", "owner/repo", limit_response=body):
             cli.check_repo_security({})
         self.assertTrue(self._cache_path.exists())
         data = json.loads(self._cache_path.read_text())
@@ -345,8 +356,7 @@ class SecurityCacheTests(unittest.TestCase):
     def test_check_does_not_cache_on_failure(self):
         # Visibility=public + missing interaction-limits → SystemExit;
         # cache must not be written so the next run still tries fresh.
-        fake = _mock_run("public", "owner/repo", "{}")
-        with mock.patch.object(cli.subprocess, "run", side_effect=fake):
+        with _mock_security("public", "owner/repo", limit_response={}):
             with self.assertRaises(SystemExit):
                 cli.check_repo_security({})
         self.assertFalse(self._cache_path.exists())
