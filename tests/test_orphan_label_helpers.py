@@ -1,151 +1,221 @@
-"""Tests for the TUI's orphan-label helpers.
+"""Tests for the TUI's orphan-label helpers (B2 burner rewrite).
 
-`fetch_blocked_deps` must query *all* `blocked` issues (no
-`--label agent-plan` filter), so `human-oversight + blocked` issues
-get their `depends-on:` lines parsed and rendered.
-
-`fetch_has_pr_links` returns, for every open `has-pr` issue, the list
-of its currently-OPEN closing PRs. An empty list is preserved (it
-signals an orphan label that the housekeeping loop will clean up).
+After the B2 rewrite, `fetch_blocked_deps`, `fetch_has_pr_links`, and
+`fetch_issues_and_prs` all read from a single batched GraphQL query
+(`_tui_refresh_batch`). These tests stub that helper directly so
+each fetch_* is exercised in isolation, mirroring the in-memory shape
+the layer would produce.
 """
 import json
-import subprocess
 import unittest
 from unittest import mock
 
 from pod import cli
 
-from _gh_helpers import patch_client
+
+def _label_nodes(*names):
+    return {"nodes": [{"name": n} for n in names]}
 
 
-def _gh_result(stdout=""):
-    r = mock.Mock()
-    r.returncode = 0
-    r.stdout = stdout
-    r.stderr = ""
-    return r
+def _issue(num, *, title="", labels=(), body="",
+           created_at="2026-05-09T00:00:00Z",
+           updated_at="2026-05-10T00:00:00Z",
+           closed_at=None):
+    iss = {
+        "number": num,
+        "title": title,
+        "labels": _label_nodes(*labels),
+        "createdAt": created_at,
+        "updatedAt": updated_at,
+    }
+    if body is not None:
+        iss["body"] = body
+    if closed_at is not None:
+        iss["closedAt"] = closed_at
+    return iss
 
 
-class FetchBlockedDepsQueryTests(unittest.TestCase):
-    def test_query_does_not_filter_to_agent_plan(self):
-        captured = {}
+def _pr_node(num, *, title="", labels=(), state="OPEN",
+             checks_state=None,
+             created_at="2026-05-09T00:00:00Z",
+             updated_at="2026-05-10T00:00:00Z"):
+    return {
+        "number": num,
+        "title": title,
+        "state": state,
+        "createdAt": created_at,
+        "updatedAt": updated_at,
+        "closedAt": None,
+        "mergedAt": None,
+        "labels": _label_nodes(*labels),
+        "commits": {"nodes": [{
+            "commit": {
+                "statusCheckRollup": (
+                    {"state": checks_state} if checks_state else None
+                ),
+            }
+        }]},
+    }
 
-        def gh_cli_handler(*argv):
-            # First call: list blocked. We capture it then return [].
-            if "list" in argv and "blocked" in argv:
-                captured["argv"] = ("gh",) + argv
-                return _gh_result("[]")
-            return _gh_result("[]")
 
-        with patch_client(gh_cli_handler=gh_cli_handler):
-            cli.fetch_blocked_deps()
+def _has_pr_node(issue_num, *, refs):
+    """Build a hasPrIssues node; refs is a list of (pr_num, state)."""
+    return {
+        "number": issue_num,
+        "closedByPullRequestsReferences": {
+            "nodes": [{"number": n, "state": s} for n, s in refs],
+        },
+    }
 
-        argv = list(captured["argv"])
-        self.assertEqual(argv[0], "gh")
-        self.assertIn("--label", argv)
-        label_args = [argv[i + 1] for i, a in enumerate(argv) if a == "--label"]
-        self.assertEqual(label_args, ["blocked"])
 
-    def test_human_oversight_blocked_issue_yields_deps(self):
+def _patch_batch(repo_node):
+    """Patch the batched fetch to return our stubbed repository node."""
+    return mock.patch.object(cli, "_tui_refresh_batch",
+                              return_value=repo_node)
+
+
+class FetchBlockedDepsTests(unittest.TestCase):
+    def test_no_blocked_issues_yields_empty(self):
+        with _patch_batch({
+            "blocked": {"nodes": []},
+            "openIssueNumbers": {"nodes": []},
+        }):
+            self.assertEqual(cli.fetch_blocked_deps(), {})
+
+    def test_includes_blocked_from_any_family_label(self):
+        # The blocked field doesn't filter by agent-plan vs human-oversight,
+        # so HO-2 (#2565 in the kim-em/hex repo) shows up here too.
         body = ("HO-2 work item.\n\n"
                 "depends-on: #2563\n"
                 "depends-on: #2564\n")
-        list_payload = json.dumps([{"number": 2565, "body": body}])
-        open_payload = json.dumps([2563, 2564])
-
-        calls = iter([list_payload, open_payload])
-
-        def gh_cli_handler(*argv):
-            return _gh_result(next(calls))
-
-        with patch_client(gh_cli_handler=gh_cli_handler):
+        with _patch_batch({
+            "blocked": {"nodes": [_issue(2565, body=body)]},
+            "openIssueNumbers": {"nodes": [{"number": 2563}, {"number": 2564}]},
+        }):
             result = cli.fetch_blocked_deps()
-
         self.assertEqual(result, {2565: [2563, 2564]})
+
+    def test_drops_closed_deps(self):
+        body = "depends-on: #100\ndepends-on: #101\n"
+        with _patch_batch({
+            "blocked": {"nodes": [_issue(50, body=body)]},
+            "openIssueNumbers": {"nodes": [{"number": 100}]},  # 101 closed
+        }):
+            result = cli.fetch_blocked_deps()
+        self.assertEqual(result, {50: [100]})
+
+    def test_omits_issue_with_all_deps_closed(self):
+        body = "depends-on: #100\n"
+        with _patch_batch({
+            "blocked": {"nodes": [_issue(50, body=body)]},
+            "openIssueNumbers": {"nodes": []},  # all deps closed
+        }):
+            result = cli.fetch_blocked_deps()
+        self.assertEqual(result, {})
 
 
 class FetchHasPrLinksTests(unittest.TestCase):
-    """Three-step lookup: list has-pr issues → look up each issue's
-    closedByPullRequestsReferences → look up each referenced PR's state
-    via `gh pr view`. The reference objects do NOT contain a `state`
-    field, so a one-shot `select(.state == "OPEN")` filter would
-    always return empty and the housekeeping cycle would clear
-    `has-pr` from every legitimate issue."""
-
-    def _stub_handler(self, calls):
-        """Build a gh_cli handler that dispatches by argv shape, returning
-        canned stdout from the `calls` dict keyed on (argv[0], argv[1])."""
-        def handler(*argv):
-            key = (argv[0], argv[1])
-            if key == ("issue", "list"):
-                return _gh_result(calls.pop("issue_list", "[]"))
-            if key == ("issue", "view"):
-                return _gh_result(calls.pop(f"issue_view_{argv[2]}", "[]"))
-            if key == ("pr", "view"):
-                return _gh_result(calls.pop(f"pr_view_{argv[2]}", "UNKNOWN"))
-            return _gh_result("")
-        return handler
-
     def test_records_open_linked_pr(self):
-        # #3006 has an open linked PR #3015 — must show up.
-        with patch_client(gh_cli_handler=self._stub_handler({
-            "issue_list": json.dumps([{"number": 3006}]),
-            "issue_view_3006": json.dumps([3015]),
-            "pr_view_3015": "OPEN",
-        })):
+        with _patch_batch({
+            "hasPrIssues": {"nodes": [
+                _has_pr_node(3006, refs=[(3015, "OPEN")]),
+            ]},
+        }):
             self.assertEqual(cli.fetch_has_pr_links(), {3006: [3015]})
 
     def test_merged_linked_pr_yields_empty_list_orphan(self):
-        # #3016 has a linked PR but it's already merged — orphan; the
-        # entry must still be present (empty list) so the TUI can
-        # render `[PR ?]` and the housekeeping cycle can clean up.
-        with patch_client(gh_cli_handler=self._stub_handler({
-            "issue_list": json.dumps([{"number": 3016}]),
-            "issue_view_3016": json.dumps([3020]),
-            "pr_view_3020": "MERGED",
-        })):
+        with _patch_batch({
+            "hasPrIssues": {"nodes": [
+                _has_pr_node(3016, refs=[(3020, "MERGED")]),
+            ]},
+        }):
             self.assertEqual(cli.fetch_has_pr_links(), {3016: []})
 
     def test_orphan_with_no_linked_prs_at_all(self):
-        # The hand-applied `has-pr` case from the original incident:
-        # closedByPullRequestsReferences itself is empty.
-        with patch_client(gh_cli_handler=self._stub_handler({
-            "issue_list": json.dumps([{"number": 2564}]),
-            "issue_view_2564": "[]",
-        })):
+        with _patch_batch({
+            "hasPrIssues": {"nodes": [
+                _has_pr_node(2564, refs=[]),
+            ]},
+        }):
             self.assertEqual(cli.fetch_has_pr_links(), {2564: []})
 
     def test_open_and_closed_links_keeps_only_open(self):
-        # The relevant filter: an issue may have one merged PR
-        # (historically) and one open PR (the in-flight one). Only the
-        # open one should appear in the result.
-        with patch_client(gh_cli_handler=self._stub_handler({
-            "issue_list": json.dumps([{"number": 4000}]),
-            "issue_view_4000": json.dumps([4001, 4002]),
-            "pr_view_4001": "MERGED",
-            "pr_view_4002": "OPEN",
-        })):
+        with _patch_batch({
+            "hasPrIssues": {"nodes": [
+                _has_pr_node(4000, refs=[(4001, "MERGED"),
+                                          (4002, "OPEN")]),
+            ]},
+        }):
             self.assertEqual(cli.fetch_has_pr_links(), {4000: [4002]})
 
-    def test_no_has_pr_issues_returns_empty_without_view_calls(self):
-        list_payload = "[]"
-        view_called = False
+    def test_no_has_pr_issues_yields_empty(self):
+        with _patch_batch({"hasPrIssues": {"nodes": []}}):
+            self.assertEqual(cli.fetch_has_pr_links(), {})
 
-        def fake_run(argv, **kwargs):
-            nonlocal view_called
-            if argv[:3] == ["gh", "issue", "view"] or argv[:3] == ["gh", "pr", "view"]:
-                view_called = True
-            r = mock.Mock()
-            r.returncode = 0
-            r.stdout = list_payload
-            r.stderr = ""
-            return r
 
-        with mock.patch.object(subprocess, "run", side_effect=fake_run):
-            result = cli.fetch_has_pr_links()
+class FetchIssuesAndPrsTests(unittest.TestCase):
+    def test_returns_open_issues_and_prs(self):
+        with _patch_batch({
+            "openAgentPlan": {"nodes": [
+                _issue(10, title="open agent-plan",
+                        labels=["agent-plan"]),
+            ]},
+            "openHumanOversight": {"nodes": [
+                _issue(20, title="open ho",
+                        labels=["human-oversight"]),
+            ]},
+            "closedAgentPlan": {"nodes": []},
+            "closedHumanOversight": {"nodes": []},
+            "pullRequests": {"nodes": [
+                _pr_node(30, title="pass pr", state="OPEN",
+                          checks_state="SUCCESS"),
+                _pr_node(31, title="fail pr", state="OPEN",
+                          checks_state="FAILURE"),
+            ]},
+        }):
+            items = cli.fetch_issues_and_prs()
+        # Sorted by -number, with issue before pr at same number (none here).
+        nums = [(it.kind, it.number) for it in items]
+        self.assertIn(("issue", 10), nums)
+        self.assertIn(("issue", 20), nums)
+        self.assertIn(("pr", 30), nums)
+        self.assertIn(("pr", 31), nums)
+        # Highest number first.
+        self.assertEqual(items[0].number, 31)
+        # CI status decoded.
+        pr_pass = next(i for i in items if i.kind == "pr" and i.number == 30)
+        pr_fail = next(i for i in items if i.kind == "pr" and i.number == 31)
+        self.assertEqual(pr_pass.ci_status, "pass")
+        self.assertEqual(pr_fail.ci_status, "fail")
 
-        self.assertEqual(result, {})
-        self.assertFalse(view_called)
+
+class BatchCacheTests(unittest.TestCase):
+    def test_batch_cached_within_ttl(self):
+        # Force a clean cache.
+        cli._TUI_REFRESH_CACHE = (0.0, None)
+        from _gh_helpers import fake_response, patch_client
+        graphql_body = {"data": {"repository": {
+            "openAgentPlan": {"nodes": []},
+            "openHumanOversight": {"nodes": []},
+            "closedAgentPlan": {"nodes": []},
+            "closedHumanOversight": {"nodes": []},
+            "blocked": {"nodes": []},
+            "openIssueNumbers": {"nodes": []},
+            "hasPrIssues": {"nodes": []},
+            "pullRequests": {"nodes": []},
+        }}}
+        with patch_client(routes={
+            ("POST", "/graphql"): fake_response(200, body=graphql_body),
+        }) as client, mock.patch.object(cli, "_get_repo",
+                                         return_value="o/r"):
+            cli.fetch_issues_and_prs()
+            cli.fetch_blocked_deps()
+            cli.fetch_has_pr_links()
+        # All three fetch_* called _tui_refresh_batch — but only one
+        # GraphQL request should have hit the wire (cached for the rest).
+        graphql_calls = [c for c in client.calls
+                         if c["method"] == "POST" and c["path"] == "/graphql"]
+        self.assertEqual(len(graphql_calls), 1)
 
 
 if __name__ == "__main__":

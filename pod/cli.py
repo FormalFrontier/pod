@@ -1763,187 +1763,241 @@ class GHItem:
     timestamp: str      # ISO 8601 timestamp for the current state
 
 
+_TUI_REFRESH_QUERY = """
+query TuiRefresh($owner: String!, $name: String!) {
+  repository(owner: $owner, name: $name) {
+    openAgentPlan: issues(first: 100, states: OPEN,
+                           labels: ["agent-plan"]) {
+      nodes {
+        number title createdAt updatedAt
+        labels(first: 20) { nodes { name } }
+      }
+    }
+    openHumanOversight: issues(first: 100, states: OPEN,
+                                 labels: ["human-oversight"]) {
+      nodes {
+        number title createdAt updatedAt
+        labels(first: 20) { nodes { name } }
+      }
+    }
+    closedAgentPlan: issues(first: 30, states: CLOSED,
+                              labels: ["agent-plan"],
+                              orderBy: {field: UPDATED_AT, direction: DESC}) {
+      nodes {
+        number title createdAt updatedAt closedAt
+        labels(first: 20) { nodes { name } }
+      }
+    }
+    closedHumanOversight: issues(first: 30, states: CLOSED,
+                                   labels: ["human-oversight"],
+                                   orderBy: {field: UPDATED_AT, direction: DESC}) {
+      nodes {
+        number title createdAt updatedAt closedAt
+        labels(first: 20) { nodes { name } }
+      }
+    }
+    blocked: issues(first: 40, states: OPEN, labels: ["blocked"]) {
+      nodes { number body }
+    }
+    openIssueNumbers: issues(first: 100, states: OPEN) {
+      nodes { number }
+    }
+    hasPrIssues: issues(first: 40, states: OPEN, labels: ["has-pr"]) {
+      nodes {
+        number
+        closedByPullRequestsReferences(first: 20) {
+          nodes { number state }
+        }
+      }
+    }
+    pullRequests(first: 15,
+                  states: [OPEN, CLOSED, MERGED],
+                  orderBy: {field: UPDATED_AT, direction: DESC}) {
+      nodes {
+        number title state createdAt updatedAt closedAt mergedAt
+        labels(first: 20) { nodes { name } }
+        commits(last: 1) {
+          nodes {
+            commit {
+              statusCheckRollup { state }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
+
+_TUI_REFRESH_CACHE: tuple[float, dict | None] = (0.0, None)
+_TUI_REFRESH_TTL = 4.0  # seconds; matches the TUI's fast-path tick cadence
+_TUI_REFRESH_LOCK = threading.Lock()
+
+
+def _tui_refresh_batch() -> dict | None:
+    """One GraphQL query feeding all three TUI fetch helpers.
+
+    Burner-rewrite (B2): replaces 4–6 `gh issue list` / `gh pr list`
+    calls per TUI refresh tick with a single GraphQL request. The
+    `_TUI_REFRESH_LOCK` makes the check-then-fetch atomic, so three
+    concurrent background threads share one round-trip (rather than
+    each firing its own). The layer also ETag-caches the GraphQL
+    response (since the cache key includes a hash of the request body),
+    so cache-miss hits return 304s.
+    """
+    global _TUI_REFRESH_CACHE
+    with _TUI_REFRESH_LOCK:
+        now = time.time()
+        ts, cached = _TUI_REFRESH_CACHE
+        if cached is not None and (now - ts) < _TUI_REFRESH_TTL:
+            return cached
+        slug = _get_repo()
+        owner, _, name = slug.partition("/")
+        if not (owner and name):
+            return None
+        try:
+            resp = gh.get_client().graphql(
+                _TUI_REFRESH_QUERY,
+                variables={"owner": owner, "name": name},
+                cache="etag",
+            )
+        except Exception:
+            return None
+        if not resp.ok():
+            return None
+        body = resp.body() or {}
+        repo_node = (body.get("data") or {}).get("repository") or {}
+        if not repo_node:
+            return None
+        _TUI_REFRESH_CACHE = (now, repo_node)
+        return repo_node
+
+
+def _gql_rollup_to_ci(commits_node: dict) -> str:
+    """Map a single PR's last-commit `statusCheckRollup` to "pass" / "fail" / ""."""
+    nodes = (commits_node or {}).get("nodes") or []
+    if not nodes:
+        return ""
+    rollup = (((nodes[0] or {}).get("commit") or {})
+              .get("statusCheckRollup") or {})
+    state = rollup.get("state")
+    if state == "FAILURE":
+        return "fail"
+    if state in ("SUCCESS",):
+        return "pass"
+    return ""
+
+
 def fetch_issues_and_prs() -> list[GHItem]:
-    """Fetch issues (agent-plan or human-oversight label, all states) and recent PRs from GitHub."""
+    """Fetch issues (agent-plan or human-oversight label, all states)
+    and recent PRs from GitHub. Powered by the batched TUI GraphQL
+    query so it costs one round-trip (or a 304) per refresh tick."""
+    repo_node = _tui_refresh_batch()
+    if repo_node is None:
+        return []
     items: list[GHItem] = []
     seen_open: set[int] = set()
-    cwd = str(PROJECT_DIR)
-
-    issue_json = "--json=number,title,labels,state,createdAt,updatedAt,closedAt"
-    # All open issues (there should never be thousands of open ones)
-    for label in ("agent-plan", "human-oversight"):
-        try:
-            r = _gh_cli("issue", "list", "--label", label, "--state", "open",
-                        "--limit", "500", issue_json, timeout=30)
-            if r.returncode == 0:
-                for iss in json.loads(r.stdout):
-                    if iss["number"] in seen_open:
-                        continue
-                    seen_open.add(iss["number"])
-                    labels = [l["name"] for l in iss.get("labels", [])]
-                    ts = iss.get("updatedAt") or iss.get("createdAt", "")
-                    items.append(GHItem(
-                        kind="issue", number=iss["number"], title=iss["title"],
-                        labels=labels, ci_status="", state="open", timestamp=ts,
-                    ))
-        except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError):
-            pass
-    # Recent closed issues (just enough for context; display logic drops these first anyway)
+    for key in ("openAgentPlan", "openHumanOversight"):
+        nodes = ((repo_node.get(key) or {}).get("nodes")) or []
+        for iss in nodes:
+            num = iss.get("number")
+            if not isinstance(num, int) or num in seen_open:
+                continue
+            seen_open.add(num)
+            labels = [l.get("name") for l in
+                      ((iss.get("labels") or {}).get("nodes") or [])]
+            ts = iss.get("updatedAt") or iss.get("createdAt") or ""
+            items.append(GHItem(
+                kind="issue", number=num, title=iss.get("title", "") or "",
+                labels=labels, ci_status="", state="open", timestamp=ts,
+            ))
     seen_closed: set[int] = set()
-    for label in ("agent-plan", "human-oversight"):
-        try:
-            r = _gh_cli("issue", "list", "--label", label, "--state", "closed",
-                        "--limit", "30", issue_json, timeout=30)
-            if r.returncode == 0:
-                for iss in json.loads(r.stdout):
-                    if iss["number"] in seen_closed or iss["number"] in seen_open:
-                        continue
-                    seen_closed.add(iss["number"])
-                    labels = [l["name"] for l in iss.get("labels", [])]
-                    ts = iss.get("closedAt") or iss.get("updatedAt") or iss.get("createdAt", "")
-                    items.append(GHItem(
-                        kind="issue", number=iss["number"], title=iss["title"],
-                        labels=labels, ci_status="", state="closed", timestamp=ts,
-                    ))
-        except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError):
-            pass
-
-    # PRs (open + recently closed/merged)
-    try:
-        r = _gh_cli(
-            "pr", "list", "--state", "all", "--limit", "15",
-            "--json", "number,title,labels,statusCheckRollup,state,createdAt,updatedAt,closedAt,mergedAt",
-            timeout=30,
-        )
-        if r.returncode == 0:
-            for pr in json.loads(r.stdout):
-                labels = [l["name"] for l in pr.get("labels", [])]
-                # CI status from statusCheckRollup
-                ci = ""
-                checks = pr.get("statusCheckRollup", []) or []
-                if checks:
-                    if any(c.get("conclusion") == "FAILURE" for c in checks):
-                        ci = "fail"
-                    elif (any(c.get("conclusion") == "SUCCESS" for c in checks) and
-                          all(c.get("conclusion") == "SUCCESS" for c in checks if c.get("conclusion"))):
-                        ci = "pass"
-                pr_state = pr.get("state", "OPEN").lower()
-                ts = pr.get("mergedAt") or pr.get("closedAt") or "" if pr_state in ("merged", "closed") else pr.get("updatedAt") or pr.get("createdAt", "")
-                items.append(GHItem(
-                    kind="pr", number=pr["number"], title=pr["title"],
-                    labels=labels, ci_status=ci, state=pr_state, timestamp=ts,
-                ))
-    except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError):
-        pass
-
-    # Sort by number descending (newest first), issues before PRs at same number
+    for key in ("closedAgentPlan", "closedHumanOversight"):
+        nodes = ((repo_node.get(key) or {}).get("nodes")) or []
+        for iss in nodes:
+            num = iss.get("number")
+            if not isinstance(num, int):
+                continue
+            if num in seen_closed or num in seen_open:
+                continue
+            seen_closed.add(num)
+            labels = [l.get("name") for l in
+                      ((iss.get("labels") or {}).get("nodes") or [])]
+            ts = (iss.get("closedAt") or iss.get("updatedAt")
+                  or iss.get("createdAt") or "")
+            items.append(GHItem(
+                kind="issue", number=num, title=iss.get("title", "") or "",
+                labels=labels, ci_status="", state="closed", timestamp=ts,
+            ))
+    pr_nodes = ((repo_node.get("pullRequests") or {}).get("nodes")) or []
+    for pr in pr_nodes:
+        num = pr.get("number")
+        if not isinstance(num, int):
+            continue
+        labels = [l.get("name") for l in
+                  ((pr.get("labels") or {}).get("nodes") or [])]
+        ci = _gql_rollup_to_ci(pr.get("commits") or {})
+        pr_state = (pr.get("state") or "OPEN").lower()
+        if pr_state in ("merged", "closed"):
+            ts = pr.get("mergedAt") or pr.get("closedAt") or ""
+        else:
+            ts = pr.get("updatedAt") or pr.get("createdAt") or ""
+        items.append(GHItem(
+            kind="pr", number=num, title=pr.get("title", "") or "",
+            labels=labels, ci_status=ci, state=pr_state, timestamp=ts,
+        ))
     items.sort(key=lambda x: (-x.number, x.kind))
-
-    # Deduplicate: if an issue and PR share the same number, keep both
-    # (they're different GitHub objects)
     return items
 
 
 def fetch_blocked_deps() -> dict[int, list[int]]:
-    """Fetch open depends-on dependencies for blocked issues (closed deps filtered out).
-
-    Queries every open `blocked` issue regardless of family label
-    (`agent-plan`, `human-oversight`, etc.) so the TUI can render
-    `[Blocked on #N]` annotations consistently.
-    """
+    """Fetch open depends-on dependencies for blocked issues (closed
+    deps filtered out). Reads from the batched TUI GraphQL response."""
     import re as _re
-    try:
-        r = _gh_cli(
-            "issue", "list", "--label", "blocked",
-            "--state", "open", "--limit", "40", "--json", "number,body",
-            timeout=30,
-        )
-        if r.returncode != 0:
-            return {}
-
-        raw: dict[int, list[int]] = {}
-        for iss in json.loads(r.stdout):
-            deps = [int(d) for d in _re.findall(r"depends-on: #(\d+)", iss.get("body", ""))]
-            if deps:
-                raw[iss["number"]] = deps
-        if not raw:
-            return {}
-
-        # Fetch open issue numbers to filter out closed deps
-        r2 = _gh_cli(
-            "issue", "list", "--state", "open", "--limit", "100",
-            "--json", "number", "--jq", "[.[].number]",
-            timeout=30,
-        )
-        open_nums: set[int] = set(json.loads(r2.stdout)) if r2.returncode == 0 else set()
-
-        return {num: filtered for num, deps in raw.items()
-                if (filtered := [d for d in deps if d in open_nums])}
-    except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError):
+    repo_node = _tui_refresh_batch()
+    if repo_node is None:
         return {}
+    blocked = ((repo_node.get("blocked") or {}).get("nodes")) or []
+    open_nums_nodes = ((repo_node.get("openIssueNumbers") or {})
+                        .get("nodes")) or []
+    open_nums = {n.get("number") for n in open_nums_nodes
+                 if isinstance(n, dict) and isinstance(n.get("number"), int)}
+    raw: dict[int, list[int]] = {}
+    for iss in blocked:
+        num = iss.get("number")
+        if not isinstance(num, int):
+            continue
+        body = iss.get("body") or ""
+        deps = [int(d) for d in _re.findall(r"depends-on: #(\d+)", body)]
+        if deps:
+            raw[num] = deps
+    return {num: filtered for num, deps in raw.items()
+            if (filtered := [d for d in deps if d in open_nums])}
 
 
 def fetch_has_pr_links() -> dict[int, list[int]]:
-    """Fetch open linked PRs for each open `has-pr` issue.
-
-    Returned dict maps issue number → list of OPEN PR numbers that
-    reference the issue via `Closes #N` (GitHub's `closedByPullRequestsReferences`).
-    An empty list means the `has-pr` label is orphan: every PR that
-    once linked the issue has merged or been closed without
-    auto-closing it. The caller should still emit the entry so the
-    TUI can flag the orphan; auto-cleanup happens in housekeeping
-    via `coordination check-has-pr`.
-
-    Note on the two-step lookup: `gh issue view --json
-    closedByPullRequestsReferences` returns objects with
-    `id`/`number`/`repository`/`url` only — no `state` — so we have
-    to dereference each PR via `gh pr view --json state` to filter
-    out closed/merged ones. Has-pr issues are typically few (≤ 10),
-    so the N+1 cost is bounded.
-    """
-    try:
-        r = _gh_cli(
-            "issue", "list", "--label", "has-pr",
-            "--state", "open", "--limit", "40", "--json", "number",
-            timeout=30,
-        )
-        if r.returncode != 0:
-            return {}
-
-        issue_nums = [iss["number"] for iss in json.loads(r.stdout)]
-        if not issue_nums:
-            return {}
-
-        result: dict[int, list[int]] = {}
-        for num in issue_nums:
-            r2 = _gh_cli(
-                "issue", "view", str(num),
-                "--json", "closedByPullRequestsReferences",
-                "--jq", "[.closedByPullRequestsReferences[].number]",
-                timeout=15,
-            )
-            if r2.returncode != 0:
-                result[num] = []
-                continue
-            try:
-                refs = json.loads(r2.stdout) or []
-            except json.JSONDecodeError:
-                result[num] = []
-                continue
-
-            open_prs: list[int] = []
-            for pr_num in refs:
-                r3 = _gh_cli(
-                    "pr", "view", str(pr_num),
-                    "--json", "state", "--jq", ".state",
-                    timeout=15,
-                )
-                if r3.returncode == 0 and r3.stdout.strip() == "OPEN":
-                    open_prs.append(pr_num)
-            result[num] = open_prs
-        return result
-    except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError):
+    """For every open `has-pr` issue, return the list of currently-OPEN
+    closing PRs. Empty list means the label is orphan (all referenced
+    PRs merged or closed) — caller still gets the entry. Reads from
+    the batched TUI GraphQL response, so the previous N+1 fan-out via
+    `gh pr view` becomes 0 extra calls."""
+    repo_node = _tui_refresh_batch()
+    if repo_node is None:
         return {}
+    has_pr = ((repo_node.get("hasPrIssues") or {}).get("nodes")) or []
+    out: dict[int, list[int]] = {}
+    for iss in has_pr:
+        num = iss.get("number")
+        if not isinstance(num, int):
+            continue
+        prs = ((iss.get("closedByPullRequestsReferences") or {})
+               .get("nodes") or [])
+        open_prs = [p.get("number") for p in prs
+                    if isinstance(p, dict) and p.get("state") == "OPEN"
+                    and isinstance(p.get("number"), int)]
+        out[num] = open_prs
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -2809,8 +2863,19 @@ def check_repo_security(config: dict) -> None:
         _security_last_ok = now
         return
 
+    # B3 burner rewrite: a single GraphQL query returns visibility +
+    # interactionAbility in one round-trip instead of two REST calls.
+    owner, _, name = slug.partition("/")
     try:
-        resp = gh.get_client().get(f"/repos/{slug}", timeout=15)
+        resp = gh.get_client().graphql(
+            "query($owner: String!, $name: String!) {"
+            "  repository(owner: $owner, name: $name) {"
+            "    visibility"
+            "    interactionAbility { limit expiresAt origin }"
+            "  }"
+            "}",
+            variables={"owner": owner, "name": name},
+        )
     except FileNotFoundError:
         print("pod: security: `gh` CLI not found; cannot verify interaction limits.",
               file=sys.stderr)
@@ -2826,7 +2891,9 @@ def check_repo_security(config: dict) -> None:
             print("    → run `gh auth status` / `gh auth login` and retry.",
                   file=sys.stderr)
         sys.exit(1)
-    visibility = ((resp.body() or {}).get("visibility") or "").lower()
+    body = resp.body() or {}
+    repo_node = ((body.get("data") or {}).get("repository") or {})
+    visibility = (repo_node.get("visibility") or "").lower()
     if not visibility:
         print("pod: security: cannot determine repo visibility: empty response",
               file=sys.stderr)
@@ -2837,37 +2904,28 @@ def check_repo_security(config: dict) -> None:
         _security_last_ok = now
         return
 
-    try:
-        resp = gh.get_client().get(f"/repos/{slug}/interaction-limits",
-                                    timeout=15)
-    except Exception as e:
-        _security_fail(slug, f"failed to query interaction-limits: {e}")
-    if not resp.ok():
-        err = f"HTTP {resp.status}"
-        is_auth = resp.status in (401, 403)
-        _security_fail(slug, f"failed to query interaction-limits: {err}",
-                       auth_hint=is_auth)
-
-    data = resp.body() or {}
-
-    if not data:
+    ability = repo_node.get("interactionAbility") or None
+    if not ability:
         _security_fail(slug,
             "no interaction limit set on this public repo. "
             "Random GitHub users can post issues/comments whose contents "
             "feed into pod agent prompts.")
 
-    have = data.get("limit", "")
+    # GraphQL `InteractionAbility` enum: COLLABORATORS_ONLY / etc.
+    # Convert to lowercase REST shape for ranking against config.
+    have_raw = ability.get("limit") or ""
+    have = have_raw.lower() if isinstance(have_raw, str) else ""
     if _INTERACTION_LIMIT_RANK.get(have, 0) < _INTERACTION_LIMIT_RANK.get(minimum, 0):
         _security_fail(slug,
             f"interaction limit is `{have or 'unknown'}`, "
             f"but pod requires `{minimum}` or stricter.")
 
-    expires = data.get("expires_at")
+    expires = ability.get("expiresAt")
     if expires:
         try:
             t = datetime.datetime.fromisoformat(expires.replace("Z", "+00:00"))
         except ValueError:
-            _security_fail(slug, f"unparseable expires_at: {expires!r}")
+            _security_fail(slug, f"unparseable expiresAt: {expires!r}")
         delta = t - datetime.datetime.now(datetime.timezone.utc)
         days = delta.total_seconds() / 86400
         if days < min_days:
@@ -2936,44 +2994,110 @@ def _is_repo_public(config: dict) -> bool:
     return visibility == "public"
 
 
+_PROVENANCE_QUERY = """
+query Provenance($owner: String!, $name: String!, $num: Int!) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $num) {
+      author { login }
+      authorAssociation
+      comments(first: 100) {
+        nodes {
+          databaseId
+          author { login }
+          authorAssociation
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}
+"""
+
+
 def fetch_issue_provenance(repo: str, issue_num: int) -> _IssueProvenance:
     """Fetch the issue + its comments and bundle author/association data.
 
-    Two layer-routed reads per issue: one for the issue, one paginated
-    for comments. ETag-cached, so steady-state cost is two 304s per
-    repeat. Raises RuntimeError on layer failure so callers can surface
-    a clear error.
+    Burner-rewrite (B4): one GraphQL query returns issue author +
+    authorAssociation and the first 100 comments (with author +
+    association) in a single round-trip. Falls back to the REST path
+    for the rare case of >100 comments on a single agent-plan issue.
+    Raises RuntimeError on layer failure so callers can surface a
+    clear error.
     """
     client = gh.get_client()
-    issue_resp = client.get(f"/repos/{repo}/issues/{issue_num}", timeout=30)
-    if not issue_resp.ok():
-        raise RuntimeError(
-            f"failed to fetch issue {repo}#{issue_num}: HTTP {issue_resp.status}")
-    issue = issue_resp.body() or {}
+    owner, _, name = repo.partition("/")
+    if not (owner and name):
+        raise RuntimeError(f"unparseable repo slug: {repo!r}")
 
-    comments_raw: list = []
-    for page in client.paginate(f"/repos/{repo}/issues/{issue_num}/comments",
-                                 max_pages=10):
-        if not page.ok():
-            raise RuntimeError(
-                f"failed to page comments for {repo}#{issue_num}: "
-                f"HTTP {page.status}")
-        body = page.body() or []
-        if isinstance(body, list):
-            comments_raw.extend(body)
-    comments = [
-        _ProvenanceComment(
-            comment_id=int(c.get("id", 0)),
-            login=(c.get("user") or {}).get("login", "") or "",
-            association=c.get("author_association", "NONE") or "NONE",
-        )
-        for c in comments_raw
-    ]
+    resp = client.graphql(_PROVENANCE_QUERY,
+                          variables={"owner": owner, "name": name,
+                                     "num": issue_num})
+    if not resp.ok():
+        raise RuntimeError(
+            f"failed to fetch provenance for {repo}#{issue_num}: "
+            f"HTTP {resp.status}")
+    body = resp.body() or {}
+    issue_node = (((body.get("data") or {}).get("repository") or {})
+                  .get("issue") or {})
+    if not issue_node:
+        # GraphQL "errors" payload, or issue not found.
+        raise RuntimeError(
+            f"failed to fetch provenance for {repo}#{issue_num}: "
+            "GraphQL returned no issue node")
+
+    author = (issue_node.get("author") or {}).get("login") or ""
+    author_assoc = issue_node.get("authorAssociation") or "NONE"
+
+    comments_node = issue_node.get("comments") or {}
+    nodes = comments_node.get("nodes") or []
+    page_info = comments_node.get("pageInfo") or {}
+    has_next = bool(page_info.get("hasNextPage"))
+
+    comments: list[_ProvenanceComment] = []
+    for c in nodes:
+        if not isinstance(c, dict):
+            continue
+        cid = c.get("databaseId") or 0
+        login = (c.get("author") or {}).get("login") or ""
+        assoc = c.get("authorAssociation") or "NONE"
+        comments.append(_ProvenanceComment(
+            comment_id=int(cid), login=login, association=assoc))
+
+    # Rare edge case: >100 comments. Fall back to the REST paginate path
+    # so we don't silently miss an untrusted commenter past the 100th
+    # row. This costs one extra page request via httpx.
+    if has_next:
+        for page in client.paginate(
+                f"/repos/{repo}/issues/{issue_num}/comments",
+                max_pages=20):
+            if not page.ok():
+                raise RuntimeError(
+                    f"failed to page comments for {repo}#{issue_num}: "
+                    f"HTTP {page.status}")
+            page_body = page.body() or []
+            if not isinstance(page_body, list):
+                continue
+            # The GraphQL first page already covered the first 100.
+            # The REST endpoint orders by created_at ascending (oldest
+            # first), so we re-extract everything here and deduplicate
+            # by id rather than guessing pagination cursors.
+            for rc in page_body:
+                if not isinstance(rc, dict):
+                    continue
+                rid = int(rc.get("id") or 0)
+                if not rid or any(c.comment_id == rid for c in comments):
+                    continue
+                comments.append(_ProvenanceComment(
+                    comment_id=rid,
+                    login=(rc.get("user") or {}).get("login", "") or "",
+                    association=rc.get("author_association", "NONE") or "NONE",
+                ))
+
     return _IssueProvenance(
         repo=repo,
         issue_num=issue_num,
-        author_login=(issue.get("user") or {}).get("login", "") or "",
-        author_association=issue.get("author_association", "NONE") or "NONE",
+        author_login=author,
+        author_association=author_assoc,
         comments=comments,
         fetched_at=time.time(),
     )
@@ -3403,218 +3527,208 @@ def check_dead_claimed_issues(config: dict):
             _save_claim_history(history)
 
 
+_RECONCILE_BATCH_QUERY = """
+query ReconcileBatch($owner: String!, $name: String!) {
+  repository(owner: $owner, name: $name) {
+    issues(first: 50, states: OPEN,
+           labels: ["agent-plan", "claimed"]) {
+      nodes {
+        number
+        state
+        labels(first: 20) { nodes { name } }
+        comments(last: 100) {
+          nodes { databaseId createdAt body }
+        }
+      }
+    }
+  }
+}
+"""
+
+
 def reconcile_untracked_github_claims():
-    """Periodic safety net: find GitHub issues with 'claimed' label that are
-    not tracked in local claim-history.json, and either backfill them (if the
-    owning session is still alive) or release them (if dead and past the grace
-    period).
+    """Periodic safety net: find GitHub issues with 'claimed' label that
+    are not tracked in local claim-history.json, and either backfill them
+    (if the owning session is still alive) or release them (if dead and
+    past the grace period).
 
-    This covers the gap where a claim was recorded on GitHub (label + comment)
-    but never made it into claim-history.json — e.g. because the JSONL monitor
-    missed the `coordination claim` command, or the agent died before
-    record_claim() fired.
+    Burner-rewrite (B1): one GraphQL query returns state + labels +
+    latest comments for every claimed agent-plan issue in one shot,
+    replacing the previous N+1 fan-out (`gh issue list` plus ~3 REST
+    `gh issue view`s per issue). Per-issue REST writes (label remove +
+    comment) are still made, only for the small set that actually need
+    releasing.
 
-    Fail-closed: any GitHub API error skips that issue rather than releasing it.
+    Fail-closed: any GitHub API error skips that issue rather than
+    releasing it.
     """
     import re as _re
 
     repo = _get_repo()
     grace_seconds = 600  # 10 minutes — don't release very fresh claims
+    client = gh.get_client()
 
-    # 1. Query GitHub for all currently-claimed issues
+    owner, _, name = repo.partition("/")
+    if not (owner and name):
+        return
+
     try:
-        r = _gh_cli(
-            "issue", "list", "--label", "agent-plan", "--label", "claimed",
-            "--state", "open", "--limit", "100", "--json", "number",
-            timeout=30,
-        )
-        if _is_rate_limit_error(r):
-            log("reconcile_untracked_github_claims: aborting — GraphQL rate-limited "
-                "on initial issue list")
-            return
-        if r.returncode != 0:
-            return
-        github_claimed = {iss["number"] for iss in json.loads(r.stdout)}
-    except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError):
+        resp = client.graphql(_RECONCILE_BATCH_QUERY,
+                              variables={"owner": owner, "name": name})
+    except Exception as e:
+        log(f"reconcile_untracked_github_claims: batch query failed: {e}")
+        return
+    if resp.status == 403:
+        log("reconcile_untracked_github_claims: aborting — GraphQL rate-limited")
+        return
+    if not resp.ok():
+        return
+    body = resp.body() or {}
+    nodes = (((body.get("data") or {}).get("repository") or {}
+              ).get("issues") or {}).get("nodes") or []
+    if not nodes:
         return
 
-    if not github_claimed:
-        return
-
-    # 2. Which of these are already tracked locally?
     history = load_claim_history()
     tracked = set()
-    # Map issue → timestamp of the claim comment we already released.
-    # If the latest claim comment on GitHub has a newer timestamp, it's
-    # a different claim and we must not skip it.
-    released_at: dict[int, str] = {}  # issue_num → released claim_comment_time
+    released_at: dict[int, str] = {}
     for k, v in history.items():
-        issue = int(k)
+        try:
+            issue = int(k)
+        except (TypeError, ValueError):
+            continue
         if v.get("released"):
             released_at[issue] = v.get("released_comment_time", "")
         else:
             tracked.add(issue)
-    untracked = github_claimed - tracked
-    if not untracked:
-        return
 
-    # 3. Get live agent UUIDs for backfill check
     agents = read_all_agents()
-    live_uuids = {a.uuid for a in agents if a.status not in ("dead", "stopped")}
+    live_uuids = {a.uuid for a in agents
+                  if a.status not in ("dead", "stopped")}
 
     now_epoch = time.time()
     released_count = 0
     backfilled_count = 0
 
-    try:
-        for issue_num in sorted(untracked):
-            # Fetch the latest "Claimed by session" comment for this issue
-            try:
-                r = _gh_cli(
-                    "issue", "view", str(issue_num), "--repo", repo,
-                    "--json", "comments",
-                    "--jq", '[.comments[] | select(.body | startswith("Claimed by session"))] | sort_by(.createdAt) | last | {body, created_at: .createdAt}',
-                    timeout=60,
-                )
-                if _is_rate_limit_error(r):
-                    raise _GraphQLRateLimited(
-                        f"comment fetch rate-limited for #{issue_num}")
-                if r.returncode != 0:
-                    continue
-                comment_data = json.loads(r.stdout.strip()) if r.stdout.strip() else None
-                if not comment_data:
-                    continue
-            except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError):
-                continue
+    claim_re = _re.compile(
+        r'Claimed by session `([^`]+)` on branch `agent/([^`]+)`')
 
-            comment_body = comment_data.get("body", "")
-            comment_time = comment_data.get("created_at", "")
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        issue_num = node.get("number")
+        if not isinstance(issue_num, int):
+            continue
+        if issue_num in tracked:
+            continue
 
-            # Parse: "Claimed by session `UUID` on branch `agent/SHORT_ID`"
-            m = _re.search(r'Claimed by session `([^`]+)` on branch `agent/([^`]+)`', comment_body)
-            if not m:
-                continue
-            owner_uuid, short_id = m.group(1), m.group(2)
+        labels = [l.get("name") for l in
+                  (((node.get("labels") or {}).get("nodes")) or [])]
+        if "claimed" not in labels:
+            continue
+        comments = ((node.get("comments") or {}).get("nodes")) or []
+        # Latest "Claimed by session …" comment by createdAt.
+        claim_comments = [c for c in comments
+                          if isinstance(c, dict)
+                          and (c.get("body") or "").startswith(
+                              "Claimed by session")]
+        if not claim_comments:
+            continue
+        claim_comments.sort(key=lambda c: c.get("createdAt") or "")
+        latest = claim_comments[-1]
+        comment_body = latest.get("body", "") or ""
+        comment_time = latest.get("createdAt", "") or ""
 
-            # Skip if the latest claim comment is the same one we already released.
-            # Compare by timestamp: if a newer claim comment exists, it's a new
-            # claim (possibly by the same UUID via resume) and must not be skipped.
-            prev_released_time = released_at.get(issue_num, "")
-            if prev_released_time and comment_time and comment_time <= prev_released_time:
-                continue
+        m = claim_re.search(comment_body)
+        if not m:
+            continue
+        owner_uuid, short_id = m.group(1), m.group(2)
 
-            # If the owning session is still alive, backfill into claim history
-            if owner_uuid in live_uuids:
-                with _claim_history_filelock():
-                    h = load_claim_history()
-                    key = str(issue_num)
-                    if key not in h or h[key].get("released"):
-                        h[key] = {"session_uuid": owner_uuid, "short_id": short_id, "restart_count": 0}
-                        _save_claim_history(h)
-                        backfilled_count += 1
-                        log(f"Reconcile: backfilled claim #{issue_num} → session {owner_uuid[:8]}")
-                continue
+        # Same-claim short-circuit: we already released this exact comment.
+        prev_released_time = released_at.get(issue_num, "")
+        if (prev_released_time and comment_time
+                and comment_time <= prev_released_time):
+            continue
 
-            # Owner is dead — check grace period using claim comment timestamp
-            try:
-                from datetime import datetime, timezone
-                claim_dt = datetime.fromisoformat(comment_time.replace("Z", "+00:00"))
-                claim_epoch = claim_dt.timestamp()
-            except (ValueError, TypeError):
-                continue  # Can't parse timestamp, skip
-
-            age = now_epoch - claim_epoch
-            if age < grace_seconds:
-                continue  # Too fresh, might be a just-claimed issue
-
-            # Re-fetch latest claim owner before releasing (compare-and-swap)
-            try:
-                r2 = _gh_cli(
-                    "issue", "view", str(issue_num), "--repo", repo,
-                    "--json", "comments",
-                    "--jq", '[.comments[] | select(.body | startswith("Claimed by session"))] | sort_by(.createdAt) | last | .body',
-                    timeout=60,
-                )
-                if _is_rate_limit_error(r2):
-                    raise _GraphQLRateLimited(
-                        f"CAS fetch rate-limited for #{issue_num}")
-                if r2.returncode != 0:
-                    continue
-                latest_body = r2.stdout.strip().strip('"')
-            except (subprocess.TimeoutExpired, OSError):
-                continue
-
-            m2 = _re.search(r'Claimed by session `([^`]+)`', latest_body)
-            if not m2 or m2.group(1) != owner_uuid:
-                continue  # Owner changed since our first read — someone reclaimed it
-
-            # Re-check liveness — agent state may have changed during API calls.
-            # Check if ANY live agent has this issue claimed (not just the owner
-            # from the GitHub comment — another agent may have picked it up).
-            fresh_agents = read_all_agents()
-            fresh_live = {a.uuid for a in fresh_agents if a.status not in ("dead", "stopped", "killed")}
-            if owner_uuid in fresh_live:
-                continue  # Owner came back to life (e.g. resumed session)
-            if any(a.claimed_issue == issue_num and a.uuid in fresh_live for a in fresh_agents):
-                continue  # Another live agent has this issue — don't release
-
-            # Release the stale claim — first verify the label is still present
-            # (prevents N parallel reconcilers from all posting release comments)
-            try:
-                r_label_check = _gh_cli(
-                    "issue", "view", str(issue_num), "--repo", repo,
-                    "--json", "labels",
-                    "--jq", '[.labels[].name] | any(. == "claimed")',
-                    timeout=30,
-                )
-                if _is_rate_limit_error(r_label_check):
-                    raise _GraphQLRateLimited(
-                        f"label probe rate-limited for #{issue_num}")
-                if r_label_check.returncode != 0 or r_label_check.stdout.strip() != "true":
-                    continue  # Label already removed by another reconciler
-
-                r3 = _gh_cli(
-                    "issue", "edit", str(issue_num), "--repo", repo,
-                    "--remove-label", "claimed", timeout=30,
-                )
-                if _is_rate_limit_error(r3):
-                    raise _GraphQLRateLimited(
-                        f"label remove rate-limited for #{issue_num}")
-                if r3.returncode != 0:
-                    continue
-                age_str = f"{int(age // 3600)}h{int((age % 3600) // 60)}m"
-                msg = (f"Stale claim released by reconciler — session `{owner_uuid}` "
-                       f"is no longer running (claimed {age_str} ago). Available for reclaim.")
-                r_comment = _gh_cli(
-                    "issue", "comment", str(issue_num), "--repo", repo,
-                    "--body", msg, timeout=30,
-                )
-                if _is_rate_limit_error(r_comment):
-                    raise _GraphQLRateLimited(
-                        f"release comment rate-limited for #{issue_num}")
-                # Record in history so we don't re-process this exact claim.
-                # Store the comment timestamp so we can distinguish this release
-                # from a future re-claim (even by the same UUID via resume).
-                with _claim_history_filelock():
-                    h = load_claim_history()
-                    key = str(issue_num)
-                    h[key] = {
-                        "session_uuid": owner_uuid,
-                        "short_id": short_id,
-                        "restart_count": 0,
-                        "released": True,
-                        "released_comment_time": comment_time,
-                    }
+        # Owner alive → backfill into history; don't release.
+        if owner_uuid in live_uuids:
+            with _claim_history_filelock():
+                h = load_claim_history()
+                key = str(issue_num)
+                if key not in h or h[key].get("released"):
+                    h[key] = {"session_uuid": owner_uuid,
+                              "short_id": short_id,
+                              "restart_count": 0}
                     _save_claim_history(h)
-                released_count += 1
-                log(f"Reconcile: released stale claim #{issue_num} (owner {owner_uuid[:8]}, age {age_str})")
-            except (subprocess.TimeoutExpired, OSError):
+                    backfilled_count += 1
+                    log(f"Reconcile: backfilled claim #{issue_num} → "
+                        f"session {owner_uuid[:8]}")
+            continue
+
+        # Owner dead → grace check.
+        try:
+            claim_dt = datetime.datetime.fromisoformat(
+                comment_time.replace("Z", "+00:00"))
+            claim_epoch = claim_dt.timestamp()
+        except (ValueError, TypeError):
+            continue
+        age = now_epoch - claim_epoch
+        if age < grace_seconds:
+            continue
+
+        # Re-check liveness right before mutating.
+        fresh_agents = read_all_agents()
+        fresh_live = {a.uuid for a in fresh_agents
+                       if a.status not in ("dead", "stopped", "killed")}
+        if owner_uuid in fresh_live:
+            continue
+        if any(a.claimed_issue == issue_num and a.uuid in fresh_live
+               for a in fresh_agents):
+            continue
+
+        # Per-issue REST writes: label remove + release comment. The
+        # batched GraphQL response is our "label still present" probe;
+        # the layer's ETag cache makes a follow-up check fast if a
+        # caller wants extra paranoia, but in steady state the GraphQL
+        # snapshot is accurate within seconds.
+        try:
+            r3 = _gh_cli("issue", "edit", str(issue_num), "--repo", repo,
+                          "--remove-label", "claimed", timeout=30)
+            if _is_rate_limit_error(r3):
+                log(f"reconcile: rate-limited on label remove for "
+                    f"#{issue_num}; aborting sweep")
+                break
+            if r3.returncode != 0:
                 continue
-    except _GraphQLRateLimited as e:
-        log(f"reconcile_untracked_github_claims: aborting sweep — {e}")
+            age_str = f"{int(age // 3600)}h{int((age % 3600) // 60)}m"
+            msg = (f"Stale claim released by reconciler — session "
+                   f"`{owner_uuid}` is no longer running "
+                   f"(claimed {age_str} ago). Available for reclaim.")
+            r_comment = _gh_cli("issue", "comment", str(issue_num),
+                                 "--repo", repo, "--body", msg, timeout=30)
+            if _is_rate_limit_error(r_comment):
+                log(f"reconcile: rate-limited on release comment for "
+                    f"#{issue_num}; aborting sweep")
+                break
+            with _claim_history_filelock():
+                h = load_claim_history()
+                h[str(issue_num)] = {
+                    "session_uuid": owner_uuid,
+                    "short_id": short_id,
+                    "restart_count": 0,
+                    "released": True,
+                    "released_comment_time": comment_time,
+                }
+                _save_claim_history(h)
+            released_count += 1
+            log(f"Reconcile: released stale claim #{issue_num} "
+                f"(owner {owner_uuid[:8]}, age {age_str})")
+        except (subprocess.TimeoutExpired, OSError):
+            continue
 
     if released_count or backfilled_count:
-        log(f"Reconcile: {backfilled_count} backfilled, {released_count} released")
+        log(f"Reconcile: {backfilled_count} backfilled, "
+            f"{released_count} released")
 
 
 def check_dead_pr_claimed_prs(config: dict):
@@ -7232,6 +7346,15 @@ def main():
     p_filter.add_argument("--include-untrusted", action="store_true",
                            help="Surface untrusted issues with [UNTRUSTED: ...] prefix")
 
+    # Hidden dispatcher used by the `coordination` shim script. Carries
+    # the bash script's argv shape: first arg is the subcommand, rest
+    # are its args. Logic lives in `pod/coordination.py`.
+    p_coordination_dispatch = sub.add_parser(
+        "_coordination", help=argparse.SUPPRESS,
+    )
+    p_coordination_dispatch.add_argument(
+        "coord_args", nargs=argparse.REMAINDER)
+
     args = parser.parse_args()
 
     # Handle subcommands that don't require ensure_config()
@@ -7244,6 +7367,9 @@ def main():
     elif args.command == "coordination":
         cmd_coordination(args)
         return
+    elif args.command == "_coordination":
+        from pod.coordination import main as _coord_main
+        sys.exit(_coord_main(args.coord_args or []))
 
     config = ensure_config()
 
