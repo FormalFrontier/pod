@@ -29,42 +29,48 @@ COORDINATION = PROJECT_ROOT / "pod" / "data" / "coordination"
 
 def _make_stub_gh(stub_dir: Path, body: str, existing_pr_number: int = 42) -> Path:
     """Write a stub `gh` shell script that emulates just the API calls
-    `cmd_create_pr` makes before the guard fires."""
+    `cmd_create_pr` makes before the guard fires.
+
+    Built without `textwrap.dedent` because the legacy bash version
+    tolerated an indented shebang (the shell falls back to running the
+    script via /bin/sh on exec-format error), but Python's
+    `subprocess.run` does not, and the post-port coordination dispatcher
+    raises `OSError(Errno 8: Exec format error)`. Writing the script
+    with explicit `\\n` keeps the shebang at byte 0 regardless of the
+    interpolated `body` content.
+    """
     stub = stub_dir / "gh"
-    stub.write_text(textwrap.dedent(f"""\
-        #!/bin/bash
-        # Minimal gh stub for cmd_create_pr guard test. Routes by argv shape.
-        set -e
-        case "$1 $2" in
-          "repo view")
-            # `gh repo view --json nameWithOwner -q .nameWithOwner` etc.
-            for arg in "$@"; do
-              case "$arg" in
-                .nameWithOwner) echo "owner/repo"; exit 0;;
-                .defaultBranchRef.name) echo "main"; exit 0;;
-              esac
-            done
-            exit 0;;
-          "pr list")
-            # First call: --head BRANCH --json number --jq '.[0].number // empty'
-            echo "{existing_pr_number}"
-            exit 0;;
-          "pr view")
-            # `gh pr view N --repo owner/repo --json body --jq .body`
-            cat <<'EOF_BODY'
-{body}
-EOF_BODY
-            exit 0;;
-          "pr merge")
-            exit 0;;
-          "issue edit")
-            exit 0;;
-          *)
-            # Default: success, empty stdout. Sufficient for any other
-            # incidental call the script makes.
-            exit 0;;
-        esac
-    """))
+    script = (
+        "#!/bin/bash\n"
+        "# Minimal gh stub for cmd_create_pr guard test. Routes by argv shape.\n"
+        "set -e\n"
+        "case \"$1 $2\" in\n"
+        "  \"repo view\")\n"
+        "    # `gh repo view --json nameWithOwner -q .nameWithOwner` etc.\n"
+        "    for arg in \"$@\"; do\n"
+        "      case \"$arg\" in\n"
+        "        .nameWithOwner) echo \"owner/repo\"; exit 0;;\n"
+        "        .defaultBranchRef.name) echo \"main\"; exit 0;;\n"
+        "      esac\n"
+        "    done\n"
+        "    exit 0;;\n"
+        "  \"pr list\")\n"
+        f"    echo \"{existing_pr_number}\"\n"
+        "    exit 0;;\n"
+        "  \"pr view\")\n"
+        "    cat <<'EOF_BODY'\n"
+        f"{body}\n"
+        "EOF_BODY\n"
+        "    exit 0;;\n"
+        "  \"pr merge\")\n"
+        "    exit 0;;\n"
+        "  \"issue edit\")\n"
+        "    exit 0;;\n"
+        "  *)\n"
+        "    exit 0;;\n"
+        "esac\n"
+    )
+    stub.write_text(script)
     stub.chmod(stub.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     return stub
 
@@ -109,18 +115,30 @@ class CreatePrGuardTests(unittest.TestCase):
         self.stub_dir.mkdir()
         _make_stub_git_push(self.stub_dir)
 
-        # Wipe any cached repo info from prior runs that could reference
-        # the temp dir's slug (cache key is path-derived).
+        # Pre-seed the repo / base-branch caches so coordination doesn't
+        # try to hit the real `api.github.com` looking up default_branch
+        # (the bash version went through `gh repo view`, our port routes
+        # the default-branch lookup through the layer's httpx client which
+        # WILL touch the network).
         toplevel = subprocess.run(["git", "rev-parse", "--show-toplevel"],
                                   cwd=self.repo, capture_output=True, text=True,
                                   check=True).stdout.strip()
         cache_key = toplevel.replace("/", "-")
-        for cache in (f"/tmp/pod-repo-cache{cache_key}",
-                      f"/tmp/pod-base-branch-cache{cache_key}"):
-            try:
-                os.unlink(cache)
-            except FileNotFoundError:
-                pass
+        Path(f"/tmp/pod-repo-cache{cache_key}").write_text("owner/repo\n")
+        Path(f"/tmp/pod-base-branch-cache{cache_key}").write_text("main\n")
+        # Also pre-seed the labels-ensured flag so we don't try to
+        # bootstrap labels (which would issue a dozen gh stub calls).
+        Path(f"/tmp/pod-labels-ensured-owner-repo").touch()
+        # Clean up the seeded files after the test.
+        def _cleanup_caches():
+            for p in (f"/tmp/pod-repo-cache{cache_key}",
+                      f"/tmp/pod-base-branch-cache{cache_key}",
+                      "/tmp/pod-labels-ensured-owner-repo"):
+                try:
+                    os.unlink(p)
+                except FileNotFoundError:
+                    pass
+        self.addCleanup(_cleanup_caches)
 
     def _run(self, body: str, partial: bool = False):
         _make_stub_gh(self.stub_dir, body=body)

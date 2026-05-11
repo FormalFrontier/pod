@@ -7232,6 +7232,15 @@ def main():
     p_filter.add_argument("--include-untrusted", action="store_true",
                            help="Surface untrusted issues with [UNTRUSTED: ...] prefix")
 
+    # Hidden dispatcher used by the `coordination` shim script. Carries
+    # the bash script's argv shape: first arg is the subcommand, rest
+    # are its args. Logic lives in `pod/coordination.py`.
+    p_coordination_dispatch = sub.add_parser(
+        "_coordination", help=argparse.SUPPRESS,
+    )
+    p_coordination_dispatch.add_argument(
+        "coord_args", nargs=argparse.REMAINDER)
+
     args = parser.parse_args()
 
     # Handle subcommands that don't require ensure_config()
@@ -7244,6 +7253,9 @@ def main():
     elif args.command == "coordination":
         cmd_coordination(args)
         return
+    elif args.command == "_coordination":
+        from pod.coordination import main as _coord_main
+        sys.exit(_coord_main(args.coord_args or []))
 
     config = ensure_config()
 

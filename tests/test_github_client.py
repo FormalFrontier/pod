@@ -235,6 +235,40 @@ class PaginateTests(_Tmp):
             c.close()
         self.assertEqual(seen_pages, [1, 2, 3])
 
+    def test_list_open_issues_excludes_prs_by_default(self):
+        # REST /issues returns PRs as issue-shaped objects with
+        # `pull_request` set. `gh issue list` excludes them. Our helper
+        # must match `gh`'s sense.
+        def h(req: httpx.Request) -> httpx.Response:
+            body = [
+                {"number": 1, "title": "real issue"},
+                {"number": 2, "title": "actually a PR",
+                 "pull_request": {"url": "..."}},
+                {"number": 3, "title": "another issue"},
+            ]
+            return _resp(200, json_body=body)
+
+        c = _client(h, cache_dir=self.cache_dir, log_path=self.log_path)
+        try:
+            result = c.list_open_issues("o/r", labels=["agent-plan"])
+        finally:
+            c.close()
+        self.assertEqual([x["number"] for x in result], [1, 3])
+
+    def test_list_open_issues_include_prs_when_requested(self):
+        def h(req: httpx.Request) -> httpx.Response:
+            return _resp(200, json_body=[
+                {"number": 1, "title": "issue"},
+                {"number": 2, "title": "pr", "pull_request": {"url": "..."}},
+            ])
+
+        c = _client(h, cache_dir=self.cache_dir, log_path=self.log_path)
+        try:
+            result = c.list_open_issues("o/r", exclude_prs=False)
+        finally:
+            c.close()
+        self.assertEqual([x["number"] for x in result], [1, 2])
+
     def test_per_page_in_cache_key(self):
         # Same URL with different per_page should miss each other's cache.
         def h(req: httpx.Request) -> httpx.Response:

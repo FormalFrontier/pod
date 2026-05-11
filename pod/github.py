@@ -738,6 +738,39 @@ class GitHubClient:
         )
         return r
 
+    # --- domain helpers ---
+
+    def list_open_issues(self, repo: str, *,
+                         labels: list[str] | None = None,
+                         exclude_prs: bool = True,
+                         per_page: int = 100,
+                         max_pages: int | None = None) -> list[dict]:
+        """List open issues in `repo` (\"owner/name\").
+
+        GitHub's REST `/repos/{slug}/issues` endpoint includes pull
+        requests in the response (objects carrying a `pull_request`
+        field), unlike `gh issue list` which excludes them. We default
+        `exclude_prs=True` so callers get the `gh issue list` shape
+        unless they explicitly opt out. Routes through the layer so
+        every page is ETag-cached.
+        """
+        params: dict[str, str] = {"state": "open"}
+        if labels:
+            params["labels"] = ",".join(labels)
+        out: list[dict] = []
+        for page in self.paginate(f"/repos/{repo}/issues",
+                                  params=params,
+                                  per_page=per_page,
+                                  max_pages=max_pages):
+            if not page.ok():
+                break
+            body = page.body() or []
+            for item in body:
+                if exclude_prs and item.get("pull_request"):
+                    continue
+                out.append(item)
+        return out
+
     # --- introspection ---
 
     def rate(self) -> dict[str, RateSnapshot]:
