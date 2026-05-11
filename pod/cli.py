@@ -270,6 +270,16 @@ copy_build_cache = true
 prompt = "/repair"
 copy_build_cache = true
 
+# Replan agent: triages issues labelled `replan` (from PRs closed
+# unsalvageable, `coordination skip --replan`, or `create-pr --partial`).
+# Shares the planner lock with `/plan` so the two cannot race on issue
+# state. Dispatched by the replan short-circuit in `dispatch_queue_balance`,
+# ordered after `repair` and before `plan`.
+[worker_types.replan]
+prompt = "/replan"
+lock = "planner"
+copy_build_cache = false
+
 # Example additional worker type:
 # [worker_types.review]
 # prompt = "/review"

@@ -54,37 +54,11 @@ gh pr list --state open \
 
 Never skip this step. Downstream agents are blocked on `main` until merged PRs land.
 
-## Step 3: Triage `replan` issues (before creating new work)
+Replan triage is handled by `/replan`, which dispatch always runs
+before `/plan` when there are `replan`-labelled candidates. Do not
+duplicate that work here.
 
-Fetch the list:
-```
-pod _filter-trusted-issues --label replan --state open --json number,title,body \
-    --jq '.[] | "### #\(.number) \(.title)\n\(.body)\n"'
-```
-
-Process **all** replan issues before creating any new issues.
-For each, exactly one of:
-- **Work already done** (a subsequent PR merged it): close with a note
-- **Plan stale / approach changed**: create a corrected replacement issue, close original linking forward
-- **Partial progress**: create issue for remaining deliverables, close original linking forward
-- **Worker-decomposed**: the worker created sub-issues before releasing
-  the claim. Detect via a comment that starts with `Decomposed into #` and
-  lists the sub-issue numbers (workers must leave this breadcrumb before
-  `coordination skip` or `coordination create-pr --partial`). Read the
-  sub-issues and decide:
-  - sub-issues fully cover the parent → close the parent with a forward
-    link (do NOT re-create the sub-issues);
-  - residual scope remains → narrow the body to that residual and remove
-    the `replan` label so workers can claim it again.
-  In the partial-PR variant the parent will also have a merged or open PR
-  reference; treat it the same way and rely on the merged PR to record the
-  partial work.
-- **Still valid, body still accurate**: remove the `replan` label (`gh issue edit N --remove-label replan`) to re-open for workers
-- **Still valid, body stale**: update the issue body with current state, then remove the `replan` label
-
-**Never delegate replan triage to a worker** — that is the planner's job.
-
-## Step 4: Create fix issues for broken PRs
+## Step 3: Create fix issues for broken PRs
 
 Check for PRs with merge conflicts or failing CI:
 ```bash
@@ -104,7 +78,7 @@ gh issue list --label agent-plan --state open --json number,title \
 If no fix issue exists, **create one immediately** using `coordination plan`.
 These fix issues take priority over all new feature work.
 
-## Step 5: Understand existing plans
+## Step 4: Understand existing plans
 
 Read the **full body** of every open `agent-plan` issue:
 ```
@@ -115,7 +89,7 @@ pod _filter-trusted-issues --label agent-plan --state open --limit 20 \
 Understand what's already planned at the **deliverable level**, not just the title.
 Your work item MUST NOT overlap with any existing issue's deliverables.
 
-## Step 6: Write new issues
+## Step 5: Write new issues
 
 Work types: **`feature`**, **`review`**, **`summarize`**.
 Target roughly 2:1 feature:review during implementation; 1:1 during cleanup.
@@ -182,7 +156,7 @@ gh issue list --label agent-plan --state open --limit 20 \
     --json number,title --jq '.[].title'
 ```
 
-## Step 7: Post and exit
+## Step 6: Post and exit
 
 For each issue, write the plan body to `plans/<UUID-prefix>-N.md`, then post:
 ```
