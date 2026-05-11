@@ -29,7 +29,7 @@ failing, abandon.
 | Command | Purpose |
 |---|---|
 | `coordination list-pr-repair` | Read-only list of PRs needing repair, priority-ordered (`conflict` > `failed` > `stuck`). No label writes. |
-| `coordination claim-pr-repair N` | Adds `repair-claimed` label + comment; 30 min cooldown. Fails if already claimed. |
+| `coordination claim-pr-repair N` | Adds `repair-claimed` label + comment, races detected via a short re-read. Fails if already claimed or another session won the race. |
 | `coordination mark-pr-salvaged N` | Clears `repair-claimed`, comments salvage summary. Call after a successful push. |
 | `coordination close-pr-unsalvageable N "reason"` | Closes PR, adds `unsalvageable`, removes `has-pr` on linked issue, adds `replan`. |
 
@@ -50,8 +50,8 @@ PR number out of `#<num> [<reason>] <title>` and claim it:
 coordination claim-pr-repair <pr-number>
 ```
 
-If the claim output says the PR was claimed by another session in the last
-30 minutes, move to the next candidate. If all candidates are claimed,
+If the claim output says the PR is already `repair-claimed` or you lost
+the race, move to the next candidate. If all candidates are claimed,
 exit — another dispatch will handle the work later.
 
 ## Step 2: Check Out the PR Branch

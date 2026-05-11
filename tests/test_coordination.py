@@ -254,6 +254,120 @@ class ClaimTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Subcommand: claim-pr-repair
+# ---------------------------------------------------------------------------
+
+class ClaimPRRepairTests(unittest.TestCase):
+    """Repair-claim path: serialisation must come from the
+    `repair-claimed` label + the in-window race-detect (RACE_SLEEP_SHORT
+    re-read) only. There is no long-form comment-history cooldown — an
+    earlier 30-minute cooldown was removed because crashed-session
+    re-attempts dominated legitimate parallel use, sending every fresh
+    agent into a guaranteed-fail walk of the candidate list.
+    """
+
+    def test_already_repair_claimed_returns_1(self):
+        def handler(*argv):
+            if argv[:2] == ("pr", "view"):
+                return _gh_result(stdout="repair-claimed,has-pr")
+            return _gh_result()
+
+        with _capture_stdout() as buf, patch_client(gh_cli_handler=handler):
+            rc = coordination.cmd_claim_pr_repair(_make_ctx(), ["42"])
+        self.assertEqual(rc, 1)
+        self.assertIn("already repair-claimed", buf.getvalue())
+
+    def test_stale_old_repair_claim_comment_does_not_block(self):
+        """A `Claimed PR repair by session` comment older than the
+        race-detect cutoff (race_since = now-at-call) must NOT block the
+        claim. Pre-fix this would have failed with `... within the last
+        30 minutes`. Post-fix the only relevant signal is the label
+        plus the in-window re-read."""
+        def handler(*argv):
+            if argv[:2] == ("pr", "view"):
+                return _gh_result(stdout="has-pr")  # no repair-claimed
+            return _gh_result()
+
+        # One historical claim comment (old) plus our own (just posted).
+        # After race-detect (cache="none" re-read), only our own is in
+        # the post-cutoff window.
+        page = fake_response(200, body=[
+            {"body": "Claimed PR repair by session `old-dead` on branch `y`",
+             "created_at": "2020-01-01T00:00:00Z"},
+            {"body": "Claimed PR repair by session `sess-A` on branch `x`",
+             "created_at": "2026-05-12T00:00:00Z"},
+        ])
+
+        # Two _iso_to_epoch return values matter: the old comment must
+        # fall before race_since, and ours must fall after. Patch to a
+        # function that distinguishes by content.
+        def fake_iso(s):
+            if s.startswith("2020"):
+                return 1  # very old
+            return int(time.time()) + 10  # after race_since
+        with _capture_stdout() as buf, \
+             mock.patch("pod.coordination._iso_to_epoch",
+                        side_effect=fake_iso), \
+             patch_client(routes={
+                 ("GET", "/repos/owner/repo/issues/42/comments"): page,
+             }, gh_cli_handler=handler), \
+             mock.patch("time.sleep"):
+            rc = coordination.cmd_claim_pr_repair(
+                _make_ctx(session_id="sess-A"), ["42"])
+        self.assertEqual(rc, 0)
+        out = buf.getvalue()
+        self.assertNotIn("within the last 30 minutes", out)
+        self.assertIn("Claimed PR #42 for repair", out)
+
+    def test_clean_repair_claim_succeeds(self):
+        def handler(*argv):
+            if argv[:2] == ("pr", "view"):
+                return _gh_result(stdout="has-pr")
+            return _gh_result()
+        # Only our own claim comment present.
+        page = fake_response(200, body=[
+            {"body": "Claimed PR repair by session `sess-A` on branch `x`",
+             "created_at": "2026-05-12T00:00:00Z"},
+        ])
+        with _capture_stdout() as buf, \
+             mock.patch("pod.coordination._iso_to_epoch",
+                        return_value=int(time.time()) + 10), \
+             patch_client(routes={
+                 ("GET", "/repos/owner/repo/issues/42/comments"): page,
+             }, gh_cli_handler=handler), \
+             mock.patch("time.sleep"):
+            rc = coordination.cmd_claim_pr_repair(
+                _make_ctx(session_id="sess-A"), ["42"])
+        self.assertEqual(rc, 0)
+        self.assertIn("Claimed PR #42 for repair", buf.getvalue())
+
+    def test_race_lost_returns_1(self):
+        def handler(*argv):
+            if argv[:2] == ("pr", "view"):
+                return _gh_result(stdout="has-pr")
+            return _gh_result()
+        # Two in-window claim comments; alphabetically lower belongs to
+        # a different session — we lose the race.
+        page = fake_response(200, body=[
+            {"body": "Claimed PR repair by session `aaa-other` on branch `y`",
+             "created_at": "2026-05-12T00:00:00Z"},
+            {"body": "Claimed PR repair by session `sess-A` on branch `x`",
+             "created_at": "2026-05-12T00:00:00Z"},
+        ])
+        with _capture_stdout() as buf, \
+             mock.patch("pod.coordination._iso_to_epoch",
+                        return_value=int(time.time()) + 10), \
+             patch_client(routes={
+                 ("GET", "/repos/owner/repo/issues/42/comments"): page,
+             }, gh_cli_handler=handler), \
+             mock.patch("time.sleep"):
+            rc = coordination.cmd_claim_pr_repair(
+                _make_ctx(session_id="sess-A"), ["42"])
+        self.assertEqual(rc, 1)
+        self.assertIn("Race lost on PR #42", buf.getvalue())
+
+
+# ---------------------------------------------------------------------------
 # Subcommand: skip
 # ---------------------------------------------------------------------------
 

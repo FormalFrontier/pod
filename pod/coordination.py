@@ -1114,23 +1114,19 @@ def cmd_claim_pr_repair(ctx: CoordinationContext, argv: list[str]) -> int:
         print(f"CLAIM FAILED: PR #{pr_num} is already repair-claimed.")
         return 1
 
-    # Cooldown probe (30 min). Failure here must abort claim — we don't
-    # know whether someone else just claimed.
-    try:
-        cooldown_since = _now_epoch() - 1800
-        recent = _count_recent_repair_claims(client, ctx.repo, pr_num,
-                                              cooldown_since)
-    except _RaceCheckFailed as e:
-        print(f"CLAIM FAILED: cooldown check for PR #{pr_num} failed: {e}")
-        return 1
-    if recent > 0:
-        print(f"CLAIM FAILED: PR #{pr_num} was claimed for repair within "
-              "the last 30 minutes.")
-        return 1
-
     # Freeze the race-detect cutoff BEFORE posting so the layer's
     # rate-limit back-pressure (which can sleep up to 60s) can't push
     # our concurrent attempts past the window.
+    # No long-form cooldown: the `repair-claimed` label + race-detect
+    # window (RACE_SLEEP_SHORT, ~2 s) are sufficient to serialise
+    # concurrent claims. An older 30-minute comment-history cooldown
+    # was removed because crashed-session re-attempts were dominating
+    # legitimate parallel use, causing every fresh agent to walk the
+    # candidate list hitting `CLAIM FAILED: ... within the last 30
+    # minutes` on every PR. Dead-session cleanup is the housekeeping
+    # sweep's job; truly-unsalvageable PRs should be closed with
+    # `coordination close-pr-unsalvageable` so they exit the candidate
+    # list entirely.
     race_since = _now_epoch()
 
     client.gh_cli("pr", "edit", pr_num, "--repo", ctx.repo,
