@@ -10,8 +10,8 @@ Run `coordination list-pr-repair`. Output is one PR per line in priority
 order: `conflict` > `failed` > `stuck`. Claim the top one with
 `coordination claim-pr-repair <pr-number>`.
 
-If every candidate is already claimed by another session in the last
-30 minutes, exit — a fresh dispatch will handle the work later.
+If every candidate is already `repair-claimed` (or you lose the race on
+each), exit — a fresh dispatch will handle the work later.
 
 ## Diagnose and Fix
 

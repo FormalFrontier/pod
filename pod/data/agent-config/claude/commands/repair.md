@@ -21,8 +21,8 @@ Claim the top one:
 coordination claim-pr-repair <pr-number>
 ```
 
-If the claim output says the PR was claimed by another session in the last
-30 minutes, skip it and try the next one. If every candidate is claimed,
+If the claim output says the PR is already `repair-claimed` or you lost
+the race, skip it and try the next one. If every candidate is claimed,
 exit — a fresh dispatch will handle the work later.
 
 ## Two Outcomes, No Escalation
