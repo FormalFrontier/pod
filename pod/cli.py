@@ -1833,6 +1833,82 @@ query TuiRefresh($owner: String!, $name: String!) {
 _TUI_REFRESH_CACHE: tuple[float, dict | None] = (0.0, None)
 _TUI_REFRESH_TTL = 4.0  # seconds; matches the TUI's fast-path tick cadence
 _TUI_REFRESH_LOCK = threading.Lock()
+# Bump when `_TUI_REFRESH_QUERY` changes shape so an on-disk snapshot from
+# an older pod version is rejected instead of feeding the new code stale
+# data with missing keys (`openAgentPlan`, `blocked`, etc.).
+_TUI_CACHE_SCHEMA = 1
+# One-shot flag: try the disk fallback exactly once per process, on the
+# first refresh tick after start-up. After that we either have live data
+# or we're already serving the in-memory copy.
+_TUI_DISK_CACHE_LOADED = False
+# Shown in the header once the cache crosses these ages. Tuned so a
+# single missed refresh tick doesn't flash the indicator on and off.
+_TUI_STALE_AFTER_S = 60.0
+_TUI_VERY_STALE_AFTER_S = 3600.0
+
+
+def _tui_cache_path() -> Path:
+    return POD_DIR / "tui-cache.json"
+
+
+def _save_tui_cache(fetched_at: float, slug: str, repo_node: dict) -> None:
+    """Atomic write of the latest successful GraphQL response so a
+    later dry-quota startup can serve a stale snapshot rather than an
+    empty items panel. chmod 600 — issue bodies and comments are in the
+    payload."""
+    payload = {
+        "schema": _TUI_CACHE_SCHEMA,
+        "repo": slug,
+        "fetched_at": fetched_at,
+        "body": repo_node,
+    }
+    p = _tui_cache_path()
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return
+    tmp = p.with_suffix(".tmp")
+    try:
+        tmp.write_text(json.dumps(payload))
+        os.chmod(tmp, 0o600)
+        tmp.replace(p)
+    except OSError:
+        pass
+
+
+def _load_tui_cache(slug: str) -> tuple[float, dict] | None:
+    """Returns `(fetched_at, repo_node)` for a previously-saved snapshot
+    of the same repo and schema, or `None` if missing, corrupt, or
+    schema-mismatched. Never raises."""
+    p = _tui_cache_path()
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text())
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    if data.get("schema") != _TUI_CACHE_SCHEMA:
+        return None
+    if data.get("repo") != slug:
+        return None
+    try:
+        fetched_at = float(data.get("fetched_at", 0.0))
+    except (TypeError, ValueError):
+        return None
+    body = data.get("body")
+    if not isinstance(body, dict):
+        return None
+    # Reject snapshots whose top-level keys don't match the current query
+    # shape (defence in depth on top of the schema-version check).
+    required = ("openAgentPlan", "openHumanOversight",
+                "closedAgentPlan", "closedHumanOversight",
+                "blocked", "openIssueNumbers",
+                "hasPrIssues", "pullRequests")
+    if not all(k in body for k in required):
+        return None
+    return (fetched_at, body)
 
 
 def _tui_refresh_batch() -> dict | None:
@@ -1845,17 +1921,37 @@ def _tui_refresh_batch() -> dict | None:
     each firing its own). The layer also ETag-caches the GraphQL
     response (since the cache key includes a hash of the request body),
     so cache-miss hits return 304s.
+
+    Stale-render: if the live call fails (rate limit, 5xx, network),
+    we return whatever's currently in the in-memory cache rather than
+    `None`. That cache is seeded once per process from
+    `.pod/tui-cache.json` on the first cold-start tick, so even a fresh
+    pod startup with the GraphQL bucket dry shows the last successful
+    snapshot (with an `items stale: …` indicator in the header) instead
+    of an empty panel.
     """
-    global _TUI_REFRESH_CACHE
+    global _TUI_REFRESH_CACHE, _TUI_DISK_CACHE_LOADED
     with _TUI_REFRESH_LOCK:
         now = time.time()
         ts, cached = _TUI_REFRESH_CACHE
         if cached is not None and (now - ts) < _TUI_REFRESH_TTL:
             return cached
         slug = _get_repo()
+
+        # One-shot disk load: only fires on the very first refresh
+        # before any live data lands. Carries `fetched_at` from disk
+        # forward so the staleness indicator reflects the original
+        # snapshot age, not now.
+        if cached is None and not _TUI_DISK_CACHE_LOADED:
+            _TUI_DISK_CACHE_LOADED = True
+            disk = _load_tui_cache(slug)
+            if disk is not None:
+                _TUI_REFRESH_CACHE = disk
+                cached = disk[1]
+
         owner, _, name = slug.partition("/")
         if not (owner and name):
-            return None
+            return cached
         try:
             resp = gh.get_client().graphql(
                 _TUI_REFRESH_QUERY,
@@ -1863,14 +1959,15 @@ def _tui_refresh_batch() -> dict | None:
                 cache="etag",
             )
         except Exception:
-            return None
+            return cached  # serve stale
         if not resp.ok():
-            return None
+            return cached
         body = resp.body() or {}
         repo_node = (body.get("data") or {}).get("repository") or {}
         if not repo_node:
-            return None
+            return cached
         _TUI_REFRESH_CACHE = (now, repo_node)
+        _save_tui_cache(now, slug, repo_node)
         return repo_node
 
 
@@ -6276,6 +6373,27 @@ def _tui_main(stdscr, config: dict):
             lock_indicator = " | LOCK"
         if FORCE_QUOTA_FILE.exists():
             lock_indicator += " | FORCE"
+        # Items panel staleness — survives a single missed refresh tick
+        # without flashing the indicator. Computed against the cache's
+        # original `fetched_at`, so a snapshot loaded from disk on
+        # startup shows its true age (potentially hours), not a fresh-
+        # looking few seconds.
+        tui_cache_ts, _tui_cache_body = _TUI_REFRESH_CACHE
+        if tui_cache_ts > 0 and _tui_cache_body is not None:
+            age = time.time() - tui_cache_ts
+            if age >= _TUI_VERY_STALE_AFTER_S:
+                lock_indicator += f" | items very stale: {human_duration(age)}"
+            elif age >= _TUI_STALE_AFTER_S:
+                lock_indicator += f" | items stale: {human_duration(age)}"
+        # Quota low-water indicator — the stderr warning from the layer
+        # gets overwritten by curses, so surface a compact marker here
+        # while the bucket is still in its depleted window.
+        try:
+            low = gh.get_client().low_water_buckets()
+        except Exception:
+            low = set()
+        for b in sorted(low):
+            lock_indicator += f" | {b}:!"
         effective = target  # already computed via get_effective_target() above
         user_t = read_target()
         if effective is not None and user_t is not None and effective < user_t:
