@@ -3449,7 +3449,8 @@ def cmd_filter_trusted_issues(config: dict, args) -> None:
         sys.stdout.write("\n")
 
 
-def _release_claim(issue_str: str, session_uuid: str, restart_count: int) -> bool:
+def _release_claim(issue_str: str, session_uuid: str, restart_count: int,
+                    *, reason: str | None = None) -> bool:
     """Remove the 'claimed' label from an issue and leave an explanatory comment.
     Returns True on success (including idempotent terminal cases — see below),
     False on transient failure (caller may revert history deletion).
@@ -3465,7 +3466,11 @@ def _release_claim(issue_str: str, session_uuid: str, restart_count: int) -> boo
     If the `claimed` label is already absent, returns True without spending
     GraphQL quota. If the issue is closed and the label is still present,
     also returns True — pod doesn't read labels off closed issues, and the
-    quota-safe choice is to leave them alone."""
+    quota-safe choice is to leave them alone.
+
+    `reason`, if given, replaces the default "died after N restart attempts"
+    release comment — for callers (e.g. the quota-exhaustion handler) where
+    that wording would mislead."""
     import re as _re
     repo = _get_repo()
 
@@ -3533,8 +3538,9 @@ def _release_claim(issue_str: str, session_uuid: str, restart_count: int) -> boo
     if r1.returncode != 0:
         log(f"Failed to remove claimed label on #{issue_str}: {r1.stderr.strip()}")
         return False
-    msg = (f"Claim released — worker session `{session_uuid}` died after "
-           f"{restart_count} restart attempt(s). Available for reclaim.")
+    msg = reason or (
+        f"Claim released — worker session `{session_uuid}` died after "
+        f"{restart_count} restart attempt(s). Available for reclaim.")
     try:
         r2 = _gh_cli(
             "issue", "comment", issue_str, "--repo", repo,
@@ -3769,7 +3775,14 @@ def reconcile_untracked_github_claims():
     import re as _re
 
     repo = _get_repo()
-    grace_seconds = 600  # 10 minutes — don't release very fresh claims
+    # 60s is enough to cover the window between an agent posting the
+    # "Claimed by session" comment and writing its local claim-history
+    # entry — anything older with a dead owner UUID is a real orphan.
+    # The previous 10-minute setting compounded with the 10-minute
+    # housekeeping cadence to delay orphan cleanup by up to 20 minutes;
+    # a session whose GitHub claim survives 60 seconds past its UUID
+    # disappearing from `read_all_agents()` is unambiguously dead.
+    grace_seconds = 60
     client = gh.get_client()
 
     owner, _, name = repo.partition("/")
@@ -5932,10 +5945,34 @@ def agent_process_main(config: dict, agent_id: str | None = None,
         if _is_quota_exhausted:
             log(f"Agent {short_id}: session stdout indicates quota exhaustion, "
                 f"will re-check quota before next dispatch")
-            # Release claim without replan — issue is fine, just quota-gated
+            # Release claim without replan — issue is fine, just quota-gated.
+            # Must call `_release_claim` (not just `clear_claim`) so the GitHub
+            # `claimed` label is actually removed: this session UUID is about
+            # to be discarded when the next dispatch generates a fresh one,
+            # at which point no live agent owns the GitHub claim and any
+            # `clear_claim`-only path would leak it as an orphan label that
+            # `check_dead_claimed_issues` then skips forever (it ignores
+            # `released:True` entries). On transient GitHub failure (likely
+            # under quota pressure), leave the history entry untouched so the
+            # next housekeeping reconcile picks it up.
             if state.claimed_issue > 0 and state.pr_number == 0:
-                clear_claim(state.claimed_issue, session_uuid=state.uuid)
-                log(f"Agent {short_id}: released claim on #{state.claimed_issue} (quota exhaustion, not replan)")
+                released_ok = False
+                try:
+                    released_ok = _release_claim(
+                        str(state.claimed_issue), state.uuid, 0,
+                        reason=(f"Claim released — worker session "
+                                f"`{state.uuid}` exited due to quota "
+                                f"exhaustion. Available for reclaim."))
+                except _GraphQLRateLimited as e:
+                    log(f"Agent {short_id}: GH rate-limited releasing "
+                        f"#{state.claimed_issue} ({e}); will retry via housekeeping")
+                if released_ok:
+                    clear_claim(state.claimed_issue, session_uuid=state.uuid)
+                    log(f"Agent {short_id}: released claim on #{state.claimed_issue} (quota exhaustion, not replan)")
+                else:
+                    log(f"Agent {short_id}: GitHub release failed for "
+                        f"#{state.claimed_issue} (quota exhaustion); "
+                        f"leaving history entry for housekeeping retry")
             cleanup_worktree(wt_dir, branch)
             state.worktree = ""
             state.branch = ""
