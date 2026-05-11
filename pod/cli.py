@@ -2194,14 +2194,22 @@ def _parse_codex_jsonl_line(line: bytes, state: AgentState):
             cmd = item.get("command", "")[:120]
             state.last_text = f"[exec] {cmd}"
             state.last_activity = time.time()
-            # Detect issue claim from coordination script output
+            # Detect issue claim from coordination script output.
+            # Anchor the regex to start-of-line so historical mentions in
+            # `git log`, `coordination orient`, `gh issue view`, etc. do not
+            # match. Skip for `repair`/`replan` workers, which do not claim
+            # issues — they claim PRs (repair) or edit issues directly
+            # (replan); a stray match would leave stale state for cleanup.
             output = item.get("aggregated_output", "")
-            m = re.search(r"Claimed issue #(\d+)", output)
-            if m:
-                state.claimed_issue = int(m.group(1))
+            if state.worker_type not in ("repair", "replan"):
+                m = re.search(r"^Claimed issue #(\d+)\s*$",
+                              output, re.MULTILINE)
+                if m:
+                    state.claimed_issue = int(m.group(1))
             # Detect PR repair claim from output (only on success — the command
             # emits "Claimed PR #N for repair" only after race-detect passes)
-            m_pr_claim = re.search(r"Claimed PR #(\d+) for repair", output)
+            m_pr_claim = re.search(r"^Claimed PR #(\d+) for repair\s*$",
+                                   output, re.MULTILINE)
             if m_pr_claim:
                 state.repair_pr = int(m_pr_claim.group(1))
             # Detect PR creation from coordination create-pr
@@ -2234,10 +2242,15 @@ def _parse_claude_jsonl_line(line: bytes, state: AgentState):
                 if isinstance(block, dict) and block.get("type") == "tool_result":
                     result_text = block.get("content", "")
                     if isinstance(result_text, str):
-                        m = re.search(r"Claimed issue #(\d+)", result_text)
-                        if m:
-                            state.claimed_issue = int(m.group(1))
-                        m_pr = re.search(r"Claimed PR #(\d+) for repair", result_text)
+                        # Same anchoring + worker_type guard as the codex
+                        # parser. See the codex path for the rationale.
+                        if state.worker_type not in ("repair", "replan"):
+                            m = re.search(r"^Claimed issue #(\d+)\s*$",
+                                          result_text, re.MULTILINE)
+                            if m:
+                                state.claimed_issue = int(m.group(1))
+                        m_pr = re.search(r"^Claimed PR #(\d+) for repair\s*$",
+                                         result_text, re.MULTILINE)
                         if m_pr:
                             state.repair_pr = int(m_pr.group(1))
         return
@@ -5732,7 +5745,12 @@ def _release_agent_resources(reason: str, skip_msg: str) -> None:
         # Unclaim issue if claimed and no PR yet — but only if no other
         # live agent is also working on this issue (prevents unclaiming
         # when killing duplicate claimants).
-        if state.claimed_issue > 0 and state.pr_number == 0:
+        # Skip for `repair`/`replan` workers: they do not own a claimed
+        # issue, so `claimed_issue` is meaningless for them (if it
+        # somehow holds a stale number, calling `coordination skip` on
+        # it just thrashes on closed issues).
+        if (state.claimed_issue > 0 and state.pr_number == 0
+                and state.worker_type not in ("repair", "replan")):
             try:
                 other_agents = read_all_agents()
             except Exception:
@@ -6134,8 +6152,14 @@ def agent_process_main(config: dict, agent_id: str | None = None,
 
         while _agent_proc.poll() is None:
             state.write()
-            # Track claim changes: write to history when claimed, clear when PR created
-            if state.claimed_issue > 0 and state.pr_number == 0:
+            # Track claim changes: write to history when claimed, clear
+            # when PR created. `repair`/`replan` workers do not own a
+            # claimed issue (repair tracks via `repair_pr`, replan edits
+            # directly), so skip the issue-claim bookkeeping for them —
+            # otherwise a stray `claimed_issue` from a buggy parser
+            # would pollute claim-history.json.
+            if (state.claimed_issue > 0 and state.pr_number == 0
+                    and state.worker_type not in ("repair", "replan")):
                 if state.claimed_issue != _last_tracked_issue:
                     record_claim(state.claimed_issue, state.uuid, state.short_id)
                     _last_tracked_issue = state.claimed_issue
@@ -6260,7 +6284,10 @@ def agent_process_main(config: dict, agent_id: str | None = None,
             # `released:True` entries). On transient GitHub failure (likely
             # under quota pressure), leave the history entry untouched so the
             # next housekeeping reconcile picks it up.
-            if state.claimed_issue > 0 and state.pr_number == 0:
+            # `repair`/`replan` workers do not legitimately own a claimed
+            # issue (see the symmetric cleanup-skip path below).
+            if (state.claimed_issue > 0 and state.pr_number == 0
+                    and state.worker_type not in ("repair", "replan")):
                 released_ok = False
                 try:
                     released_ok = _release_claim(
@@ -6296,7 +6323,13 @@ def agent_process_main(config: dict, agent_id: str | None = None,
         #     claim entry pointing to our old session UUID; the next housekeeping
         #     cycle from any agent sees that UUID as dead and forks a new agent,
         #     causing unbounded agent proliferation.
-        if state.claimed_issue > 0 and state.pr_number == 0:
+        # Only runs for workers that actually claim issues (e.g. `work`,
+        # `plan`). `repair` claims PRs (tracked in `repair_pr`) and `replan`
+        # edits issues directly without claiming, so calling `coordination
+        # skip` on whatever happens to be in `claimed_issue` for those
+        # types just churns on closed-issue errors.
+        if (state.claimed_issue > 0 and state.pr_number == 0
+                and state.worker_type not in ("repair", "replan")):
             skip_ok = False
             try:
                 coordination(
