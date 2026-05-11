@@ -2318,6 +2318,29 @@ def _list_pr_repair_count(config: dict) -> int:
     return sum(1 for line in r.stdout.splitlines() if line.strip())
 
 
+def _count_running_replan_agents(agents: list | None = None) -> int:
+    """Count live agents whose worker_type is 'replan'."""
+    if agents is None:
+        agents = read_all_agents()
+    return sum(1 for a in agents
+               if a.worker_type == "replan"
+               and a.status not in ("dead", "stopped", "killed"))
+
+
+def _list_replan_count(config: dict) -> int:
+    """Return the number of replan candidates, or 0 on error.
+
+    Calls `coordination list-replan` and counts output lines.
+    """
+    try:
+        r = coordination(config, "list-replan")
+    except (subprocess.TimeoutExpired, OSError):
+        return 0
+    if r.returncode != 0:
+        return 0
+    return sum(1 for line in r.stdout.splitlines() if line.strip())
+
+
 _gh_quota_cache: dict = {"graphql_remaining": None, "checked_at": 0.0}
 _GH_QUOTA_CHECK_TTL = 30.0  # seconds between `gh api rate_limit` polls
 _GH_QUOTA_PAUSE_THRESHOLD = 100  # pause dispatch below this (of 5000/hr)
@@ -2504,6 +2527,36 @@ def dispatch_queue_balance(config: dict, queue_depth: int,
             log(f"dispatch: repair preferred (candidates={candidates}, "
                 f"running_repair={running_repair})")
             return "repair"
+
+    # Replan preference. After repair, before any planner-lock filling
+    # or queue-draining work, prefer `replan` if there are unclaimed
+    # replan-labelled issues. Unlike `repair` (lock-less), `replan`
+    # shares the `planner` lock with `plan`, so we acquire the lock
+    # here. If it fails, skip the rest of the filling path (which would
+    # try the same lock again) and fall straight to draining — calling
+    # `lock-planner` twice per tick is expensive (posts/sleeps/deletes
+    # a comment).
+    if "replan" in worker_types:
+        replan_candidates = _list_replan_count(config)
+        running_replan = _count_running_replan_agents()
+        if replan_candidates > running_replan:
+            replan_lock = worker_types["replan"].get("lock", "planner")
+            r = coordination(config, f"lock-{replan_lock}")
+            if r.returncode == 0:
+                if state:
+                    state.lock_held = replan_lock
+                    state.write()
+                log(f"dispatch: replan preferred "
+                    f"(candidates={replan_candidates}, "
+                    f"running_replan={running_replan})")
+                return "replan"
+            log(f"dispatch: replan preferred but {replan_lock} lock held; "
+                f"skipping filling, trying draining")
+            draining = {k: v for k, v in worker_types.items()
+                        if not v.get("lock")}
+            if queue_depth > 0 and draining:
+                return _choose_draining(config, draining)
+            return None
 
     config_min_queue = cfg_get(config, "dispatch", "min_queue", default=3)
     planner_min_queue = read_planner_min_queue()
