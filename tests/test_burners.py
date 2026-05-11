@@ -211,6 +211,75 @@ class ProvenanceBurnerTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 cli.fetch_issue_provenance("o/r", 42)
 
+    def test_etag_cached_repeat_serves_304(self):
+        """A repeat provenance fetch for the same issue must serve a
+        304 from the layer's ETag cache rather than burning a fresh
+        GraphQL call. This is the dominant GraphQL burner pre-fix —
+        `cmd_filter_trusted_issues` runs as a fresh subprocess per
+        `coordination orient` tick, so the in-process
+        `_provenance_cache` doesn't deduplicate across invocations.
+        The on-disk ETag cache does.
+        """
+        import httpx
+        from pod import github as gh
+        from pod.github import GitHubClient
+
+        seen_if_none_match: list[str | None] = []
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            seen_if_none_match.append(req.headers.get("if-none-match"))
+            base_headers = {
+                "x-ratelimit-limit": "5000",
+                "x-ratelimit-remaining": "4999",
+                "x-ratelimit-reset": str(int(time.time()) + 3600),
+                "x-ratelimit-resource": "graphql",
+            }
+            if req.headers.get("if-none-match") == '"prov-v1"':
+                return httpx.Response(304, headers=base_headers)
+            body = {"data": {"repository": {"issue": {
+                "author": {"login": "alice"},
+                "authorAssociation": "OWNER",
+                "comments": {
+                    "nodes": [{"databaseId": 1,
+                                "author": {"login": "alice"},
+                                "authorAssociation": "OWNER"}],
+                    "pageInfo": {"hasNextPage": False, "endCursor": None},
+                },
+            }}}}
+            return httpx.Response(200, json=body,
+                                   headers={**base_headers,
+                                            "etag": '"prov-v1"'})
+
+        with tempfile.TemporaryDirectory() as td:
+            cache_dir = Path(td) / "gh-cache"
+            log_path = Path(td) / "gh-access.log"
+            client = GitHubClient(
+                host="github.com",
+                token="t-test",
+                cache_dir=cache_dir,
+                log_path=log_path,
+                transport=httpx.MockTransport(handler),
+                trim_cache_on_init=False,
+                rate_cap_hz=0,
+            )
+            try:
+                with mock.patch.object(gh, "get_client",
+                                        return_value=client):
+                    p1 = cli.fetch_issue_provenance("o/r", 42)
+                    p2 = cli.fetch_issue_provenance("o/r", 42)
+            finally:
+                client.close()
+
+        # First call had no If-None-Match (cold cache); second sent
+        # the stored etag.
+        self.assertEqual(seen_if_none_match, [None, '"prov-v1"'])
+        # Both calls must return semantically identical results; the
+        # 304-served second response uses the cached body.
+        self.assertEqual(p1.author_login, p2.author_login)
+        self.assertEqual(p1.author_association, p2.author_association)
+        self.assertEqual([c.comment_id for c in p1.comments],
+                         [c.comment_id for c in p2.comments])
+
     def test_more_than_100_comments_falls_back_to_rest(self):
         # First page (GraphQL) has 100 comments AND hasNextPage=True.
         gql_comments = [(cid, "alice", "MEMBER") for cid in range(1, 101)]

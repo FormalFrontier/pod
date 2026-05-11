@@ -3227,6 +3227,14 @@ def fetch_issue_provenance(repo: str, issue_num: int) -> _IssueProvenance:
     for the rare case of >100 comments on a single agent-plan issue.
     Raises RuntimeError on layer failure so callers can surface a
     clear error.
+
+    ETag-cached: `cmd_filter_trusted_issues` runs as a fresh subprocess
+    per `coordination orient` / `list-unclaimed` tick, so the in-process
+    `_provenance_cache` doesn't help across invocations. The layer's
+    ETag store, on the other hand, lives on disk and is keyed by the
+    GraphQL request body (which includes `issue_num`), so a repeat
+    fetch of an unchanged issue serves a 304 that doesn't count against
+    the GraphQL bucket. This is the dominant GraphQL burner pre-fix.
     """
     client = gh.get_client()
     owner, _, name = repo.partition("/")
@@ -3235,7 +3243,8 @@ def fetch_issue_provenance(repo: str, issue_num: int) -> _IssueProvenance:
 
     resp = client.graphql(_PROVENANCE_QUERY,
                           variables={"owner": owner, "name": name,
-                                     "num": issue_num})
+                                     "num": issue_num},
+                          cache="etag")
     if not resp.ok():
         raise RuntimeError(
             f"failed to fetch provenance for {repo}#{issue_num}: "
