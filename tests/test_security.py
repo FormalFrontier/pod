@@ -24,12 +24,17 @@ def _mock_security(visibility: str, slug: str,
     """Combine `git remote` (subprocess.run) + the GitHub access layer
     (httpx via _FakeClient) for `check_repo_security`.
 
-    `limit_response` is a dict for the interaction-limits payload (or
-    "{}" string for the empty body — same shape `check_repo_security`
-    sees on a public repo with no limit).
+    After the B3 burner rewrite the visibility + interaction-limits
+    check is a single GraphQL query, so we route a single POST `/graphql`
+    response with the combined GraphQL shape:
+      data.repository.visibility (PUBLIC/PRIVATE/INTERNAL)
+      data.repository.interactionAbility { limit expiresAt origin }
+
+    `limit_response` accepts the REST shape (dict with `limit`,
+    `expires_at`, `origin`) for backwards compatibility with existing
+    callers; we translate to the GraphQL shape internally.
     """
     if isinstance(limit_response, str):
-        # Backwards-compat with old "{}" / JSON-string callers.
         try:
             limit_body = json.loads(limit_response)
         except (json.JSONDecodeError, TypeError):
@@ -37,18 +42,36 @@ def _mock_security(visibility: str, slug: str,
     else:
         limit_body = limit_response or {}
 
+    if limit_status != 200:
+        gql_body = {"errors": [{"message": "interaction-limits failed"}]}
+        graphql_status = limit_status
+    else:
+        # The GraphQL `InteractionAbility.limit` enum uses upper-case
+        # (COLLABORATORS_ONLY); the production code lower-cases it before
+        # comparing against config. Convert the REST-shaped fixture for
+        # tests that still pass `"collaborators_only"` etc.
+        raw_limit = limit_body.get("limit")
+        gql_limit = raw_limit.upper() if isinstance(raw_limit, str) and raw_limit else None
+        ability = None
+        if limit_body:
+            ability = {
+                "limit": gql_limit,
+                "expiresAt": limit_body.get("expires_at"),
+                "origin": limit_body.get("origin"),
+            }
+        gql_body = {
+            "data": {
+                "repository": {
+                    "visibility": visibility.upper() if visibility else None,
+                    "interactionAbility": ability,
+                }
+            }
+        }
+        graphql_status = 200
+
     routes = {
-        ("GET", f"/repos/{slug}"): fake_response(
-            200, body={"visibility": visibility}),
+        ("POST", "/graphql"): fake_response(graphql_status, body=gql_body),
     }
-    if visibility == "public":
-        if limit_status == 200:
-            routes[("GET", f"/repos/{slug}/interaction-limits")] = (
-                fake_response(200, body=limit_body))
-        else:
-            routes[("GET", f"/repos/{slug}/interaction-limits")] = (
-                fake_response(limit_status,
-                              body={"message": "interaction-limits failed"}))
 
     git_remote = _git_remote_mock(slug)
 
@@ -162,13 +185,15 @@ class SecurityCheckTests(unittest.TestCase):
                 cli._security_last_ok - cli._SECURITY_CHECK_TTL_SECONDS - 1
             )
             self._cache_path.unlink(missing_ok=True)
+            graphql_body = {"data": {"repository": {
+                "visibility": "PRIVATE", "interactionAbility": None,
+            }}}
             with patch_client(routes={
-                ("GET", "/repos/owner/repo"): fake_response(
-                    200, body={"visibility": "private"}),
+                ("POST", "/graphql"): fake_response(200, body=graphql_body),
             }) as client, mock.patch.object(cli.subprocess, "run",
                                               return_value=_git_remote_mock("owner/repo")):
                 cli.check_repo_security({})
-                self.assertTrue(any(c["method"] == "GET" for c in client.calls))
+                self.assertTrue(any(c["method"] == "POST" for c in client.calls))
 
     def test_gh_not_found_fails_closed(self):
         # The layer fails to construct a client (no `gh auth token`); we
@@ -181,9 +206,9 @@ class SecurityCheckTests(unittest.TestCase):
                 cli.check_repo_security({})
 
     def test_gh_repo_view_error_fails_closed(self):
-        # Slug lookup (git remote) succeeds; the REST visibility probe fails.
+        # Slug lookup (git remote) succeeds; the GraphQL visibility probe fails.
         with patch_client(routes={
-            ("GET", "/repos/o/r"): fake_response(
+            ("POST", "/graphql"): fake_response(
                 401, body={"message": "auth required"}),
         }), mock.patch.object(cli.subprocess, "run",
                               return_value=_git_remote_mock("o/r")):
@@ -191,11 +216,9 @@ class SecurityCheckTests(unittest.TestCase):
                 cli.check_repo_security({})
 
     def test_gh_api_network_error_fails_closed(self):
-        # Visibility probe succeeds (public); interaction-limits 500s.
+        # GraphQL 5xx → fail-closed exit 1.
         with patch_client(routes={
-            ("GET", "/repos/o/r"): fake_response(
-                200, body={"visibility": "public"}),
-            ("GET", "/repos/o/r/interaction-limits"): fake_response(
+            ("POST", "/graphql"): fake_response(
                 500, body={"message": "server error"}),
         }), mock.patch.object(cli.subprocess, "run",
                               return_value=_git_remote_mock("o/r")):
