@@ -168,15 +168,39 @@ class ClaimTests(unittest.TestCase):
                 return _gh_result(stdout="agent-plan")
             return _gh_result()
 
-        # paginate returns no claim comments → race count == 1 (just ours,
-        # which is created on POST, not visible in our paginate mock)
-        # → no race detected.
+        # Empty comments page (after the race-detect sleep) → no other
+        # claimants visible → claim succeeds.
+        empty_page = fake_response(200, body=[])
         with _capture_stdout() as buf, \
-             patch_client(routes={}, gh_cli_handler=handler), \
+             patch_client(routes={
+                 ("GET", "/repos/owner/repo/issues/42/comments"): empty_page,
+             }, gh_cli_handler=handler), \
              mock.patch("time.sleep"):
             rc = coordination.cmd_claim(_make_ctx(), ["42"])
         self.assertEqual(rc, 0)
         self.assertIn("Claimed issue #42", buf.getvalue())
+
+    def test_race_recheck_failure_fails_closed(self):
+        """If the post-sleep comment re-read returns non-OK, the bash
+        original would have died (set -euo pipefail); the Python port
+        must fail closed with a clear message rather than silently
+        succeeding."""
+        def handler(*argv):
+            if argv[:2] == ("issue", "view"):
+                return _gh_result(stdout="agent-plan")
+            return _gh_result()
+
+        # Race-check page errors out — must NOT succeed.
+        error_page = fake_response(500, body={"message": "server error"})
+        with _capture_stdout() as buf, \
+             patch_client(routes={
+                 ("GET", "/repos/owner/repo/issues/42/comments"): error_page,
+             }, gh_cli_handler=handler), \
+             mock.patch("time.sleep"):
+            rc = coordination.cmd_claim(_make_ctx(), ["42"])
+        self.assertEqual(rc, 1)
+        self.assertIn("CLAIM FAILED", buf.getvalue())
+        self.assertIn("race verification", buf.getvalue())
 
     def test_race_lost_returns_1(self):
         def handler(*argv):

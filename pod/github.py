@@ -116,12 +116,27 @@ class _ETagStore:
 
     @staticmethod
     def key_for(host: str, method: str, url: str, params: dict | None,
-                accept: str, api_version: str) -> str:
+                accept: str, api_version: str,
+                body: Any = None) -> str:
+        """Compute a deterministic cache key. `body` is hashed into the
+        key when present so POST `/graphql` requests (where the query
+        lives in the body, not the URL) get distinct cache entries per
+        distinct query+variables."""
         norm_params = ""
         if params:
             norm_params = urllib.parse.urlencode(
                 sorted((k, v) for k, v in params.items()), doseq=True)
-        material = f"{host}|{method}|{url}|{norm_params}|{accept}|{api_version}"
+        body_hash = ""
+        if body is not None:
+            try:
+                body_hash = hashlib.sha256(
+                    json.dumps(body, sort_keys=True,
+                               separators=(",", ":")).encode()
+                ).hexdigest()
+            except (TypeError, ValueError):
+                body_hash = ""
+        material = (f"{host}|{method}|{url}|{norm_params}|{accept}"
+                    f"|{api_version}|{body_hash}")
         return hashlib.sha256(material.encode()).hexdigest()
 
     def load(self, key: str) -> dict | None:
@@ -507,7 +522,17 @@ class GitHubClient:
                 _allow_retry: bool = True,
                 _caller: str | None = None) -> GHResponse:
         method = method.upper()
-        cacheable = cache == "etag" and method in ("GET", "HEAD")
+        # ETag conditional requests apply to GET/HEAD by spec, plus
+        # POST `/graphql` as a special case: GitHub honors
+        # `If-None-Match` on GraphQL POST queries, and a 304 response
+        # does not consume the primary GraphQL budget. The cache key
+        # incorporates a body hash so distinct queries get distinct
+        # entries (see `_ETagStore.key_for`).
+        is_graphql_post = (method == "POST"
+                            and isinstance(path_or_url, str)
+                            and path_or_url.endswith("/graphql"))
+        cacheable = cache == "etag" and (
+            method in ("GET", "HEAD") or is_graphql_post)
 
         if path_or_url.startswith("http"):
             url = path_or_url
@@ -540,7 +565,8 @@ class GitHubClient:
         cached: dict | None = None
         if cacheable:
             cache_key = _ETagStore.key_for(self.host, method, url_for_key,
-                                            params, accept, api_version)
+                                            params, accept, api_version,
+                                            body=json)
             cached = self.cache.load(cache_key)
             if cached and cached.get("etag"):
                 send_headers["If-None-Match"] = cached["etag"]

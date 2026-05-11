@@ -99,8 +99,23 @@ def _git(*args: str, cwd: str | None = None,
 
 def _pod(*args: str, input: str | None = None,
          timeout: int = 60) -> subprocess.CompletedProcess:
-    return subprocess.run([sys.executable, "-m", "pod", *args],
-                          capture_output=True, text=True,
+    """Re-enter `pod` as a subprocess for internal helpers (`_filter-
+    trusted-issues`, `_check-provenance`). The bash original did the
+    same — both versions reuse pod's existing CLI plumbing rather than
+    re-implementing provenance logic.
+
+    Uses the `pod` executable from PATH (the shim that exec'd us into
+    `_coordination` ran via PATH, so it's available). Falls back to
+    `python -c 'from pod.cli import main; main()'` if `pod` isn't
+    found (e.g. tests, or if PATH was scrubbed)."""
+    import shutil
+    pod_bin = shutil.which("pod")
+    if pod_bin:
+        argv = [pod_bin, *args]
+    else:
+        argv = [sys.executable, "-c",
+                "from pod.cli import main; main()", *args]
+    return subprocess.run(argv, capture_output=True, text=True,
                           timeout=timeout, input=input)
 
 
@@ -982,37 +997,51 @@ def cmd_list_pr_repair(ctx: CoordinationContext, argv: list[str]) -> int:
     return 0
 
 
+class _RaceCheckFailed(Exception):
+    """Raised when the race-detection re-read can't complete (e.g. the
+    comments endpoint returns non-OK). Callers MUST fail closed: the
+    bash original ran under `set -euo pipefail` so a failed re-read
+    aborted the whole `claim`. Swallowing the failure here would let
+    two concurrent claimants both succeed."""
+
+
 # ---------------------------------------------------------------------------
 # Subcommand: claim-pr-repair
 # ---------------------------------------------------------------------------
 
 def _count_recent_repair_claims(client, repo: str, pr_num: str,
-                                 within_seconds: int) -> int:
-    cutoff = _now_epoch() - within_seconds
+                                 since_epoch: int) -> int:
+    """Count `Claimed PR repair by session` comments with
+    `created_at > since_epoch`. Raises `_RaceCheckFailed` on any
+    non-OK comments page so callers can fail closed."""
     count = 0
     for page in client.paginate(f"/repos/{repo}/issues/{pr_num}/comments",
                                 cache="none"):
         if not page.ok():
-            break
+            raise _RaceCheckFailed(
+                f"comments fetch for PR #{pr_num} returned HTTP {page.status}")
         for c in (page.body() or []):
             if not isinstance(c, dict):
                 continue
             if "Claimed PR repair by session" not in (c.get("body") or ""):
                 continue
             ts = _iso_to_epoch(c.get("created_at", "") or "")
-            if ts and ts > cutoff:
+            if ts and ts > since_epoch:
                 count += 1
     return count
 
 
 def _recent_repair_claim_winner(client, repo: str, pr_num: str,
-                                within_seconds: int) -> str | None:
-    cutoff = _now_epoch() - within_seconds
+                                since_epoch: int) -> str | None:
+    """Return the lowest-sorted (lexicographic) `session` UUID among
+    repair-claim comments newer than `since_epoch`. Raises
+    `_RaceCheckFailed` on non-OK pages."""
     bodies: list[str] = []
     for page in client.paginate(f"/repos/{repo}/issues/{pr_num}/comments",
                                 cache="none"):
         if not page.ok():
-            break
+            raise _RaceCheckFailed(
+                f"comments fetch for PR #{pr_num} returned HTTP {page.status}")
         for c in (page.body() or []):
             if not isinstance(c, dict):
                 continue
@@ -1020,7 +1049,7 @@ def _recent_repair_claim_winner(client, repo: str, pr_num: str,
             if "Claimed PR repair by session" not in body:
                 continue
             ts = _iso_to_epoch(c.get("created_at", "") or "")
-            if ts and ts > cutoff:
+            if ts and ts > since_epoch:
                 bodies.append(body)
     if not bodies:
         return None
@@ -1045,10 +1074,24 @@ def cmd_claim_pr_repair(ctx: CoordinationContext, argv: list[str]) -> int:
         print(f"CLAIM FAILED: PR #{pr_num} is already repair-claimed.")
         return 1
 
-    if _count_recent_repair_claims(client, ctx.repo, pr_num, 1800) > 0:
+    # Cooldown probe (30 min). Failure here must abort claim — we don't
+    # know whether someone else just claimed.
+    try:
+        cooldown_since = _now_epoch() - 1800
+        recent = _count_recent_repair_claims(client, ctx.repo, pr_num,
+                                              cooldown_since)
+    except _RaceCheckFailed as e:
+        print(f"CLAIM FAILED: cooldown check for PR #{pr_num} failed: {e}")
+        return 1
+    if recent > 0:
         print(f"CLAIM FAILED: PR #{pr_num} was claimed for repair within "
               "the last 30 minutes.")
         return 1
+
+    # Freeze the race-detect cutoff BEFORE posting so the layer's
+    # rate-limit back-pressure (which can sleep up to 60s) can't push
+    # our concurrent attempts past the window.
+    race_since = _now_epoch()
 
     client.gh_cli("pr", "edit", pr_num, "--repo", ctx.repo,
                    "--add-label", "repair-claimed", timeout=15)
@@ -1060,8 +1103,22 @@ def cmd_claim_pr_repair(ctx: CoordinationContext, argv: list[str]) -> int:
     )
 
     time.sleep(RACE_SLEEP_SHORT)
-    if _count_recent_repair_claims(client, ctx.repo, pr_num, 60) > 1:
-        winner = _recent_repair_claim_winner(client, ctx.repo, pr_num, 60)
+    try:
+        race_count = _count_recent_repair_claims(client, ctx.repo, pr_num,
+                                                  race_since)
+    except _RaceCheckFailed as e:
+        print(f"CLAIM FAILED: race verification for PR #{pr_num} failed: {e}")
+        # Don't strip the label — another session may have legitimately
+        # claimed in the same window. The reconciler will clean up if
+        # nobody actually completes the repair.
+        return 1
+    if race_count > 1:
+        try:
+            winner = _recent_repair_claim_winner(client, ctx.repo, pr_num,
+                                                  race_since)
+        except _RaceCheckFailed as e:
+            print(f"CLAIM FAILED: race verification for PR #{pr_num} failed: {e}")
+            return 1
         if winner and winner != ctx.session_id:
             print(f"CLAIM FAILED: Race lost on PR #{pr_num} — another "
                   "session won.")
@@ -1252,32 +1309,38 @@ _CLAIM_RACE_SECONDS = 60
 
 
 def _count_recent_claims(client, repo: str, issue_num: str,
-                          within_seconds: int) -> int:
-    cutoff = _now_epoch() - within_seconds
+                          since_epoch: int) -> int:
+    """Count `Claimed by session` comments with `created_at > since_epoch`.
+    Raises `_RaceCheckFailed` on any non-OK page so the caller can fail
+    closed (bash's `set -euo pipefail` did this implicitly)."""
     count = 0
     for page in client.paginate(f"/repos/{repo}/issues/{issue_num}/comments",
                                 cache="none"):
         if not page.ok():
-            break
+            raise _RaceCheckFailed(
+                f"comments fetch for #{issue_num} returned HTTP {page.status}")
         for c in (page.body() or []):
             if not isinstance(c, dict):
                 continue
             if "Claimed by session" not in (c.get("body") or ""):
                 continue
             ts = _iso_to_epoch(c.get("created_at", "") or "")
-            if ts and ts > cutoff:
+            if ts and ts > since_epoch:
                 count += 1
     return count
 
 
 def _recent_claim_winner(client, repo: str, issue_num: str,
-                          within_seconds: int) -> str | None:
-    cutoff = _now_epoch() - within_seconds
+                          since_epoch: int) -> str | None:
+    """Return the lowest-sorted (lexicographic) `session` UUID among
+    claim comments newer than `since_epoch`. Raises `_RaceCheckFailed`
+    on non-OK pages."""
     bodies: list[str] = []
     for page in client.paginate(f"/repos/{repo}/issues/{issue_num}/comments",
                                 cache="none"):
         if not page.ok():
-            break
+            raise _RaceCheckFailed(
+                f"comments fetch for #{issue_num} returned HTTP {page.status}")
         for c in (page.body() or []):
             if not isinstance(c, dict):
                 continue
@@ -1285,7 +1348,7 @@ def _recent_claim_winner(client, repo: str, issue_num: str,
             if "Claimed by session" not in body:
                 continue
             ts = _iso_to_epoch(c.get("created_at", "") or "")
-            if ts and ts > cutoff:
+            if ts and ts > since_epoch:
                 bodies.append(body)
     if not bodies:
         return None
@@ -1326,6 +1389,14 @@ def cmd_claim(ctx: CoordinationContext, argv: list[str]) -> int:
 
     is_resume = os.environ.get("POD_IS_RESUME", "0") == "1"
     note = " (resumed conversation)" if is_resume else ""
+    # Freeze the race-detect cutoff BEFORE posting so the layer's
+    # rate-limit back-pressure (which can sleep up to 60s on quota
+    # exhaustion) can't push concurrent claim comments out of the
+    # window. The bash original computed `now - 60` inside its jq
+    # filter, so the cutoff drifted with each re-read; that was a
+    # latent bug — we fix it here.
+    race_since = _now_epoch() - _CLAIM_RACE_SECONDS
+
     client.gh_cli("issue", "edit", issue_num, "--repo", ctx.repo,
                    "--add-label", "claimed", timeout=15)
     client.gh_cli(
@@ -1336,9 +1407,21 @@ def cmd_claim(ctx: CoordinationContext, argv: list[str]) -> int:
     )
 
     time.sleep(RACE_SLEEP_SHORT)
-    if _count_recent_claims(client, ctx.repo, issue_num, _CLAIM_RACE_SECONDS) > 1:
-        winner = _recent_claim_winner(client, ctx.repo, issue_num,
-                                       _CLAIM_RACE_SECONDS)
+    try:
+        recent = _count_recent_claims(client, ctx.repo, issue_num, race_since)
+    except _RaceCheckFailed as e:
+        print(f"CLAIM FAILED: race verification for #{issue_num} failed: {e}")
+        # Don't strip the label — another session may have claimed in
+        # the same window. The reconciler / release-stale-claims sweep
+        # will clean up if nobody actually completes the work.
+        return 1
+    if recent > 1:
+        try:
+            winner = _recent_claim_winner(client, ctx.repo, issue_num,
+                                           race_since)
+        except _RaceCheckFailed as e:
+            print(f"CLAIM FAILED: race verification for #{issue_num} failed: {e}")
+            return 1
         if winner and winner != ctx.session_id:
             print(f"CLAIM FAILED: Race detected on #{issue_num} — another "
                   "agent won. You MUST NOT work on this issue. "
@@ -1565,6 +1648,16 @@ def cmd_release_stale_claims(ctx: CoordinationContext,
 # ---------------------------------------------------------------------------
 
 def _active_lock_comment_ids(client, ctx: CoordinationContext) -> list[int]:
+    """Return the database IDs of `planner-lock-attempt:` comments that
+    are still "active" — created within `PLANNER_LOCK_TTL` seconds.
+
+    Note on TTL clock: the cutoff combines a server-side comment
+    timestamp (`created_at`) with a local-clock "now". This matches the
+    bash original exactly; both versions share the same modest clock-
+    skew sensitivity. A holder whose clock is N seconds ahead of GitHub
+    sees the lock expire N seconds early; one behind, N seconds late.
+    PLANNER_LOCK_TTL=1200s is generous enough that this is acceptable.
+    """
     issue = _resolve_planner_lock_issue(ctx)
     cutoff = _now_epoch() - PLANNER_LOCK_TTL
     ids: list[int] = []

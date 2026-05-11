@@ -1832,41 +1832,46 @@ query TuiRefresh($owner: String!, $name: String!) {
 
 _TUI_REFRESH_CACHE: tuple[float, dict | None] = (0.0, None)
 _TUI_REFRESH_TTL = 4.0  # seconds; matches the TUI's fast-path tick cadence
+_TUI_REFRESH_LOCK = threading.Lock()
 
 
 def _tui_refresh_batch() -> dict | None:
     """One GraphQL query feeding all three TUI fetch helpers.
 
     Burner-rewrite (B2): replaces 4–6 `gh issue list` / `gh pr list`
-    calls per TUI refresh tick with a single GraphQL request. ETag-
-    cached by the layer, so the steady-state cost is one 304 per tick.
-    Additionally cached in-process for `_TUI_REFRESH_TTL` so the three
-    `fetch_*` helpers issued back-to-back share a single round-trip.
+    calls per TUI refresh tick with a single GraphQL request. The
+    `_TUI_REFRESH_LOCK` makes the check-then-fetch atomic, so three
+    concurrent background threads share one round-trip (rather than
+    each firing its own). The layer also ETag-caches the GraphQL
+    response (since the cache key includes a hash of the request body),
+    so cache-miss hits return 304s.
     """
     global _TUI_REFRESH_CACHE
-    now = time.time()
-    ts, cached = _TUI_REFRESH_CACHE
-    if cached is not None and (now - ts) < _TUI_REFRESH_TTL:
-        return cached
-    slug = _get_repo()
-    owner, _, name = slug.partition("/")
-    if not (owner and name):
-        return None
-    try:
-        resp = gh.get_client().graphql(
-            _TUI_REFRESH_QUERY,
-            variables={"owner": owner, "name": name},
-        )
-    except Exception:
-        return None
-    if not resp.ok():
-        return None
-    body = resp.body() or {}
-    repo_node = (body.get("data") or {}).get("repository") or {}
-    if not repo_node:
-        return None
-    _TUI_REFRESH_CACHE = (now, repo_node)
-    return repo_node
+    with _TUI_REFRESH_LOCK:
+        now = time.time()
+        ts, cached = _TUI_REFRESH_CACHE
+        if cached is not None and (now - ts) < _TUI_REFRESH_TTL:
+            return cached
+        slug = _get_repo()
+        owner, _, name = slug.partition("/")
+        if not (owner and name):
+            return None
+        try:
+            resp = gh.get_client().graphql(
+                _TUI_REFRESH_QUERY,
+                variables={"owner": owner, "name": name},
+                cache="etag",
+            )
+        except Exception:
+            return None
+        if not resp.ok():
+            return None
+        body = resp.body() or {}
+        repo_node = (body.get("data") or {}).get("repository") or {}
+        if not repo_node:
+            return None
+        _TUI_REFRESH_CACHE = (now, repo_node)
+        return repo_node
 
 
 def _gql_rollup_to_ci(commits_node: dict) -> str:
