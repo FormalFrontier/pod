@@ -192,13 +192,15 @@ class TuiRefreshQueryShapeTests(unittest.TestCase):
             r"\s*direction:\s*DESC\}",
         )
 
-    def test_open_agent_plan_cap_is_200(self):
-        # On repos at hex's scale the 100-issue cap was insufficient. The
-        # plan agreed bump to 200 gives headroom without paying for full
-        # pagination.
+    def test_open_agent_plan_cap_is_at_github_max(self):
+        # GitHub's GraphQL `first` is capped at 100 per connection;
+        # going above silently errors the entire batched query (HTTP
+        # 200 + `{"errors": [...]}` body, hard to debug from the
+        # caller side). Stay at 100 here. Hex-scale repos rely on
+        # `orderBy: CREATED_AT DESC` for newest-first visibility.
         self.assertRegex(
             cli._TUI_REFRESH_QUERY,
-            r"openAgentPlan: issues\(first:\s*200,",
+            r"openAgentPlan: issues\(first:\s*100,",
         )
 
     def test_open_issue_numbers_removed(self):

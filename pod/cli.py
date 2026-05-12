@@ -1776,7 +1776,7 @@ class GHItem:
 _TUI_REFRESH_QUERY = """
 query TuiRefresh($owner: String!, $name: String!) {
   repository(owner: $owner, name: $name) {
-    openAgentPlan: issues(first: 200, states: OPEN,
+    openAgentPlan: issues(first: 100, states: OPEN,
                            labels: ["agent-plan"],
                            orderBy: {field: CREATED_AT, direction: DESC}) {
       nodes {
