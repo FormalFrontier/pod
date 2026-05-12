@@ -74,12 +74,21 @@ def _patch_batch(repo_node):
                               return_value=repo_node)
 
 
+def _patch_states(states_by_num):
+    """Patch `fetch_issue_states` to return the supplied {num: state} dict."""
+    return mock.patch.object(
+        cli, "fetch_issue_states",
+        side_effect=lambda repo, nums: {n: states_by_num.get(n, "")
+                                         for n in nums})
+
+
+def _patch_repo(slug="o/r"):
+    return mock.patch.object(cli, "_get_repo", return_value=slug)
+
+
 class FetchBlockedDepsTests(unittest.TestCase):
     def test_no_blocked_issues_yields_empty(self):
-        with _patch_batch({
-            "blocked": {"nodes": []},
-            "openIssueNumbers": {"nodes": []},
-        }):
+        with _patch_batch({"blocked": {"nodes": []}}), _patch_repo():
             self.assertEqual(cli.fetch_blocked_deps(), {})
 
     def test_includes_blocked_from_any_family_label(self):
@@ -88,30 +97,59 @@ class FetchBlockedDepsTests(unittest.TestCase):
         body = ("HO-2 work item.\n\n"
                 "depends-on: #2563\n"
                 "depends-on: #2564\n")
-        with _patch_batch({
-            "blocked": {"nodes": [_issue(2565, body=body)]},
-            "openIssueNumbers": {"nodes": [{"number": 2563}, {"number": 2564}]},
-        }):
+        with _patch_batch({"blocked": {"nodes": [_issue(2565, body=body)]}}), \
+             _patch_states({2563: "OPEN", 2564: "OPEN"}), \
+             _patch_repo():
             result = cli.fetch_blocked_deps()
         self.assertEqual(result, {2565: [2563, 2564]})
 
     def test_drops_closed_deps(self):
         body = "depends-on: #100\ndepends-on: #101\n"
-        with _patch_batch({
-            "blocked": {"nodes": [_issue(50, body=body)]},
-            "openIssueNumbers": {"nodes": [{"number": 100}]},  # 101 closed
-        }):
+        with _patch_batch({"blocked": {"nodes": [_issue(50, body=body)]}}), \
+             _patch_states({100: "OPEN", 101: "CLOSED"}), \
+             _patch_repo():
             result = cli.fetch_blocked_deps()
         self.assertEqual(result, {50: [100]})
 
     def test_omits_issue_with_all_deps_closed(self):
         body = "depends-on: #100\n"
-        with _patch_batch({
-            "blocked": {"nodes": [_issue(50, body=body)]},
-            "openIssueNumbers": {"nodes": []},  # all deps closed
-        }):
+        with _patch_batch({"blocked": {"nodes": [_issue(50, body=body)]}}), \
+             _patch_states({100: "CLOSED"}), \
+             _patch_repo():
             result = cli.fetch_blocked_deps()
         self.assertEqual(result, {})
+
+    def test_lookup_failure_fail_closed(self):
+        # A dep whose state lookup returned "" (transport failure) must
+        # NOT be reported as open — that would let a closed-issue
+        # annotation leak through.
+        body = "depends-on: #200\ndepends-on: #201\n"
+        with _patch_batch({"blocked": {"nodes": [_issue(60, body=body)]}}), \
+             _patch_states({200: "OPEN", 201: ""}), \
+             _patch_repo():
+            result = cli.fetch_blocked_deps()
+        self.assertEqual(result, {60: [200]})
+
+    def test_resolves_deps_outside_any_cap(self):
+        # Regression: pre-fix, deps were resolved against `openIssueNumbers`
+        # which capped at 100 oldest open issues. Recent deps were silently
+        # dropped, hiding `Blocked on #N` annotations. The new code passes
+        # whatever dep numbers it parses out of bodies directly to
+        # `fetch_issue_states`, so there is no cap.
+        body = "depends-on: #99999\n"
+        recv: list[int] = []
+
+        def capture(repo, nums):
+            recv.extend(nums)
+            return {n: "OPEN" for n in nums}
+
+        with _patch_batch({"blocked": {"nodes": [_issue(7, body=body)]}}), \
+             mock.patch.object(cli, "fetch_issue_states",
+                               side_effect=capture), \
+             _patch_repo():
+            result = cli.fetch_blocked_deps()
+        self.assertEqual(result, {7: [99999]})
+        self.assertEqual(recv, [99999])
 
 
 class FetchHasPrLinksTests(unittest.TestCase):
@@ -200,7 +238,6 @@ class BatchCacheTests(unittest.TestCase):
             "closedAgentPlan": {"nodes": []},
             "closedHumanOversight": {"nodes": []},
             "blocked": {"nodes": []},
-            "openIssueNumbers": {"nodes": []},
             "hasPrIssues": {"nodes": []},
             "pullRequests": {"nodes": []},
         }}}
