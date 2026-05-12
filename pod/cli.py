@@ -1776,15 +1776,17 @@ class GHItem:
 _TUI_REFRESH_QUERY = """
 query TuiRefresh($owner: String!, $name: String!) {
   repository(owner: $owner, name: $name) {
-    openAgentPlan: issues(first: 100, states: OPEN,
-                           labels: ["agent-plan"]) {
+    openAgentPlan: issues(first: 200, states: OPEN,
+                           labels: ["agent-plan"],
+                           orderBy: {field: CREATED_AT, direction: DESC}) {
       nodes {
         number title createdAt updatedAt
         labels(first: 20) { nodes { name } }
       }
     }
     openHumanOversight: issues(first: 100, states: OPEN,
-                                 labels: ["human-oversight"]) {
+                                 labels: ["human-oversight"],
+                                 orderBy: {field: CREATED_AT, direction: DESC}) {
       nodes {
         number title createdAt updatedAt
         labels(first: 20) { nodes { name } }
@@ -1806,13 +1808,12 @@ query TuiRefresh($owner: String!, $name: String!) {
         labels(first: 20) { nodes { name } }
       }
     }
-    blocked: issues(first: 40, states: OPEN, labels: ["blocked"]) {
+    blocked: issues(first: 100, states: OPEN, labels: ["blocked"],
+                     orderBy: {field: UPDATED_AT, direction: DESC}) {
       nodes { number body }
     }
-    openIssueNumbers: issues(first: 100, states: OPEN) {
-      nodes { number }
-    }
-    hasPrIssues: issues(first: 40, states: OPEN, labels: ["has-pr"]) {
+    hasPrIssues: issues(first: 100, states: OPEN, labels: ["has-pr"],
+                         orderBy: {field: UPDATED_AT, direction: DESC}) {
       nodes {
         number
         closedByPullRequestsReferences(first: 20) {
@@ -1846,7 +1847,11 @@ _TUI_REFRESH_LOCK = threading.Lock()
 # Bump when `_TUI_REFRESH_QUERY` changes shape so an on-disk snapshot from
 # an older pod version is rejected instead of feeding the new code stale
 # data with missing keys (`openAgentPlan`, `blocked`, etc.).
-_TUI_CACHE_SCHEMA = 1
+# Schema 2 (2026-05-12): removed `openIssueNumbers` (dep resolution moved
+# to `fetch_issue_states`); added `orderBy: CREATED_AT DESC` to
+# `openAgentPlan`/`openHumanOversight` and `orderBy: UPDATED_AT DESC` to
+# `blocked`/`hasPrIssues`; bumped `openAgentPlan` cap to 200.
+_TUI_CACHE_SCHEMA = 2
 # One-shot flag: try the disk fallback exactly once per process, on the
 # first refresh tick after start-up. After that we either have live data
 # or we're already serving the in-memory copy.
@@ -1914,8 +1919,7 @@ def _load_tui_cache(slug: str) -> tuple[float, dict] | None:
     # shape (defence in depth on top of the schema-version check).
     required = ("openAgentPlan", "openHumanOversight",
                 "closedAgentPlan", "closedHumanOversight",
-                "blocked", "openIssueNumbers",
-                "hasPrIssues", "pullRequests")
+                "blocked", "hasPrIssues", "pullRequests")
     if not all(k in body for k in required):
         return None
     return (fetched_at, body)
@@ -2059,18 +2063,26 @@ def fetch_issues_and_prs() -> list[GHItem]:
 
 
 def fetch_blocked_deps() -> dict[int, list[int]]:
-    """Fetch open depends-on dependencies for blocked issues (closed
-    deps filtered out). Reads from the batched TUI GraphQL response."""
+    """For every blocked issue, return its currently-OPEN
+    `depends-on: #N` deps. Closed (or otherwise non-OPEN) deps are
+    filtered out; entries with no remaining open deps are dropped.
+
+    Dep states are resolved via `fetch_issue_states`, which does an
+    aliased-batch GraphQL lookup and TTL-caches the result on disk.
+    This avoids the older `openIssueNumbers` enumeration which capped
+    at 100 oldest open issues and silently dropped annotations on
+    repos with more than 100 open issues.
+
+    Fail-closed: deps whose state lookup fails are treated as not-open
+    (the annotation is hidden, never wrongly shown).
+    """
     import re as _re
     repo_node = _tui_refresh_batch()
     if repo_node is None:
         return {}
     blocked = ((repo_node.get("blocked") or {}).get("nodes")) or []
-    open_nums_nodes = ((repo_node.get("openIssueNumbers") or {})
-                        .get("nodes")) or []
-    open_nums = {n.get("number") for n in open_nums_nodes
-                 if isinstance(n, dict) and isinstance(n.get("number"), int)}
     raw: dict[int, list[int]] = {}
+    all_deps: set[int] = set()
     for iss in blocked:
         num = iss.get("number")
         if not isinstance(num, int):
@@ -2079,8 +2091,12 @@ def fetch_blocked_deps() -> dict[int, list[int]]:
         deps = [int(d) for d in _re.findall(r"depends-on: #(\d+)", body)]
         if deps:
             raw[num] = deps
+            all_deps.update(deps)
+    if not all_deps:
+        return {}
+    states = fetch_issue_states(_get_repo(), sorted(all_deps))
     return {num: filtered for num, deps in raw.items()
-            if (filtered := [d for d in deps if d in open_nums])}
+            if (filtered := [d for d in deps if states.get(d) == "OPEN"])}
 
 
 def fetch_has_pr_links() -> dict[int, list[int]]:
@@ -3556,6 +3572,134 @@ def fetch_issue_provenance(repo: str, issue_num: int) -> _IssueProvenance:
             f"failed to fetch provenance for {repo}#{issue_num}: "
             "GraphQL returned no issue node")
     return got[issue_num]
+
+
+# ---------------------------------------------------------------------------
+# Issue-state batched lookup (used by `fetch_blocked_deps` to resolve
+# `depends-on: #N` references without enumerating every open issue).
+# ---------------------------------------------------------------------------
+
+_ISSUE_STATE_BATCH_SIZE = 25  # aliases per GraphQL POST, matches provenance
+_ISSUE_STATE_TTL_SECONDS = 60.0  # how long a state lookup is reused
+
+
+def _build_issue_state_batch_query(count: int) -> str:
+    """Build a GraphQL query with `count` aliased single-issue lookups
+    returning just `number` and `state`. Each alias `i{k}` uses
+    `$num{k}: Int!`."""
+    aliases = "\n".join(
+        f"    i{k}: issue(number: $num{k}) {{ number state }}"
+        for k in range(count)
+    )
+    var_decls = ", ".join(f"$num{k}: Int!" for k in range(count))
+    return (
+        f"query IssueStateBatch($owner: String!, $name: String!, "
+        f"{var_decls}) {{\n"
+        f"  repository(owner: $owner, name: $name) {{\n"
+        f"{aliases}\n"
+        f"  }}\n"
+        f"}}\n"
+    )
+
+
+_ISSUE_STATE_CACHE_FILE = "issue-state-cache.json"
+
+
+def _issue_state_cache_path() -> Path:
+    return POD_DIR / _ISSUE_STATE_CACHE_FILE
+
+
+def _load_issue_state_cache() -> dict[str, dict]:
+    p = _issue_state_cache_path()
+    try:
+        return json.loads(p.read_text())
+    except (OSError, FileNotFoundError, json.JSONDecodeError, ValueError):
+        return {}
+
+
+def _save_issue_state_cache(cache: dict[str, dict]) -> None:
+    p = _issue_state_cache_path()
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps(cache, separators=(",", ":"), sort_keys=True))
+        tmp.replace(p)
+    except OSError:
+        pass
+
+
+def _issue_state_cache_key(repo: str, num: int) -> str:
+    return f"{repo}#{num}"
+
+
+def fetch_issue_states(repo: str, nums: list[int]) -> dict[int, str]:
+    """Return `{issue_number: state}` for each number in `nums`.
+
+    State is `"OPEN"`, `"CLOSED"`, or `""` (lookup failed / not found).
+    Cached on disk at `.pod/issue-state-cache.json` with TTL
+    `_ISSUE_STATE_TTL_SECONDS`; only cache misses (or expired entries)
+    trigger a batched GraphQL POST. On transport failure for a chunk,
+    the affected numbers are omitted from the result (callers treat
+    absence as "not open" — fail-closed; the UI hides annotations
+    rather than ever showing wrong ones).
+    """
+    owner, _, name = repo.partition("/")
+    if not (owner and name) or not nums:
+        return {}
+
+    cache = _load_issue_state_cache()
+    now = time.time()
+    out: dict[int, str] = {}
+    misses: list[int] = []
+    # Dedupe while preserving order so test fixtures stay deterministic.
+    deduped = list(dict.fromkeys(int(n) for n in nums))
+    for n in deduped:
+        entry = cache.get(_issue_state_cache_key(repo, n))
+        if (isinstance(entry, dict)
+                and isinstance(entry.get("fetched_at"), (int, float))
+                and now - float(entry["fetched_at"]) < _ISSUE_STATE_TTL_SECONDS
+                and isinstance(entry.get("state"), str)):
+            out[n] = entry["state"]
+        else:
+            misses.append(n)
+
+    if not misses:
+        return out
+
+    client = gh.get_client()
+    cache_dirty = False
+    for start in range(0, len(misses), _ISSUE_STATE_BATCH_SIZE):
+        chunk = misses[start:start + _ISSUE_STATE_BATCH_SIZE]
+        query = _build_issue_state_batch_query(len(chunk))
+        variables: dict = {"owner": owner, "name": name}
+        for k, n in enumerate(chunk):
+            variables[f"num{k}"] = n
+        try:
+            resp = client.graphql(query, variables=variables, cache="none")
+        except Exception:
+            # Transport-level failure: skip this chunk, leave its entries
+            # missing from `out`. Callers fail-closed.
+            continue
+        if not resp.ok():
+            continue
+        body = resp.body() or {}
+        repo_node = (body.get("data") or {}).get("repository") or {}
+        for k, n in enumerate(chunk):
+            node = repo_node.get(f"i{k}")
+            state = ""
+            if isinstance(node, dict):
+                s = node.get("state")
+                if isinstance(s, str):
+                    state = s
+            out[n] = state
+            cache[_issue_state_cache_key(repo, n)] = {
+                "state": state, "fetched_at": now,
+            }
+            cache_dirty = True
+
+    if cache_dirty:
+        _save_issue_state_cache(cache)
+    return out
 
 
 def is_trusted(provenance: _IssueProvenance, config: dict) -> tuple[bool, str]:

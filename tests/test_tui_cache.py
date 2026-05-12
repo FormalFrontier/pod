@@ -29,7 +29,6 @@ _VALID_REPO_NODE = {
     "closedAgentPlan": {"nodes": []},
     "closedHumanOversight": {"nodes": []},
     "blocked": {"nodes": []},
-    "openIssueNumbers": {"nodes": []},
     "hasPrIssues": {"nodes": []},
     "pullRequests": {"nodes": []},
 }
