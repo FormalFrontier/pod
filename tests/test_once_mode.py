@@ -3,16 +3,20 @@
 The actual fork/exec is exercised end-to-end by hand; here we pin the
 small, deterministic invariants that protect against regressions:
 
-  1. `AgentState.target_issue` defaults to 0 and round-trips through the
-     JSON state file.
-  2. `cmd_once` infers the worker type from issue labels when the user
-     omits `--type`, and rejects unrecognised label sets cleanly.
-  3. The one-shot agent does NOT count against the regular `target`
-     pool (the auto-spawn `running` accountant excludes one-shot
-     agents).
+  * `AgentState.target_issue` / `target_type` round-trip through the
+    JSON state file.
+  * The `_is_regular_agent` predicate excludes one-shot agents from
+    every `target` accountant (auto-spawn, `cmd_add`, `cmd_finish`,
+    `cmd_kill`).
+  * `_abort_one_shot_iteration` flips `state.finishing` only for
+    one-shot agents — regular agents continue their normal retry/backoff.
+  * `cmd_once` preflight (open/state, not-yet-claimed, labels matched
+    against worker types) refuses every operator-error case with a
+    clean exit before spawning.
+  * `_once_prompt` returns the `/once` slash form for Claude and reads
+    the codex template body for Codex.
 """
 
-import dataclasses
 import json
 import tempfile
 import types
@@ -50,10 +54,56 @@ class AgentStateOnceFieldsTests(unittest.TestCase):
                 self.assertEqual(back.target_type, "feature")
 
 
-class CmdOnceInferenceTests(unittest.TestCase):
-    """`cmd_once` reads `gh issue view` to infer worker type when
-    `--type` is omitted. Mock the subprocess call so we don't touch
-    the network and pin the failure modes precisely."""
+class IsRegularAgentTests(unittest.TestCase):
+    """`_is_regular_agent` is the shared predicate behind every
+    `target` accountant. The fix for Codex's MEDIUM #4 finding made
+    it explicit so `cmd_add`, `cmd_finish`, `cmd_kill`, and the
+    auto-spawn loop all agree on which agents count toward `target`."""
+
+    def test_regular_running_agent_counts(self):
+        a = cli.AgentState(short_id="r", status="running")
+        self.assertTrue(cli._is_regular_agent(a))
+
+    def test_dead_or_stopped_excluded(self):
+        for status in ("stopped", "dead"):
+            a = cli.AgentState(short_id="x", status=status)
+            self.assertFalse(cli._is_regular_agent(a),
+                             f"status={status!r} should not count")
+
+    def test_one_shot_excluded_even_when_running(self):
+        a = cli.AgentState(short_id="o", status="running",
+                           target_issue=3693)
+        self.assertFalse(cli._is_regular_agent(a))
+
+    def test_one_shot_excluded_when_finishing(self):
+        # A one-shot agent in `finishing` would otherwise look alive,
+        # but it never occupied a `target` slot to begin with.
+        a = cli.AgentState(short_id="o", status="finishing",
+                           target_issue=3693)
+        self.assertFalse(cli._is_regular_agent(a))
+
+
+class AbortOneShotIterationTests(unittest.TestCase):
+    def test_no_op_for_regular_agent(self):
+        a = cli.AgentState(short_id="reg")
+        self.assertFalse(a.finishing)
+        cli._abort_one_shot_iteration(a, "test")
+        self.assertFalse(a.finishing,
+                         "regular agent must continue iterating")
+
+    def test_marks_one_shot_finishing(self):
+        a = cli.AgentState(short_id="o", target_issue=3693)
+        self.assertFalse(a.finishing)
+        cli._abort_one_shot_iteration(a, "worktree setup failed")
+        self.assertTrue(a.finishing,
+                        "one-shot agent must exit on iteration failure")
+
+
+class CmdOnceTests(unittest.TestCase):
+    """`cmd_once` preflight invariants. We mock `subprocess.check_output`
+    so we never touch the network or fork; the goal is to pin every
+    operator-error refusal mode (no PR exit code, no half-spawned
+    worker)."""
 
     def _config(self):
         return {
@@ -64,40 +114,60 @@ class CmdOnceInferenceTests(unittest.TestCase):
             }
         }
 
+    def _gh_view(self, labels, state="OPEN", title="x"):
+        """Build a `gh issue view --json labels,state,title` payload."""
+        return json.dumps({
+            "labels": [{"name": n} for n in labels],
+            "state": state,
+            "title": title,
+        })
+
     def test_infers_worker_type_from_labels(self):
         args = types.SimpleNamespace(issue=3693, work_type=None)
         with mock.patch.object(cli.subprocess, "check_output",
-                               return_value="human-oversight\nfeature\n") as gh, \
+                               return_value=self._gh_view(
+                                   ["human-oversight", "feature"])) as gh, \
              mock.patch.object(cli, "spawn_agent",
                                return_value=12345) as spawn:
             cli.cmd_once(self._config(), args)
-        # gh issue view called once with the expected argv shape.
-        self.assertEqual(gh.call_count, 1)
         argv = gh.call_args.args[0]
         self.assertEqual(argv[:3], ["gh", "issue", "view"])
         self.assertIn("3693", argv)
-        # spawn_agent called with the inferred type.
+        self.assertIn("labels,state,title", argv)
         spawn.assert_called_once()
         kwargs = spawn.call_args.kwargs
         self.assertEqual(kwargs["target_issue"], 3693)
         self.assertEqual(kwargs["target_type"], "feature")
 
-    def test_explicit_type_skips_gh_call(self):
+    def test_explicit_type_still_preflights(self):
+        """Even with `--type` explicit we read the issue once to
+        check it is open + unclaimed. We do NOT skip the gh call."""
         args = types.SimpleNamespace(issue=3693, work_type="feature")
         with mock.patch.object(cli.subprocess, "check_output",
-                               side_effect=AssertionError(
-                                   "should not call gh when --type given")) as gh, \
+                               return_value=self._gh_view(["feature"])) as gh, \
              mock.patch.object(cli, "spawn_agent",
                                return_value=12345) as spawn:
             cli.cmd_once(self._config(), args)
-        self.assertEqual(gh.call_count, 0)
+        self.assertEqual(gh.call_count, 1)
         spawn.assert_called_once()
         self.assertEqual(spawn.call_args.kwargs["target_type"], "feature")
+
+    def test_unknown_explicit_type_exits_cleanly(self):
+        args = types.SimpleNamespace(issue=3693, work_type="frobnicate")
+        with mock.patch.object(cli.subprocess, "check_output",
+                               return_value=self._gh_view(["feature"])), \
+             mock.patch.object(cli, "spawn_agent",
+                               side_effect=AssertionError(
+                                   "should not spawn for unknown --type")):
+            with self.assertRaises(SystemExit) as ctx:
+                cli.cmd_once(self._config(), args)
+            self.assertEqual(ctx.exception.code, 2)
 
     def test_unrecognised_labels_exit_cleanly(self):
         args = types.SimpleNamespace(issue=3693, work_type=None)
         with mock.patch.object(cli.subprocess, "check_output",
-                               return_value="bug\nenhancement\n"), \
+                               return_value=self._gh_view(
+                                   ["bug", "enhancement"])), \
              mock.patch.object(cli, "spawn_agent",
                                side_effect=AssertionError(
                                    "should not spawn when no type matches")):
@@ -105,40 +175,62 @@ class CmdOnceInferenceTests(unittest.TestCase):
                 cli.cmd_once(self._config(), args)
             self.assertEqual(ctx.exception.code, 2)
 
+    def test_closed_issue_rejected(self):
+        args = types.SimpleNamespace(issue=3693, work_type=None)
+        with mock.patch.object(cli.subprocess, "check_output",
+                               return_value=self._gh_view(
+                                   ["feature"], state="CLOSED")), \
+             mock.patch.object(cli, "spawn_agent",
+                               side_effect=AssertionError(
+                                   "should not spawn for closed issue")):
+            with self.assertRaises(SystemExit) as ctx:
+                cli.cmd_once(self._config(), args)
+            self.assertEqual(ctx.exception.code, 2)
 
-class AutoSpawnExcludesOnceModeTests(unittest.TestCase):
-    """The auto-spawn loop reads the `running` count to decide how
-    many agents to maintain against `target`. A `pod once` worker
-    is, by user intent, *outside* the pool — it bypassed quota to
-    take a single priority issue. The accountant must therefore
-    skip agents with `target_issue` set, otherwise launching a
-    once-worker would reduce the regular-pool target by one for the
-    duration of the priority job."""
+    def test_already_claimed_issue_rejected(self):
+        """Codex MEDIUM #3: the preflight must catch a `claimed`
+        label *before* spawning. Otherwise the agent creates a
+        worktree and registers a branch before discovering the
+        race, which is cleanup-able but not 'without starting work'
+        in the operational sense."""
+        args = types.SimpleNamespace(issue=3693, work_type=None)
+        with mock.patch.object(cli.subprocess, "check_output",
+                               return_value=self._gh_view(
+                                   ["human-oversight", "feature",
+                                    "claimed"])), \
+             mock.patch.object(cli, "spawn_agent",
+                               side_effect=AssertionError(
+                                   "should not spawn when claimed")):
+            with self.assertRaises(SystemExit) as ctx:
+                cli.cmd_once(self._config(), args)
+            self.assertEqual(ctx.exception.code, 2)
 
-    def test_running_predicate_excludes_target_issue_agents(self):
-        regular_alive = cli.AgentState(short_id="reg", status="running",
-                                        target_issue=0)
-        regular_starting = cli.AgentState(short_id="reg2",
-                                           status="starting",
-                                           target_issue=0)
-        once_alive = cli.AgentState(short_id="once", status="running",
-                                     target_issue=3693)
-        once_finishing = cli.AgentState(short_id="once2",
-                                         status="finishing",
-                                         target_issue=42)
-        dead_regular = cli.AgentState(short_id="dead", status="dead",
-                                       target_issue=0)
-        stopped_once = cli.AgentState(short_id="stopped",
-                                        status="stopped",
-                                        target_issue=99)
-        agents = [regular_alive, regular_starting, once_alive,
-                  once_finishing, dead_regular, stopped_once]
-        # Mirror the auto-spawn predicate inline so a refactor of the
-        # closure surfaces here too.
-        running = sum(1 for a in agents
-                      if a.status not in ("stopped", "dead")
-                      and not a.target_issue)
-        self.assertEqual(running, 2)
+    def test_unparseable_gh_output_exits_cleanly(self):
+        args = types.SimpleNamespace(issue=3693, work_type=None)
+        with mock.patch.object(cli.subprocess, "check_output",
+                               return_value="not json"), \
+             mock.patch.object(cli, "spawn_agent",
+                               side_effect=AssertionError(
+                                   "should not spawn for bad gh output")):
+            with self.assertRaises(SystemExit) as ctx:
+                cli.cmd_once(self._config(), args)
+            self.assertEqual(ctx.exception.code, 2)
+
+
+class OncePromptTests(unittest.TestCase):
+    def test_claude_returns_slash_form(self):
+        self.assertEqual(cli._once_prompt("claude"), "/once")
+
+    def test_codex_reads_template_body(self):
+        prompt = cli._once_prompt("codex")
+        # Must NOT just be the slash form — Codex has no slash command
+        # system. Either the template is found (body) or we log a
+        # warning and fall back to `/once`; the template ships with
+        # the package so the first path is the expected one.
+        self.assertNotEqual(prompt, "/once",
+                            "codex backend should resolve to template body")
+        self.assertIn("one-shot", prompt.lower())
+        self.assertIn("issue number", prompt.lower())
 
 
 if __name__ == "__main__":

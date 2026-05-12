@@ -895,6 +895,39 @@ class AgentState:
             pass
 
 
+def _is_regular_agent(a: AgentState) -> bool:
+    """True iff `a` counts against the regular `target` pool.
+
+    Regular agents are spawned by `pod target N` / auto-spawn and live
+    inside the dispatch quota cap. One-shot agents (set by `pod once`)
+    explicitly bypass quota and live *outside* the pool — every
+    accountant that consults `target` (auto-spawn `running` count,
+    `cmd_add` setting `new_target`, `cmd_finish` / `cmd_kill`
+    decrementing target on signal/kill) must filter them out via this
+    predicate, otherwise launching a single one-shot worker silently
+    reduces the regular pool's effective size for the duration of the
+    priority job.
+    """
+    return a.status not in ("stopped", "dead") and not a.target_issue
+
+
+def _abort_one_shot_iteration(state: AgentState, reason: str) -> None:
+    """Mark a one-shot agent as `finishing` so its iteration loop
+    exits on the next check instead of cycling.
+
+    `pod once` semantics promise a single iteration; failure-path
+    `continue`s in `agent_process_main` would otherwise retry the
+    dispatch (re-creating worktrees, re-launching the model, possibly
+    looping on a permanently broken environment). Call this from each
+    failure branch before the loop's `continue`/`break`. No-op for
+    regular agents.
+    """
+    if state.target_issue:
+        log(f"Agent {state.short_id}: one-shot mode aborting "
+            f"({reason}, target_issue=#{state.target_issue})")
+        state.finishing = True
+
+
 def read_all_agents() -> list[AgentState]:
     """Read all agent state files, filtering out stale (dead process) ones."""
     agents = []
@@ -4893,6 +4926,23 @@ def install_agent_config(wt_dir: str, backend: str = "claude"):
                     f.write("\n\n" + agent_text)
 
 
+def _once_prompt(backend: str) -> str:
+    """Return the `/once` prompt for a one-shot priority dispatch.
+
+    Claude consumes the slash form directly. Codex has no slash-command
+    system, so we read the template body from
+    `pod/data/agent-config/codex/commands/once.md`. Falls back to the
+    literal `/once` if no template exists, matching `_worker_prompt`'s
+    fallback behaviour.
+    """
+    if backend == "codex":
+        cmd_file = _data_dir() / "agent-config" / "codex" / "commands" / "once.md"
+        if cmd_file.is_file():
+            return cmd_file.read_text()
+        log("Warning: no Codex command template for 'once', using /once raw")
+    return "/once"
+
+
 def _worker_prompt(config: dict, worker_type: str,
                     backend: str | None = None) -> str:
     """Return the prompt text for a given worker type.
@@ -6260,7 +6310,10 @@ def agent_process_main(config: dict, agent_id: str | None = None,
                 coordination(config, f"unlock-{lock_name}")
                 state.lock_held = ""
             state.status = "error"
+            _abort_one_shot_iteration(state, "worktree setup failed")
             state.write()
+            if state.finishing:
+                break
             time.sleep(10)
             continue
 
@@ -6272,7 +6325,10 @@ def agent_process_main(config: dict, agent_id: str | None = None,
                 coordination(config, f"unlock-{lock_name}")
                 state.lock_held = ""
             state.status = "error"
+            _abort_one_shot_iteration(state, "worktree dir missing")
             state.write()
+            if state.finishing:
+                break
             time.sleep(10)
             continue
 
@@ -6283,21 +6339,24 @@ def agent_process_main(config: dict, agent_id: str | None = None,
         install_agent_config(wt_dir, backend=chosen_backend)
 
         if not _resume_uuid:
-            prompt = _worker_prompt(config, chosen_type, backend=chosen_backend)
             if state.target_issue:
-                # `pod once` directive: point the agent at a specific issue
-                # so it doesn't pull the next unclaimed one from the
-                # generic queue. Appended after the slash command (Claude)
-                # / template body (Codex) so the agent sees both the
-                # work-type instructions and the override together.
+                # One-shot mode: use the dedicated `/once` template
+                # (which explicitly claims the target issue rather than
+                # listing the queue) and append a structured directive
+                # carrying the issue number + inferred worker type. The
+                # in-process claim-mismatch guard in the JSONL monitor
+                # is the runtime backstop if the model slips.
+                prompt = _once_prompt(chosen_backend)
                 prompt = (
                     f"{prompt}\n\n"
-                    f"This is a one-shot priority dispatch. Work specifically on "
-                    f"issue #{state.target_issue}. Claim that exact issue (not the "
-                    f"next unclaimed one from the queue) and execute it end-to-end. "
-                    f"If it is already claimed by someone else, exit without "
-                    f"starting work."
+                    f"---\n"
+                    f"ISSUE NUMBER: {state.target_issue}\n"
+                    f"WORKER TYPE: {chosen_type}\n"
+                    f"---"
                 )
+            else:
+                prompt = _worker_prompt(config, chosen_type,
+                                         backend=chosen_backend)
 
         if wt_config.get("copy_build_cache", wt_config.get("copy_lake_cache", False)):
             copy_build_cache(wt_dir, config)
@@ -6329,7 +6388,10 @@ def agent_process_main(config: dict, agent_id: str | None = None,
                 coordination(config, f"unlock-{lock_name}")
                 state.lock_held = ""
             state.status = "error"
+            _abort_one_shot_iteration(state, "agent launch failed")
             state.write()
+            if state.finishing:
+                break
             time.sleep(10)
             continue
 
@@ -6356,6 +6418,24 @@ def agent_process_main(config: dict, agent_id: str | None = None,
             elif state.pr_number > 0 and state.claimed_issue > 0:
                 clear_claim(state.claimed_issue, session_uuid=state.uuid)
                 _last_tracked_issue = 0
+
+            # One-shot guard: terminate the agent if it claimed an
+            # issue that doesn't match the `pod once` target. Prompt
+            # directives are advisory; this is the hard backstop that
+            # protects against a model slip claiming a different
+            # unclaimed issue.
+            if (state.target_issue
+                    and state.claimed_issue
+                    and state.claimed_issue != state.target_issue):
+                log(f"Agent {short_id}: one-shot CLAIM MISMATCH — "
+                    f"claimed #{state.claimed_issue} but target was "
+                    f"#{state.target_issue}. Terminating session.")
+                try:
+                    _agent_proc.terminate()
+                except (OSError, AttributeError):
+                    pass
+                state.finishing = True
+                break
             # Track repair-PR claim lifecycle (parallel to issue-claim). A
             # repair agent never has a claimed_issue, so these live on a
             # separate branch keyed by state.repair_pr.
@@ -6504,7 +6584,10 @@ def agent_process_main(config: dict, agent_id: str | None = None,
                 except Exception:
                     pass
                 state.lock_held = ""
+            _abort_one_shot_iteration(state, "quota exhaustion")
             state.write()
+            if state.finishing:
+                break
             continue  # loops back to top-of-loop quota check
 
         # --- Clear uncompleted claims so check_dead_claimed_issues doesn't
@@ -6556,7 +6639,10 @@ def agent_process_main(config: dict, agent_id: str | None = None,
                     pass
                 state.lock_held = ""
             state.status = "backoff"
+            _abort_one_shot_iteration(state, f"rapid failure #{rapid_failures}")
             state.write()
+            if state.finishing:
+                break
             time.sleep(backoff)
             continue
         else:
@@ -6842,13 +6928,10 @@ def _tui_main(stdscr, config: dict):
             for sid, cost in session_agent_costs.items()
         )
         session_runs = sum(1 for sid in session_agent_costs if sid not in baseline_costs)
-        # Auto-spawn maintains `target` *regular* agents. One-shot agents
-        # (launched via `pod once`) live outside the pool by design — they
-        # ignore quota and shouldn't displace a regular worker that the
-        # user asked for via `target`.
-        running = sum(1 for a in agents
-                       if a.status not in ("stopped", "dead")
-                       and not a.target_issue)
+        # Auto-spawn maintains `target` *regular* agents. One-shot
+        # agents (launched via `pod once`) live outside the pool by
+        # design — see `_is_regular_agent` for the predicate.
+        running = sum(1 for a in agents if _is_regular_agent(a))
 
         # Kick off background refreshes (non-blocking) and read latest results.
         now = time.time()
@@ -6911,6 +6994,14 @@ def _tui_main(stdscr, config: dict):
                 message_time = now
             for a in agents:
                 if (a.short_id, a.pid_start_time) in _grandfathered_agents:
+                    continue
+                # One-shot agents (`pod once`) are explicitly out-of-band:
+                # the user dispatched them to a specific issue and they
+                # exit on their own after a single iteration. The
+                # planner's "no remaining work" signal is about the
+                # regular queue, not priority work, so don't preempt
+                # them here.
+                if a.target_issue:
                     continue
                 if (a.pid > 0
                         and not a.finishing
@@ -7609,9 +7700,14 @@ def cmd_add(config: dict, args):
     for _ in range(n):
         pid = spawn_agent(config)
         say(f"Launched agent (PID {pid})")
-    alive = len([a for a in read_all_agents() if a.status not in ("stopped", "dead")])
+    # Only count regular agents toward the target. A one-shot agent
+    # launched via `pod once` lives outside the pool by design — see
+    # `_is_regular_agent` — so counting it here would silently raise the
+    # regular pool's target while the priority job runs.
+    regular_alive = sum(1 for a in read_all_agents()
+                        if _is_regular_agent(a))
     cur_target = read_target()
-    new_target = max(alive, (cur_target or 0) + n)
+    new_target = max(regular_alive, (cur_target or 0) + n)
     write_target(new_target)
     print(f"Launched {n} agent{'s' if n != 1 else ''}. Target: {new_target}.")
 
@@ -7619,43 +7715,86 @@ def cmd_add(config: dict, args):
 def cmd_once(config: dict, args):
     """Launch a one-shot agent targeting a specific issue.
 
-    Bypasses the dispatch queue and the dispatch quota cap (the agent is
-    spawned outside the `target` pool so the regular auto-spawn loop is
-    unaffected). The agent runs a single iteration and exits, regardless
-    of whether the issue completes successfully.
+    Bypasses the dispatch queue and the dispatch quota cap (the agent
+    is spawned outside the `target` pool so the regular auto-spawn loop
+    is unaffected; see `_is_regular_agent`). The agent runs a single
+    iteration and exits, regardless of whether the issue completes
+    successfully.
+
+    Preflight checks (issue exists, is open, isn't already claimed,
+    has a label matching a configured worker type) run *before* the
+    fork so the user gets a clean error rather than a worker that
+    cleanups itself a few seconds in.
     """
     issue = args.issue
     work_type = args.work_type
+    worker_types = cfg_get(config, "worker_types", default={}) or {}
+
+    # Preflight: pull labels and state in a single gh call so we can
+    # diagnose every refusal mode without a second round-trip.
+    try:
+        info_json = subprocess.check_output(
+            ["gh", "issue", "view", str(issue),
+             "--json", "labels,state,title"],
+            cwd=str(PROJECT_DIR), text=True,
+        )
+    except subprocess.CalledProcessError as e:
+        print(f"Failed to read issue #{issue}: {e}", file=sys.stderr)
+        sys.exit(2)
+    try:
+        info = json.loads(info_json)
+    except json.JSONDecodeError as e:
+        print(f"Could not parse `gh issue view #{issue}` JSON: {e}",
+              file=sys.stderr)
+        sys.exit(2)
+
+    if info.get("state") != "OPEN":
+        print(f"Issue #{issue} is {info.get('state')!r}; refusing to "
+              f"launch a one-shot worker on a non-open issue.",
+              file=sys.stderr)
+        sys.exit(2)
+
+    label_names = [
+        lab.get("name", "") for lab in info.get("labels", [])
+    ]
+    if "claimed" in label_names:
+        print(f"Issue #{issue} already has the `claimed` label "
+              f"(another agent holds it). Refusing to spawn a "
+              f"one-shot worker — wait for the existing claim to "
+              f"finish, or release it via `pod coordination skip`.",
+              file=sys.stderr)
+        sys.exit(2)
+
+    # Explicit `--type` validation. The inferred path is already
+    # validated against `worker_types` below; the explicit path was
+    # falling through to `_worker_prompt`'s `/{worker_type}` fallback,
+    # which produced a fast-failing agent rather than a clean error.
+    if work_type and work_type not in worker_types:
+        print(
+            f"Unknown --type {work_type!r}. Configured worker types: "
+            f"{', '.join(sorted(worker_types)) or '(none)'}.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
 
     # Auto-detect work type from issue labels when the user didn't
     # specify one. We honour every configured worker type, so any label
     # the dispatch loop recognises (`feature`, `plan`, `repair`,
     # `replan`, `review`, etc.) will pick the matching prompt.
     if not work_type:
-        worker_types = cfg_get(config, "worker_types", default={}) or {}
-        try:
-            labels = subprocess.check_output(
-                ["gh", "issue", "view", str(issue),
-                 "--json", "labels", "--jq", ".labels[].name"],
-                cwd=str(PROJECT_DIR), text=True,
-            ).split()
-        except subprocess.CalledProcessError as e:
-            print(f"Failed to read labels for issue #{issue}: {e}",
-                  file=sys.stderr)
-            sys.exit(2)
-        for label in labels:
+        for label in label_names:
             if label in worker_types:
                 work_type = label
                 break
         if not work_type:
             print(
-                f"Could not infer worker type for issue #{issue} from labels "
-                f"{labels!r}. Pass --type explicitly (one of: "
-                f"{', '.join(sorted(worker_types)) or 'feature'}).",
+                f"Could not infer worker type for issue #{issue} from "
+                f"labels {label_names!r}. Pass --type explicitly "
+                f"(one of: {', '.join(sorted(worker_types)) or 'feature'}).",
                 file=sys.stderr,
             )
             sys.exit(2)
-        print(f"Inferred --type {work_type} from labels {labels!r}.")
+        print(f"Inferred --type {work_type} from labels {label_names!r}.")
 
     pid = spawn_agent(config, target_issue=issue, target_type=work_type)
     print(
@@ -7678,7 +7817,7 @@ def cmd_finish(config: dict, args):
             print(f"No running agent matching '{args.target}'")
             return
 
-    signaled = 0
+    signaled_regular = 0
     for a in targets:
         if not _pid_is_valid(a.pid, a.pid_start_time):
             print(f"Agent {a.short_id} not running (PID {a.pid})")
@@ -7686,14 +7825,18 @@ def cmd_finish(config: dict, args):
         try:
             os.kill(a.pid, signal.SIGUSR1)
             print(f"Finish signal sent to {a.short_id} (PID {a.pid})")
-            signaled += 1
+            # One-shot agents don't occupy a target slot
+            # (`_is_regular_agent`) — finishing one shouldn't free a
+            # slot for auto-spawn to refill.
+            if _is_regular_agent(a):
+                signaled_regular += 1
         except (ProcessLookupError, OSError):
             print(f"Agent {a.short_id} not running (PID {a.pid})")
 
     # Decrement target so auto-spawn doesn't immediately refill the pool.
     cur_target = read_target()
-    if cur_target is not None and signaled > 0:
-        write_target(max(0, cur_target - signaled))
+    if cur_target is not None and signaled_regular > 0:
+        write_target(max(0, cur_target - signaled_regular))
 
 
 def cmd_kill(config: dict, args):
@@ -7709,16 +7852,19 @@ def cmd_kill(config: dict, args):
             print(f"No running agent matching '{args.target}'")
             return
 
-    killed = 0
+    killed_regular = 0
     for a in targets:
         _kill_agent(config, a)
         print(f"Killed {a.short_id} (PID {a.pid})")
-        killed += 1
+        # One-shot agents don't occupy a target slot — same rationale
+        # as `cmd_finish` above.
+        if _is_regular_agent(a):
+            killed_regular += 1
 
     # Decrement target so auto-spawn doesn't immediately refill the pool.
     cur_target = read_target()
-    if cur_target is not None and killed > 0:
-        write_target(max(0, cur_target - killed))
+    if cur_target is not None and killed_regular > 0:
+        write_target(max(0, cur_target - killed_regular))
 
 
 def cmd_status(config: dict, args):
