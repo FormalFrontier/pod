@@ -6221,6 +6221,10 @@ def agent_process_main(config: dict, agent_id: str | None = None,
             chosen_type = state.target_type or "feature"
             wt_config = worker_types.get(chosen_type, {})
             lock_name = ""
+            # Clear the `waiting_quota` status set before the (force_quota-
+            # short-circuited) quota loop, so the TUI shows worktree-setup
+            # / build-cache-copy progress rather than a stale wait label.
+            state.status = "dispatching"
             state.worker_type = chosen_type
             state.write()
             log(f"Agent {short_id}: one-shot mode, target issue #{state.target_issue} "
@@ -6231,6 +6235,7 @@ def agent_process_main(config: dict, agent_id: str | None = None,
             prompt = "You were interrupted mid-task. Review your conversation history and continue where you left off."
             lock_name = ""
             wt_config = {}
+            state.status = "dispatching"
             state.worker_type = chosen_type
             state.write()
             log(f"Agent {short_id}: resuming session {_resume_uuid}")
