@@ -7786,15 +7786,21 @@ def cmd_once(config: dict, args):
             if label in worker_types:
                 work_type = label
                 break
-        if not work_type:
+        if not work_type and "work" in worker_types:
+            work_type = "work"
+            print(f"Defaulting --type work for issue #{issue} "
+                  f"(labels={label_names!r} matched no worker type).")
+        elif not work_type:
             print(
                 f"Could not infer worker type for issue #{issue} from "
-                f"labels {label_names!r}. Pass --type explicitly "
+                f"labels {label_names!r}, and no `work` worker type is "
+                f"configured. Pass --type explicitly "
                 f"(one of: {', '.join(sorted(worker_types)) or 'feature'}).",
                 file=sys.stderr,
             )
             sys.exit(2)
-        print(f"Inferred --type {work_type} from labels {label_names!r}.")
+        else:
+            print(f"Inferred --type {work_type} from labels {label_names!r}.")
 
     pid = spawn_agent(config, target_issue=issue, target_type=work_type)
     print(

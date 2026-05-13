@@ -175,6 +175,28 @@ class CmdOnceTests(unittest.TestCase):
                 cli.cmd_once(self._config(), args)
             self.assertEqual(ctx.exception.code, 2)
 
+    def test_falls_back_to_work_when_configured(self):
+        """When no label matches a worker_type but `work` is configured,
+        `pod once` defaults to `work` — `human-oversight`-only issues
+        (the common case for hand-written work items) shouldn't require
+        `--type work` explicitly."""
+        config = {
+            "worker_types": {
+                "work": {"prompt": "/work"},
+                "plan": {"prompt": "/plan"},
+                "repair": {"prompt": "/repair"},
+            }
+        }
+        args = types.SimpleNamespace(issue=3698, work_type=None)
+        with mock.patch.object(cli.subprocess, "check_output",
+                               return_value=self._gh_view(
+                                   ["human-oversight"])), \
+             mock.patch.object(cli, "spawn_agent",
+                               return_value=12345) as spawn:
+            cli.cmd_once(config, args)
+        spawn.assert_called_once()
+        self.assertEqual(spawn.call_args.kwargs["target_type"], "work")
+
     def test_closed_issue_rejected(self):
         args = types.SimpleNamespace(issue=3693, work_type=None)
         with mock.patch.object(cli.subprocess, "check_output",
