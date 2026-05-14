@@ -8462,6 +8462,98 @@ def _ensure_branch_protection(init_config):
         print("  warning: could not configure branch protection (gh CLI not available)")
 
 
+def cmd_accounts(config: dict, args):
+    """Inspect / manage Claude account leases held by pod agents.
+
+    Subactions:
+      list                       Show all known accounts and current
+                                 leases (`label  owner  pid  age
+                                 project`). Free accounts also shown.
+      release <label> [--force]  Remove the lease for ``label``.
+                                 Refuses if the owning agent is still
+                                 live; ``--force`` overrides. The
+                                 owning agent's next iteration will
+                                 re-acquire (possibly a different
+                                 account) on its own.
+      evict-orphans              Take the meta-lock and reap any
+                                 leases whose owner short_id is no
+                                 longer in .pod/agents/.
+    """
+    action = getattr(args, "accounts_action", None) or "list"
+    if action == "list":
+        accts = accounts.list_claude_accounts()
+        leases = {l.label: l for l in accounts.list_leases()}
+        live_short_ids = {a.short_id for a in read_all_agents()
+                          if a.status not in ("stopped", "dead")}
+        if not accts and not leases:
+            print("(no accounts found in ~/.claude/credentials*.json)")
+            return
+        print(f"{'LABEL':<14} {'OWNER':<10} {'PID':>6} "
+              f"{'AGE':>8}  PROJECT")
+        for acct in accts:
+            lease = leases.get(acct.label)
+            if lease is None:
+                print(f"{acct.label:<14} {'(free)':<10} {'':>6} {'':>8}  -")
+                continue
+            age = human_duration(time.time() - lease.acquired_at)
+            owner = lease.short_id
+            if lease.short_id not in live_short_ids:
+                owner += "*"  # orphan
+            print(f"{acct.label:<14} {owner:<10} {lease.pid:>6} "
+                  f"{age:>8}  {lease.project_dir}")
+        # Surface orphans that survived account enumeration (e.g. account
+        # file deleted but lease lingered) — also worth reaping.
+        unmatched = [l for l in leases.values()
+                      if l.label not in {a.label for a in accts}]
+        for lease in unmatched:
+            age = human_duration(time.time() - lease.acquired_at)
+            owner = lease.short_id
+            if lease.short_id not in live_short_ids:
+                owner += "*"
+            print(f"{lease.label:<14} {owner:<10} {lease.pid:>6} "
+                  f"{age:>8}  {lease.project_dir} (no account file)")
+        if any(owner.endswith("*") for owner in ()):  # never-true; just suppress
+            pass
+        if any(l.short_id not in live_short_ids for l in leases.values()):
+            print("\n* = orphan (owning agent is no longer live). "
+                  "`pod accounts evict-orphans` to reap.")
+    elif action == "release":
+        label = args.label
+        force = bool(getattr(args, "force", False))
+        leases = {l.label: l for l in accounts.list_leases()}
+        lease = leases.get(label)
+        if lease is None:
+            print(f"No lease held on '{label}'.")
+            return
+        live_short_ids = {a.short_id for a in read_all_agents()
+                          if a.status not in ("stopped", "dead")}
+        if lease.short_id in live_short_ids and not force:
+            print(f"Refusing to release '{label}': owning agent "
+                  f"{lease.short_id} is still live. "
+                  f"Use --force to release anyway "
+                  f"(the agent's next iteration will re-acquire).")
+            sys.exit(1)
+        ok = accounts.release_lease(label, lease.short_id)
+        if ok:
+            print(f"Released '{label}' (was owned by {lease.short_id}).")
+        else:
+            print(f"Failed to release '{label}'.")
+            sys.exit(1)
+    elif action == "evict-orphans":
+        with accounts.lease_critical_section():
+            live = {a.short_id for a in read_all_agents()
+                    if a.status not in ("stopped", "dead")}
+            evicted = accounts.evict_orphan_leases(live)
+        if evicted:
+            print(f"Evicted {len(evicted)} orphan lease(s): "
+                  f"{', '.join(evicted)}")
+        else:
+            print("No orphan leases.")
+    else:
+        print(f"Unknown action: {action}")
+        sys.exit(2)
+
+
 def cmd_init(args):
     """Bootstrap .pod/ in the current git repo."""
     # Verify we're in a git repo
@@ -8650,6 +8742,23 @@ def main():
     p_config.add_argument("--edit", action="store_true",
                            help="Open config in $EDITOR")
 
+    p_accounts = sub.add_parser(
+        "accounts",
+        help="Inspect / manage Claude account leases (list, release, evict-orphans)",
+    )
+    p_accounts_sub = p_accounts.add_subparsers(dest="accounts_action")
+    p_accounts_sub.add_parser("list",
+        help="Show current leases (default action)")
+    p_accounts_release = p_accounts_sub.add_parser(
+        "release",
+        help="Release a lease by label")
+    p_accounts_release.add_argument("label",
+        help="Account label (e.g. lean-fro)")
+    p_accounts_release.add_argument("--force", "-f", action="store_true",
+        help="Release even if the owning agent is still live")
+    p_accounts_sub.add_parser("evict-orphans",
+        help="Reap leases whose owning agent is no longer live")
+
     p_ghstats = sub.add_parser(
         "gh-stats",
         help="Aggregate .pod/gh-access.log to find which callers burn quota",
@@ -8739,6 +8848,8 @@ def main():
         cmd_log(config, args)
     elif args.command == "config":
         cmd_config(config, args)
+    elif args.command == "accounts":
+        cmd_accounts(config, args)
     elif args.command == "gh-stats":
         cmd_gh_stats(config, args)
     elif args.command == "_check-provenance":
