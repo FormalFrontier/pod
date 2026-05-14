@@ -46,6 +46,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
+from pod import accounts
 from pod import github as gh
 
 
@@ -148,11 +149,19 @@ quota_retry_seconds = 60           # Auto-mode sleep when no backend has quota
 prefer = "codex"                   # Tie-break when both backends have quota
 
 [agent.claude]
-model = "opus"                     # Claude model to use
+model = "opus"                     # Claude model to use (back-compat default)
+# Ordered list of acceptable model tiers; first satisfiable per account
+# wins. Set to ["opus"] to require Opus, ["opus", "sonnet"] to fall
+# through to Sonnet when no account has Opus quota. Absent → [model].
+accepted_models = ["opus"]
 quota_check = "~/.claude/skills/claude-usage/claude-available-model"
 quota_check_required = true        # Hard-fail if quota unavailable
 quota_retry_seconds = 60           # Sleep duration when quota unavailable
-isolated_config = true             # Use pod-managed isolated CLAUDE_CONFIG_DIR for agents
+# When isolated_config = true, each agent gets its own
+# CLAUDE_CONFIG_DIR under .pod/claude-config/<short_id>/ with its own
+# keychain entry, so different agents can simultaneously run on
+# different Claude accounts.
+isolated_config = true             # Use per-agent CLAUDE_CONFIG_DIR for agents
 
 [agent.codex]
 model = "gpt-5.4"                  # Codex model to use
@@ -422,51 +431,50 @@ def ensure_config() -> dict:
     return cfg
 
 
-def get_isolated_config_dir(config: dict) -> Path | None:
-    """Return isolated CLAUDE_CONFIG_DIR path, or None if disabled/Codex-only.
+def _claude_isolation_enabled(config: dict) -> bool:
+    """True iff Claude agents should use a per-agent CLAUDE_CONFIG_DIR.
 
-    Returns the path for `claude` and `auto` backends (auto may pick Claude
-    in any iteration); returns None for `codex`. Codex isolation is handled
-    by `_setup_codex_home()` inside `launch_agent()` via `CODEX_HOME`.
+    Returns False when the configured backend is Codex-only or when
+    ``isolated_config`` is explicitly off for Claude.
     """
     if _backend(config) == "codex":
+        return False
+    return bool(_backend_cfg(
+        config, "isolated_config", backend="claude", default=False))
+
+
+def get_isolated_config_dir(config: dict,
+                              short_id: str | None = None) -> Path | None:
+    """Return the CLAUDE_CONFIG_DIR for ``short_id``, or None if disabled.
+
+    With per-agent isolation enabled, each agent gets its own
+    ``.pod/claude-config/<short_id>/`` directory. Passing
+    ``short_id=None`` returns the root claude-config dir (callers that
+    don't yet know the agent id, e.g. legacy code paths).
+    """
+    if not _claude_isolation_enabled(config):
         return None
-    if not _backend_cfg(config, "isolated_config", backend="claude", default=False):
+    if short_id is None:
+        return ISOLATED_CONFIG_DIR
+    return accounts.agent_claude_config_dir(POD_DIR, short_id)
+
+
+def ensure_isolated_config(config: dict,
+                            short_id: str | None = None) -> Path | None:
+    """Materialise the agent's CLAUDE_CONFIG_DIR. Returns path or None if disabled.
+
+    Creates the per-agent dir with ``settings.json`` and ``projects/``.
+    The ``.credentials.json`` file is *not* written here — it lands
+    when ``accounts.mirror_canonical_to_isolated`` runs at lease
+    acquisition (which selects the specific account to use).
+    """
+    if not _claude_isolation_enabled(config):
         return None
-    return ISOLATED_CONFIG_DIR
-
-
-def ensure_isolated_config(config: dict) -> Path | None:
-    """Set up isolated CLAUDE_CONFIG_DIR for agents. Returns path or None if disabled."""
-    config_dir = get_isolated_config_dir(config)
-    if config_dir is None:
-        return None
-
-    config_dir.mkdir(parents=True, exist_ok=True)
-
-    # Minimal settings — no hooks, no plugins, no global CLAUDE.md
-    settings_path = config_dir / "settings.json"
-    settings_path.write_text('{"skipDangerousModePermissionPrompt": true}\n')
-
-    # Symlink credentials from ~/.claude/ so subscription auth works.
-    # Race-safe: use try/except since multiple agents may run this concurrently.
-    real_claude = Path.home() / ".claude"
-    cred_link = config_dir / ".credentials.json"
-    cred_target = real_claude / ".credentials.json"
-    if cred_target.exists():
-        try:
-            cred_link.unlink(missing_ok=True)
-            cred_link.symlink_to(cred_target)
-        except FileExistsError:
-            pass  # Another process created it first — fine
-    else:
-        # Clean up stale symlink if source credential file is gone
-        cred_link.unlink(missing_ok=True)
-
-    # JSONL session storage
-    (config_dir / "projects").mkdir(exist_ok=True)
-
-    return config_dir
+    if short_id is None:
+        # Legacy callers (very rare): fall back to the shared dir.
+        ISOLATED_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        return ISOLATED_CONFIG_DIR
+    return accounts.ensure_agent_claude_config_dir(POD_DIR, short_id)
 
 
 def _instruction_file_warning(git_root: Path, backend: str) -> str | None:
@@ -635,6 +643,11 @@ def say(msg: str):
     line = f"[{ts}] {msg}"
     print(line, file=sys.stderr)
     log(msg)
+
+
+# Route pod.accounts diagnostics through pod's logger so everything
+# lands in .pod/pod.log under the same timestamp format.
+accounts.set_logger(log)
 
 
 # ---------------------------------------------------------------------------
@@ -850,6 +863,15 @@ class AgentState:
     resume_session_uuid: str = ""  # If set, first iteration uses this UUID (to resume conversation)
     backend: str = "claude"        # "claude" or "codex" (for per-backend pricing lookup)
     model: str = ""                # e.g. "opus", "gpt-5.4" (for per-model pricing lookup)
+    # Per-agent account lease (Claude only). `account_label` is the
+    # currently-held lease; "" when waiting or running Codex.
+    # `lease_acquired_at` is a wall-clock timestamp used for stale-lease
+    # debugging and orphan eviction. `claude_config_dir` is the per-agent
+    # CLAUDE_CONFIG_DIR so the TUI and crash-recovery can locate the
+    # isolated config without recomputing the short_id mapping.
+    account_label: str = ""
+    lease_acquired_at: float = 0.0
+    claude_config_dir: str = ""
     # One-shot mode: agent claims and works on `target_issue` once with the
     # given `target_type` prompt, then exits. Set by `pod once`. Bypasses
     # dispatch_queue_balance, the planner / replan / repair lock dance, and
@@ -1479,133 +1501,24 @@ def _model_tier(backend: str, model: str) -> int:
     return _MODEL_TIER.get(backend, {}).get(model, 0)
 
 
-def _claude_keychain_service(claude_config_dir: Path | None) -> str:
-    """Compute the macOS keychain service name Claude Code uses for credentials.
-
-    Mirrors @anthropic-ai/claude-code's lookup: the service is
-    "Claude Code-credentials" for the default ~/.claude config dir, or
-    "Claude Code-credentials-<sha256(NFC(config_dir))[:8]>" when
-    CLAUDE_CONFIG_DIR is set.
-    """
-    import hashlib
-    import unicodedata
-    if claude_config_dir is None:
-        return "Claude Code-credentials"
-    normalized = unicodedata.normalize("NFC", str(claude_config_dir))
-    suffix = hashlib.sha256(normalized.encode()).hexdigest()[:8]
-    return f"Claude Code-credentials-{suffix}"
-
-
-def resolve_claude_credential(claude_config_dir: Path | None) -> dict:
-    """Resolve the credential Claude Code will actually use at launch time.
-
-    Mirrors Claude Code's lookup order: the macOS keychain entry keyed by
-    sha256(CLAUDE_CONFIG_DIR) first, then the plaintext
-    ``$CLAUDE_CONFIG_DIR/.credentials.json`` fallback.
-
-    Returns {accountLabel, tokenPrefix, source}.
-    """
-    import json as _json
-    service = _claude_keychain_service(claude_config_dir)
-
-    try:
-        r = subprocess.run(
-            ["security", "find-generic-password",
-             "-s", service, "-a", os.getenv("USER", ""), "-w"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if r.returncode == 0 and r.stdout.strip():
-            kc = _json.loads(r.stdout.strip())
-            return {
-                "accountLabel": kc.get("accountLabel", "?"),
-                "tokenPrefix": kc.get("claudeAiOauth", {}).get("accessToken", "")[:20],
-                "source": f"keychain[{service}]",
-            }
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError, ValueError):
-        pass
-
-    if claude_config_dir is not None:
-        creds_path = claude_config_dir / ".credentials.json"
-    else:
-        creds_path = Path.home() / ".claude" / ".credentials.json"
-    try:
-        with open(creds_path) as f:
-            creds = _json.load(f)
-        symlink = ""
-        if creds_path.is_symlink():
-            symlink = f" -> {os.readlink(creds_path)}"
-        return {
-            "accountLabel": creds.get("accountLabel", "?"),
-            "tokenPrefix": creds.get("claudeAiOauth", {}).get("accessToken", "")[:20],
-            "source": f"file[{creds_path}]{symlink}",
-        }
-    except (OSError, ValueError):
-        pass
-
-    return {"accountLabel": "?", "tokenPrefix": "", "source": "none"}
-
-
-def _sync_isolated_credential(claude_config_dir: Path | None) -> None:
-    """Mirror the default Claude credential into the isolated config's keychain entry.
-
-    Claude Code derives a per-config-dir keychain service name (suffix =
-    sha256(config_dir)[:8]). `swap-account` only updates the unsuffixed
-    default entry, so without this sync agents stay pinned to whichever
-    account was active when the isolated entry was first written. Run this
-    before each quota check and each agent launch so swap-account changes
-    propagate transparently.
-    """
-    if claude_config_dir is None or sys.platform != "darwin":
-        return
-    default = resolve_claude_credential(None)
-    isolated = resolve_claude_credential(claude_config_dir)
-    if default.get("source") == "none":
-        return
-    if (default.get("accountLabel") == isolated.get("accountLabel")
-            and default.get("tokenPrefix") == isolated.get("tokenPrefix")):
-        return
-    user = os.getenv("USER", "")
-    blob: str | None = None
-    try:
-        r = subprocess.run(
-            ["security", "find-generic-password",
-             "-s", "Claude Code-credentials", "-a", user, "-w"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if r.returncode == 0 and r.stdout.strip():
-            blob = r.stdout.strip()
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-        pass
-    if blob is None:
-        try:
-            with open(Path.home() / ".claude" / ".credentials.json") as f:
-                blob = f.read().strip()
-        except (OSError, ValueError):
-            return
-    service = _claude_keychain_service(claude_config_dir)
-    hex_data = blob.encode().hex()
-    try:
-        subprocess.run(
-            ["security", "add-generic-password", "-U",
-             "-a", user, "-s", service, "-X", hex_data],
-            capture_output=True, timeout=5, check=True,
-        )
-        log(f"Mirrored credential [{default.get('accountLabel')}] → "
-            f"isolated keychain [{service}] (was [{isolated.get('accountLabel')}])")
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
-            FileNotFoundError, OSError) as e:
-        log(f"Failed to mirror credential to {service}: {e}")
+# Keychain service name + credential resolution moved to `pod.accounts`
+# so the lease layer and cli.py share one source of truth. Keep
+# back-compat aliases at module scope for any callers that still expect
+# the cli-level names.
+_claude_keychain_service = accounts.claude_keychain_service
+resolve_claude_credential = accounts.resolve_claude_credential
 
 
 def _backend_available(config: dict, backend: str,
                         claude_config_dir: Path | None = None) -> bool:
-    """Check whether `backend` has available quota right now.
+    """Legacy single-account quota check. True iff ``backend``'s quota
+    helper reports ≥ the configured model tier.
 
-    For Claude, resolves the credential Claude Code will actually use for
-    ``claude_config_dir`` and asks the quota helper about *that* account
-    specifically — otherwise the helper inspects whichever account owns the
-    default keychain entry, which may differ from the one launched sessions
-    actually hit.
+    Kept for back-compat with ``select_available_backend`` (and a couple
+    of tests). The agent loop calls ``acquire_backend`` instead, which
+    enumerates every Claude account and atomically leases the best one.
+    Does *not* mutate the keychain — credential mirroring is now part
+    of lease acquisition in ``acquire_backend``.
     """
     cmd = os.path.expanduser(_backend_cfg(config, "quota_check", backend=backend, default=""))
     if not cmd:
@@ -1613,7 +1526,8 @@ def _backend_available(config: dict, backend: str,
     quota_required = _backend_cfg(config, "quota_check_required", backend=backend, default=True)
     args = [cmd]
     if backend == "claude":
-        _sync_isolated_credential(claude_config_dir)
+        # Use the module-level alias so existing tests can patch
+        # `cli.resolve_claude_credential` and intercept this call.
         resolved = resolve_claude_credential(claude_config_dir)
         label = resolved.get("accountLabel", "")
         if label and label != "?":
@@ -1648,19 +1562,12 @@ def _auto_backend_order(config: dict) -> list[str]:
 
 def select_available_backend(config: dict, force: bool = False,
                               claude_config_dir: Path | None = None) -> str | None:
-    """Pick the backend to run for this iteration.
+    """Legacy single-account backend picker, returning just a backend name.
 
-    Returns the backend name (`"claude"` or `"codex"`), or `None` if no
-    backend has available quota.
-
-    - Fixed mode (`agent.backend = "claude"` or `"codex"`): returns that
-      backend if its quota check passes, else None.
-    - Auto mode (`agent.backend = "auto"`): tries each backend in the
-      preference order from `[agent.auto].prefer` and returns the first
-      one whose quota check passes.
-
-    `force` (or the global `FORCE_QUOTA_FILE` flag) bypasses quota checks
-    entirely; in auto mode this returns the preferred backend.
+    Wraps ``_backend_available`` over the configured backend(s) and
+    returns the first one whose quota check passes. New code should
+    use ``acquire_backend``, which enumerates every Claude account and
+    holds a host-wide lease so two agents can't race onto the same one.
     """
     raw = cfg_get(config, "agent", "backend", default="claude")
     if raw == "auto":
@@ -1683,11 +1590,227 @@ def check_quota(config: dict, force: bool = False,
                 claude_config_dir: Path | None = None) -> bool:
     """Back-compat shim: True iff some backend has available quota now.
 
-    New code should call `select_available_backend()` directly so it knows
-    *which* backend to launch.
+    New code should call ``acquire_backend()`` directly so it knows
+    *which* backend, account, and model to launch.
     """
     return select_available_backend(config, force=force,
                                     claude_config_dir=claude_config_dir) is not None
+
+
+# --- Per-agent acquire / release ------------------------------------------
+
+
+def _claude_accepted_models(config: dict | None = None) -> list[str]:
+    """Return the ordered list of accepted Claude model tiers.
+
+    Reads ``[agent.claude].accepted_models`` from config on disk (so
+    edits take effect without restarting pod). Falls back to
+    ``[agent.claude].model`` for back-compat with older configs.
+    """
+    raw = _reload_config_value("agent", "claude", "accepted_models", default=None)
+    if isinstance(raw, list) and raw:
+        return [str(x) for x in raw]
+    fallback = _reload_config_value("agent", "claude", "model", default="opus")
+    return [fallback]
+
+
+def _release_account_lease(state: AgentState,
+                             claude_config_dir: Path | None) -> None:
+    """Release the agent's Claude account lease and harvest any refreshed
+    OAuth token back to canonical ``~/.claude/credentials<N>.json``.
+
+    Idempotent: a no-op when ``state.account_label`` is empty. Clears
+    the lease bookkeeping on state. Safe to call from cleanup paths
+    (normal iteration end, quota-exhaust, rapid-failure backoff,
+    SIGTERM, exception handlers).
+    """
+    label = state.account_label
+    if not label:
+        return
+    if claude_config_dir is not None:
+        for a in accounts.list_claude_accounts():
+            if a.label == label:
+                try:
+                    accounts.harvest_isolated_to_canonical(
+                        label, a.number, claude_config_dir)
+                except OSError as e:
+                    log(f"lease: harvest failed for {label}: {e}")
+                break
+    try:
+        accounts.release_lease(label, state.short_id)
+    except Exception as e:
+        log(f"lease: release failed for {label}: {e}")
+    state.account_label = ""
+    state.lease_acquired_at = 0.0
+
+
+def acquire_backend(
+    config: dict,
+    *,
+    state: AgentState,
+    claude_config_dir: Path | None,
+    force: bool = False,
+    pin_label: str | None = None,
+    pin_backend: str | None = None,
+) -> accounts.Candidate | None:
+    """Pick and (for Claude) atomically lease the best (backend, account,
+    model) triple for this iteration.
+
+    Resolution order, all of it under the lease meta-lock for the
+    Claude path:
+
+    1. If we already hold a lease that still satisfies (the helper still
+       reports a model tier ≥ one of ``accepted_models``), keep it.
+       Avoids release/re-acquire churn between iterations.
+    2. Otherwise enumerate every Claude account (and Codex if allowed),
+       filter to accepted tiers, order by ``[agent.auto].prefer``, then
+       for each candidate try the lease — on success re-probe with
+       ``--force`` to confirm quota didn't drop between bulk probe and
+       acquisition; if it did, release and continue.
+    3. On commit, mirror the canonical ``credentials<N>.json`` into the
+       agent's isolated keychain entry (skipping the write if the
+       isolated entry is already fresher, e.g. mid-session refresh).
+
+    Returns ``None`` when every candidate is exhausted or leased by
+    other agents — the caller should treat that as ``waiting_quota``.
+
+    ``pin_backend``/``pin_label`` are set during resume to keep the
+    session on the backend (and Claude account) it originally ran on.
+    """
+    short_id = state.short_id
+    raw = pin_backend or cfg_get(config, "agent", "backend", default="claude")
+    force = force or FORCE_QUOTA_FILE.exists()
+
+    accepted_models = _claude_accepted_models(config)
+    codex_model = _reload_config_value("agent", "codex", "model", default="gpt-5.4")
+
+    claude_quota_cmd = _backend_cfg(
+        config, "quota_check", backend="claude", default="")
+    codex_quota_cmd = _backend_cfg(
+        config, "quota_check", backend="codex", default="")
+
+    if raw == "codex":
+        backends_allowed = {"codex"}
+    elif raw == "claude":
+        backends_allowed = {"claude"}
+    else:
+        backends_allowed = {"claude", "codex"}
+    prefer = cfg_get(config, "agent", "auto", "prefer", default="codex")
+    if prefer not in ("claude", "codex"):
+        prefer = "codex"
+
+    # Step 1: existing lease still good?
+    if (state.account_label
+            and not force
+            and "claude" in backends_allowed
+            and (pin_label is None or pin_label == state.account_label)):
+        fresh = accounts.probe_account(
+            claude_quota_cmd, state.account_label, force=False)
+        if fresh:
+            avail_tier = accounts.model_tier("claude", fresh)
+            for tier in accepted_models:
+                if avail_tier >= accounts.model_tier("claude", tier):
+                    acct = next(
+                        (a for a in accounts.list_claude_accounts()
+                         if a.label == state.account_label),
+                        None)
+                    if acct is not None:
+                        return accounts.Candidate(
+                            backend="claude",
+                            label=state.account_label,
+                            model=tier,
+                            account_num=acct.number,
+                        )
+                    break
+        # Stale or no longer good — release before re-picking.
+        _release_account_lease(state, claude_config_dir)
+
+    # Step 2: bulk-probe all accounts + codex once per pass.
+    claude_accts = (
+        accounts.list_claude_accounts() if "claude" in backends_allowed else [])
+    available_by_label: dict[str, str | None] = {}
+    if "claude" in backends_allowed and not force:
+        for a in claude_accts:
+            available_by_label[a.label] = accounts.probe_account(
+                claude_quota_cmd, a.label)
+    elif "claude" in backends_allowed and force:
+        available_by_label = {a.label: accepted_models[0]
+                              for a in claude_accts}
+
+    codex_avail = (
+        "codex" in backends_allowed
+        and (force or accounts.probe_codex(codex_quota_cmd)))
+
+    candidates = accounts.enumerate_candidates(
+        claude_accounts=claude_accts,
+        available_by_label=available_by_label,
+        accepted_models=accepted_models,
+        codex_available=codex_avail,
+        codex_model=codex_model,
+        prefer=prefer,
+        pin_label=pin_label,
+    )
+    if not candidates:
+        # No usable candidate. If we got here we already released any
+        # stale lease in step 1, so just signal the caller to wait.
+        return None
+
+    # Step 3: lease + revalidate under host-wide meta-lock.
+    chosen: accounts.Candidate | None = None
+    with accounts.lease_critical_section():
+        # Best-effort orphan eviction so a dead agent's lease doesn't
+        # block live ones forever. Cheap: walks .pod/agents/ and the
+        # lease dir.
+        try:
+            live = {a.short_id for a in read_all_agents()}
+            live.add(short_id)
+            accounts.evict_orphan_leases(live)
+        except Exception:
+            pass
+        held_by_others = {
+            l.label for l in accounts.list_leases()
+            if l.short_id != short_id
+        }
+        for cand in candidates:
+            if cand.backend == "codex":
+                chosen = cand
+                break
+            if cand.label in held_by_others:
+                continue
+            if not accounts.try_acquire_lease(
+                    cand.label, short_id,
+                    project_dir=str(PROJECT_DIR)):
+                continue
+            if not force:
+                fresh = accounts.probe_account(
+                    claude_quota_cmd, cand.label, force=True)
+                if (not fresh
+                        or accounts.model_tier("claude", fresh)
+                        < accounts.model_tier("claude", cand.model)):
+                    accounts.release_lease(cand.label, short_id)
+                    continue
+            if claude_config_dir is not None:
+                try:
+                    accounts.mirror_canonical_to_isolated(
+                        cand.label, cand.account_num, claude_config_dir)
+                except OSError as e:
+                    log(f"acquire_backend: mirror failed for "
+                        f"{cand.label}: {e}")
+                    accounts.release_lease(cand.label, short_id)
+                    continue
+            chosen = cand
+            break
+
+    if chosen is None:
+        return None
+    if chosen.backend == "claude":
+        state.account_label = chosen.label
+        state.lease_acquired_at = time.time()
+    else:
+        # Picked codex; release any outstanding claude lease.
+        if state.account_label:
+            _release_account_lease(state, claude_config_dir)
+    return chosen
 
 
 def coordination(config: dict, *args, env_extra: dict | None = None,
@@ -5364,31 +5487,29 @@ def _disk_low(config: dict) -> str | None:
     return None
 
 
-def _log_credential_state(session_uuid: str, claude_config_dir: Path | None = None):
+def _log_credential_state(session_uuid: str,
+                            claude_config_dir: Path | None = None,
+                            expected_label: str = ""):
     """Log which credential Claude Code will actually use at agent launch time.
 
-    Reports the resolved credential (the one Claude Code reads from the
-    suffixed keychain entry, or the credentials.json fallback) and warns
-    when the isolated config dir diverges from the default keychain entry
-    — that divergence is the canonical sign of the "wrong account" bug.
+    Pure logging — does *not* mutate the keychain. Account selection
+    happens earlier in the iteration (under the lease meta-lock), and
+    ``accounts.mirror_canonical_to_isolated`` writes the chosen
+    account's blob into the per-agent keychain entry. By the time
+    ``launch_agent`` calls us, the right credential is already there;
+    we just confirm and warn if it doesn't match ``expected_label``.
     """
     parts = [f"session={session_uuid[:8]}"]
-
-    _sync_isolated_credential(claude_config_dir)
-    resolved = resolve_claude_credential(claude_config_dir)
+    resolved = accounts.resolve_claude_credential(claude_config_dir)
     parts.append(
         f"resolved=[{resolved['accountLabel']}] "
         f"token={resolved['tokenPrefix']}... via {resolved['source']}"
     )
-
-    if claude_config_dir is not None:
-        default_resolved = resolve_claude_credential(None)
-        if default_resolved["accountLabel"] != resolved["accountLabel"]:
-            parts.append(
-                f"WARNING default keychain has [{default_resolved['accountLabel']}] "
-                f"-- isolated config diverges"
-            )
-
+    if expected_label and resolved["accountLabel"] != expected_label:
+        parts.append(
+            f"WARNING expected [{expected_label}] but isolated "
+            f"keychain has [{resolved['accountLabel']}]"
+        )
     log(f"Credential state at launch: {' | '.join(parts)}")
 
 
@@ -5561,20 +5682,32 @@ def _codex_probe_launched_suspended(cmd: str) -> bool:
 def launch_agent(config: dict, session_uuid: str, prompt: str,
                    wt_dir: str,
                    claude_config_dir: Path | None = None,
-                   backend: str | None = None) -> subprocess.Popen:
+                   backend: str | None = None,
+                   model: str | None = None,
+                   account_label: str = "") -> subprocess.Popen:
     """Launch agent subprocess (Claude or Codex) in the worktree directory.
 
-    `backend` is required when running in auto mode; for fixed-backend
-    modes it defaults to the configured value (re-read from disk to pick
-    up live config edits).
+    ``backend`` is required when running in auto mode; for fixed-backend
+    modes it defaults to the configured value.
+
+    ``model`` should be passed by callers that have already selected a
+    tier via ``acquire_backend`` (which honours ``accepted_models``).
+    Falls back to re-reading ``[agent.<backend>].model`` from disk only
+    when omitted, preserving the pre-leasing call contract.
+
+    ``account_label`` is used purely for the credential-state log line
+    — it warns when the isolated keychain entry's label doesn't match
+    the selected one.
     """
     if backend is None:
         backend = _reload_config_value("agent", "backend", default="claude")
         if backend == "auto":
             raise ValueError(
                 "launch_agent: explicit backend= required in auto mode")
-    # Re-read model from disk so config.toml edits take effect without restart.
-    model = _reload_config_value("agent", backend, "model", default="opus")
+    if model is None:
+        # Legacy path: no caller-supplied selection. Re-read default.
+        model = _reload_config_value(
+            "agent", backend, "model", default="opus")
     session_dir = PROJECT_DIR / cfg_get(config, "project", "session_dir", default="sessions")
     session_dir.mkdir(parents=True, exist_ok=True)
     stdout_path = session_dir / f"{session_uuid}.stdout"
@@ -5658,7 +5791,8 @@ def launch_agent(config: dict, session_uuid: str, prompt: str,
             env["CLAUDE_CONFIG_DIR"] = str(claude_config_dir)
 
         # Log credential state at launch for debugging account-swap issues
-        _log_credential_state(session_uuid, claude_config_dir)
+        _log_credential_state(session_uuid, claude_config_dir,
+                              expected_label=account_label)
 
         agent_args = claude_args
 
@@ -5925,6 +6059,21 @@ def _release_agent_resources(reason: str, skip_msg: str) -> None:
         except OSError:
             pass
 
+    # Release the Claude account lease + harvest any refreshed token
+    # before tearing down the rest of the agent. Done early so a
+    # blocked downstream cleanup doesn't leave the lease orphaned.
+    if state and state.account_label:
+        try:
+            claude_cfg = (
+                Path(state.claude_config_dir) if state.claude_config_dir else None)
+            _release_account_lease(state, claude_cfg)
+            try:
+                state.write()
+            except OSError:
+                pass
+        except Exception as e:
+            log(f"_release_agent_resources: lease release failed: {e}")
+
     # Kill the child agent subprocess (claude/codex), if still running.
     if _agent_proc and _agent_proc.poll() is None:
         try:
@@ -5996,6 +6145,15 @@ def _release_agent_resources(reason: str, skip_msg: str) -> None:
                 cleanup_worktree(state.worktree, state.branch)
             except Exception as e:
                 log(f"Worktree cleanup failed on {reason}: {e}")
+
+        # Cleanup per-agent CLAUDE_CONFIG_DIR (best-effort; keychain
+        # entries linger but are orphaned and harmless).
+        if state.claude_config_dir:
+            try:
+                accounts.cleanup_agent_claude_config_dir(
+                    POD_DIR, state.short_id)
+            except OSError as e:
+                log(f"claude-config cleanup failed on {reason}: {e}")
 
         try:
             state.remove_file()
@@ -6075,10 +6233,11 @@ def agent_process_main(config: dict, agent_id: str | None = None,
         quota_retry = _backend_cfg(config, "quota_retry_seconds", default=60)
     worker_types = cfg_get(config, "worker_types", default={})
 
-    claude_config_dir = ensure_isolated_config(config)
+    claude_config_dir = ensure_isolated_config(config, short_id)
     if claude_config_dir:
         log(f"Agent {short_id}: claude isolated config at {claude_config_dir}"
             + (" (auto mode — claude iterations only)" if raw_backend == "auto" else ""))
+        state.claude_config_dir = str(claude_config_dir)
     if raw_backend in ("codex", "auto"):
         log(f"Agent {short_id}: codex iterations use CODEX_HOME set per session")
     if raw_backend == "auto":
@@ -6094,29 +6253,32 @@ def agent_process_main(config: dict, agent_id: str | None = None,
         iteration += 1
         state.loop_iteration = iteration
 
-        # --- Backend selection + quota check ---
-        # Resume sessions are pinned to the backend they originally ran
-        # under: only Claude has a real `--resume`, and a Codex "resume"
-        # at minimum reuses its worktree/UUID. Auto-selecting here would
-        # silently drop the original conversation.
-        resume_pin = state.backend if state.resume_session_uuid and state.backend else None
+        # --- Backend / account selection + quota check ---
+        # Resume sessions are pinned to the backend AND Claude account
+        # they originally ran on: only Claude has a real `--resume`,
+        # and a refreshed token on the wrong account would silently
+        # fork the conversation or fail.
+        resume_pin_backend = (
+            state.backend if state.resume_session_uuid and state.backend
+            else None)
+        resume_pin_label = (
+            state.account_label
+            if state.resume_session_uuid and state.account_label
+            else None)
         state.status = "waiting_quota"
         state.write()
-        chosen_backend: str | None = None
+        selection: accounts.Candidate | None = None
         while True:
-            if resume_pin:
-                # Honour force_quota during resume too — some quota helpers
-                # may be stale right after a kill/restart.
-                if state.force_quota or _backend_available(
-                        config, resume_pin, claude_config_dir):
-                    chosen_backend = resume_pin
-                    break
-            else:
-                chosen_backend = select_available_backend(
-                    config, force=state.force_quota,
-                    claude_config_dir=claude_config_dir)
-                if chosen_backend is not None:
-                    break
+            selection = acquire_backend(
+                config,
+                state=state,
+                claude_config_dir=claude_config_dir,
+                force=state.force_quota,
+                pin_backend=resume_pin_backend,
+                pin_label=resume_pin_label,
+            )
+            if selection is not None:
+                break
             if state.finishing:
                 break
             # Re-read state file to pick up force_quota toggled by TUI
@@ -6128,22 +6290,38 @@ def agent_process_main(config: dict, agent_id: str | None = None,
                 pass
             if state.force_quota:
                 log(f"Agent {short_id}: force_quota enabled, skipping wait")
-                if resume_pin:
-                    chosen_backend = resume_pin
-                else:
-                    chosen_backend = (select_available_backend(
-                        config, force=True,
-                        claude_config_dir=claude_config_dir) or "claude")
+                selection = acquire_backend(
+                    config,
+                    state=state,
+                    claude_config_dir=claude_config_dir,
+                    force=True,
+                    pin_backend=resume_pin_backend,
+                    pin_label=resume_pin_label,
+                )
+                if selection is None:
+                    # No accounts at all — fall back to bare "claude"
+                    # for the one-shot path; it will surface a clearer
+                    # error inside launch_agent than waiting forever.
+                    selection = accounts.Candidate(
+                        backend=resume_pin_backend or "claude",
+                        label="", model="opus", account_num=0)
                 break
-            target = resume_pin or "any backend"
+            target = resume_pin_backend or "any backend"
+            if resume_pin_label:
+                target += f"/{resume_pin_label}"
             log(f"Agent {short_id}: no quota for {target}, sleeping {quota_retry}s")
             time.sleep(quota_retry)
-        if state.finishing or chosen_backend is None:
+        if state.finishing or selection is None:
             break
 
+        chosen_backend = selection.backend
+        chosen_model = selection.model
+        chosen_account_label = selection.label
+        chosen_account_num = selection.account_num
         state.backend = chosen_backend
-        state.model = _backend_cfg(config, "model", backend=chosen_backend,
-                                    default="") or ""
+        state.model = chosen_model
+        # state.account_label and state.lease_acquired_at are set inside
+        # acquire_backend on the Claude path; cleared for codex.
         state.write()
 
         # --- Housekeeping (time-based, every 10 minutes to conserve GH API calls) ---
@@ -6191,6 +6369,16 @@ def agent_process_main(config: dict, agent_id: str | None = None,
                     pass
                 try:
                     cleanup_stale_branches(config, verbose=True)
+                except Exception:
+                    pass
+                # Evict orphan account leases — covers agents that
+                # crashed without releasing their lease (the per-agent
+                # short_id is no longer in .pod/agents/).
+                try:
+                    with accounts.lease_critical_section():
+                        live = {a.short_id for a in read_all_agents()}
+                        live.add(short_id)
+                        accounts.evict_orphan_leases(live)
                 except Exception:
                     pass
                 _housekeeping_mark_done()
@@ -6384,7 +6572,10 @@ def agent_process_main(config: dict, agent_id: str | None = None,
 
         try:
             _agent_proc = launch_agent(config, session_uuid, prompt, wt_dir,
-                                        claude_config_dir, backend=chosen_backend)
+                                        claude_config_dir,
+                                        backend=chosen_backend,
+                                        model=chosen_model,
+                                        account_label=chosen_account_label)
         except (OSError, FileNotFoundError) as e:
             log(f"Agent {short_id}: failed to launch {chosen_backend}: {e}")
             stop_monitor.set()
@@ -6589,6 +6780,11 @@ def agent_process_main(config: dict, agent_id: str | None = None,
                 except Exception:
                     pass
                 state.lock_held = ""
+            # Release the Claude account lease (and harvest any refreshed
+            # token) so the next iteration is free to pick a different
+            # account — the exhausted one would just trigger this same
+            # path again until it resets.
+            _release_account_lease(state, claude_config_dir)
             _abort_one_shot_iteration(state, "quota exhaustion")
             state.write()
             if state.finishing:
@@ -6643,6 +6839,10 @@ def agent_process_main(config: dict, agent_id: str | None = None,
                 except Exception:
                     pass
                 state.lock_held = ""
+            # Rapid-failure sessions release the account lease too:
+            # we're about to back off for several minutes and another
+            # agent may want this account in the meantime.
+            _release_account_lease(state, claude_config_dir)
             state.status = "backoff"
             _abort_one_shot_iteration(state, f"rapid failure #{rapid_failures}")
             state.write()
@@ -6680,7 +6880,16 @@ def agent_process_main(config: dict, agent_id: str | None = None,
     # --- Agent loop exited ---
     log(f"Agent {short_id} exiting (finishing={state.finishing})")
     state.status = "stopped"
+    # Release any held Claude account lease + harvest refreshed token
+    # back to canonical before the orphan-eviction sweep notices we're
+    # gone. Skipping this leaves the lease blocking other agents for up
+    # to one housekeeping cycle.
+    _release_account_lease(state, claude_config_dir)
     state.write()
+    # Tear down the per-agent CLAUDE_CONFIG_DIR — keychain entries
+    # survive but are orphaned (cheap on disk; harmless).
+    if claude_config_dir is not None:
+        accounts.cleanup_agent_claude_config_dir(POD_DIR, short_id)
     # Leave state file briefly so TUI can see "stopped", then remove
     time.sleep(2)
     state.remove_file()
@@ -7142,6 +7351,11 @@ def _tui_main(stdscr, config: dict):
                 activity = agent.last_text or agent.status
             else:
                 activity = agent.status
+            # Prefix with which Claude account holds the lease (if any),
+            # so operators can see at a glance which account each agent
+            # is burning quota on.
+            if agent.account_label:
+                activity = f"[{agent.account_label}] {activity}"
             # Thinking detection: if JSONL is stale but process is alive
             if (agent.last_activity > 0 and
                     time.time() - agent.last_activity > 10 and
