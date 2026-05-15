@@ -92,7 +92,7 @@ class FetchBlockedDepsTests(unittest.TestCase):
             self.assertEqual(cli.fetch_blocked_deps(), {})
 
     def test_includes_blocked_from_any_family_label(self):
-        # The blocked field doesn't filter by agent-plan vs human-oversight,
+        # The blocked field doesn't filter by agent-plan vs directive,
         # so HO-2 (#2565 in the kim-em/hex repo) shows up here too.
         body = ("HO-2 work item.\n\n"
                 "depends-on: #2563\n"
@@ -198,12 +198,12 @@ class FetchIssuesAndPrsTests(unittest.TestCase):
                 _issue(10, title="open agent-plan",
                         labels=["agent-plan"]),
             ]},
-            "openHumanOversight": {"nodes": [
-                _issue(20, title="open ho",
-                        labels=["human-oversight"]),
+            "openDirective": {"nodes": [
+                _issue(20, title="open directive",
+                        labels=["directive"]),
             ]},
             "closedAgentPlan": {"nodes": []},
-            "closedHumanOversight": {"nodes": []},
+            "closedDirective": {"nodes": []},
             "pullRequests": {"nodes": [
                 _pr_node(30, title="pass pr", state="OPEN",
                           checks_state="SUCCESS"),
@@ -234,9 +234,9 @@ class BatchCacheTests(unittest.TestCase):
         from _gh_helpers import fake_response, patch_client
         graphql_body = {"data": {"repository": {
             "openAgentPlan": {"nodes": []},
-            "openHumanOversight": {"nodes": []},
+            "openDirective": {"nodes": []},
             "closedAgentPlan": {"nodes": []},
-            "closedHumanOversight": {"nodes": []},
+            "closedDirective": {"nodes": []},
             "blocked": {"nodes": []},
             "hasPrIssues": {"nodes": []},
             "pullRequests": {"nodes": []},

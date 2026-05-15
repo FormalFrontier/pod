@@ -11,30 +11,38 @@ items as GitHub issues, then exit. You do NOT execute any code changes.
 4. Read the project's roadmap document to understand current phase
 5. Record quality metrics as described in the project's CLAUDE.md
 
-## Step 1b: Check for human oversight directives
+## Step 1b: Check for directives
 
-Before creating any new work, check for open `human-oversight` issues:
+Before creating any new work, check for open `directive` issues:
 ```
-gh issue list --label human-oversight --state open --json number,title,labels \
+gh issue list --label directive --state open --json number,title,labels \
     --jq '.[] | select(.labels | all(.name != "has-pr")) | "#\(.number) \(.title)"'
 ```
 
-These are direct instructions from the project owner. Treat them as highest priority:
-- **Do not create issues that overlap with or supersede a `human-oversight` issue**
-- **Do not close `human-oversight` issues** — only the owner closes them
-- **Do not add `replan` to `human-oversight` issues** — they stay open until done
-- **Do not hand-apply `has-pr` to a `human-oversight` issue** to "park" it
-  while sub-issues do the work. `has-pr` is owned by `coordination create-pr`
-  alone — applied automatically when a PR with `Closes #N` is opened, removed
-  automatically when GitHub auto-closes the issue on merge. Manual
-  application desynchronises the label from any real PR; when the partial
-  PR merges (without `Closes #N`) the issue stays `has-pr` forever and is
-  silently excluded from the work queue. To park a decomposed directive
-  cleanly, run `coordination add-dep <directive> <sub-issue>` for each open
+These are direct instructions from the project owner — work flowing
+*down* from the human, not work awaiting human attention. Treat them as
+highest priority:
+- **Do not create issues that overlap with or supersede a `directive`**
+- **Close a `directive` when its deliverables are merged.** If you
+  decompose it into sub-issues, the parent stays open until every
+  sub-issue closes; close the parent yourself once the chain is done.
+  Do **not** leave a directive open with a "for owner closure" note.
+- **Do not add `replan` to a `directive`** — if it is genuinely blocked,
+  say so in a comment and leave the claim. The replan triage loop
+  intentionally skips directives.
+- **Do not hand-apply `has-pr` to a `directive`** to "park" it while
+  sub-issues do the work. `has-pr` is owned by `coordination create-pr`
+  alone — applied automatically when a PR with `Closes #N` is opened,
+  removed automatically when GitHub auto-closes the issue on merge.
+  Manual application desynchronises the label from any real PR; when
+  the partial PR merges (without `Closes #N`) the issue stays `has-pr`
+  forever and is silently excluded from the work queue. To park a
+  decomposed directive cleanly, run
+  `coordination add-dep <directive> <sub-issue>` for each open
   sub-issue: the directive becomes `blocked` and auto-unblocks when all
-  subs close. The housekeeping cycle (`check-has-pr`, `check-blocked`) will
-  remove orphan labels and post an audit comment.
-- If a `human-oversight` issue is already claimed, continue to Step 2 (workers are on it)
+  subs close. The housekeeping cycle (`check-has-pr`, `check-blocked`)
+  will remove orphan labels and post an audit comment.
+- If a `directive` is already claimed, continue to Step 2 (workers are on it)
 - If unclaimed, prioritise creating any supporting infrastructure issues first, then exit
   — the next worker will claim the directive itself
 

@@ -43,7 +43,7 @@ REQUIRED_LABELS = {
     "has-pr": "5319E7",
     "replan": "D93F0B",
     "coordination": "0E8A16",
-    "human-oversight": "CC317C",
+    "directive": "CC317C",
     "return-to-human": "E4A400",
     "critical-path": "FF6600",
     "repair-claimed": "7057FF",
@@ -427,13 +427,13 @@ def _unclaimed_issues(ctx: CoordinationContext,
             items = []
         return _unclaimed_filter(items)
 
-    # No extra label: union of agent-plan + human-oversight, dedup by number.
+    # No extra label: union of agent-plan + directive, dedup by number.
     items_a = _safe_json(_filter_trusted_issues([
         "--label", "agent-plan", "--state", "open", "--limit", "50",
         "--json", "number,title,labels,createdAt", *include,
     ]), default=[])
     items_h = _safe_json(_filter_trusted_issues([
-        "--label", "human-oversight", "--state", "open", "--limit", "50",
+        "--label", "directive", "--state", "open", "--limit", "50",
         "--json", "number,title,labels,createdAt", *include,
     ]), default=[])
     seen: dict[int, dict] = {}
@@ -446,8 +446,9 @@ def _unclaimed_issues(ctx: CoordinationContext,
 
 def _replan_issues(ctx: CoordinationContext) -> list[dict]:
     """Return `agent-plan + replan` issues filtered through the trusted-
-    author gate. `human-oversight` is intentionally excluded — those
-    issues have an owner-closes-only policy and must not be auto-replanned.
+    author gate. `directive` issues are intentionally excluded — their
+    satisfaction is judgment-laden, so the worker who completes the
+    deliverables closes them; they are not bounced through replan triage.
     """
     include = ["--include-untrusted"] if ctx.include_untrusted else []
     args = ["--label", "agent-plan", "--label", "replan",
@@ -479,9 +480,9 @@ def _safe_json(s: str, default=None):
 def cmd_orient(ctx: CoordinationContext, argv: list[str]) -> int:
     client = gh.get_client()
 
-    print("=== HUMAN OVERSIGHT DIRECTIVES (highest priority) ===")
+    print("=== DIRECTIVES (highest priority) ===")
     r = client.gh_cli(
-        "issue", "list", "--repo", ctx.repo, "--label", "human-oversight",
+        "issue", "list", "--repo", ctx.repo, "--label", "directive",
         "--state", "open", "--limit", "50",
         "--json", "number,title,labels,createdAt",
         "--jq", '.[] | select(.labels | all(.name != "has-pr")) '
@@ -1029,8 +1030,8 @@ def cmd_list_replan(ctx: CoordinationContext, argv: list[str]) -> int:
     """List `agent-plan + replan` issues ready for /replan triage.
 
     Goes through the same trusted-author gate as `list-unclaimed`.
-    Excludes `claimed`, `blocked`, `has-pr`. `human-oversight` is
-    excluded by construction (we only ask for `agent-plan`).
+    Excludes `claimed`, `blocked`, `has-pr`. `directive` is excluded
+    by construction (we only ask for `agent-plan`).
     """
     for it in _replan_issues(ctx):
         print(f"#{it.get('number')} {it.get('title','')}")

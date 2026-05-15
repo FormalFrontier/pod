@@ -20,9 +20,10 @@ Repair sessions have exactly two terminal outcomes:
    bounded number of failed attempts. This removes `has-pr` from the linked
    issue and adds `replan`, so a fresh plan can be produced.
 
-**There is no escalation to `human-oversight`.** Complex conflicts become
-re-implementations via `replan`, not human tickets. If verification keeps
-failing, abandon.
+**Repair sessions do not author `directive` issues.** The `directive`
+label flows top-down from the project owner; it is not a place agents
+escalate to. Complex conflicts become re-implementations via `replan`,
+not human tickets. If verification keeps failing, abandon.
 
 ## Coordination Commands
 
@@ -139,7 +140,7 @@ computed on demand by `list-pr-repair`; a label would drift out of sync.
 
 - Open new issues (except as part of a `replan` comment if genuinely
   helpful context).
-- Escalate to `human-oversight`.
+- Author a `directive` to escalate (directives are owner-issued only).
 - Keep trying the same fix with minor variations past the 3-cycle budget.
 - Fight healthy in-progress CI (the stuck threshold already filters for
   checks past the configured age).

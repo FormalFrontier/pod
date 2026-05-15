@@ -25,9 +25,9 @@ from _gh_helpers import fake_response, patch_client
 
 _VALID_REPO_NODE = {
     "openAgentPlan": {"nodes": []},
-    "openHumanOversight": {"nodes": []},
+    "openDirective": {"nodes": []},
     "closedAgentPlan": {"nodes": []},
-    "closedHumanOversight": {"nodes": []},
+    "closedDirective": {"nodes": []},
     "blocked": {"nodes": []},
     "hasPrIssues": {"nodes": []},
     "pullRequests": {"nodes": []},

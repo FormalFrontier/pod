@@ -69,18 +69,23 @@ coordination orient
 ```
 
 **Priority order:**
-0. **Human oversight directives first**: Check for open `human-oversight` issues before
-   anything else. These are direct instructions from the project owner and take absolute
-   precedence over all other work:
+0. **Directives first**: Check for open `directive` issues before anything else.
+   These are direct instructions from the project owner — work flowing *down* from
+   the human, not work awaiting human attention — and take absolute precedence over
+   all other work:
    ```
-   coordination list-unclaimed --label human-oversight
+   coordination list-unclaimed --label directive
    ```
    If any are open and unclaimed, claim the oldest one immediately.
-   **These issues cannot be skipped or refused because you disagree with the approach.**
-   The only valid exit from a `human-oversight` issue is completing it, or posting a
-   comment explaining a genuine technical blocker (e.g. a missing dependency), then
-   using `coordination skip` with that reason. Do not `skip` because you think a
-   different approach is better — that is the owner's call, not yours.
+   **Directives cannot be skipped or refused because you disagree with the approach.**
+   The valid exits from a `directive` are (a) completing the deliverables and
+   **closing the issue yourself**, (b) opening a partial PR and noting the
+   remaining scope so a successor can pick it up, or (c) posting a comment
+   explaining a genuine technical blocker (e.g. a missing dependency) and
+   `coordination skip` with that reason. Do **not** leave a directive open
+   with a "for owner closure" note — if the deliverables are in, close it.
+   Do not `skip` because you think a different approach is better — that is
+   the owner's call, not yours.
 1. **Oldest unclaimed issue** of your type:
    ```
    coordination list-unclaimed --label <your-label>

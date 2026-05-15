@@ -126,7 +126,7 @@ class CmdOnceTests(unittest.TestCase):
         args = types.SimpleNamespace(issue=3693, work_type=None)
         with mock.patch.object(cli.subprocess, "check_output",
                                return_value=self._gh_view(
-                                   ["human-oversight", "feature"])) as gh, \
+                                   ["directive", "feature"])) as gh, \
              mock.patch.object(cli, "spawn_agent",
                                return_value=12345) as spawn:
             cli.cmd_once(self._config(), args)
@@ -177,7 +177,7 @@ class CmdOnceTests(unittest.TestCase):
 
     def test_falls_back_to_work_when_configured(self):
         """When no label matches a worker_type but `work` is configured,
-        `pod once` defaults to `work` — `human-oversight`-only issues
+        `pod once` defaults to `work` — `directive`-only issues
         (the common case for hand-written work items) shouldn't require
         `--type work` explicitly."""
         config = {
@@ -190,7 +190,7 @@ class CmdOnceTests(unittest.TestCase):
         args = types.SimpleNamespace(issue=3698, work_type=None)
         with mock.patch.object(cli.subprocess, "check_output",
                                return_value=self._gh_view(
-                                   ["human-oversight"])), \
+                                   ["directive"])), \
              mock.patch.object(cli, "spawn_agent",
                                return_value=12345) as spawn:
             cli.cmd_once(config, args)
@@ -218,7 +218,7 @@ class CmdOnceTests(unittest.TestCase):
         args = types.SimpleNamespace(issue=3693, work_type=None)
         with mock.patch.object(cli.subprocess, "check_output",
                                return_value=self._gh_view(
-                                   ["human-oversight", "feature",
+                                   ["directive", "feature",
                                     "claimed"])), \
              mock.patch.object(cli, "spawn_agent",
                                side_effect=AssertionError(
