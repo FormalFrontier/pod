@@ -1793,7 +1793,7 @@ def acquire_backend(
                 try:
                     accounts.mirror_canonical_to_isolated(
                         cand.label, cand.account_num, claude_config_dir)
-                except OSError as e:
+                except (OSError, accounts.CredentialMirrorError) as e:
                     log(f"acquire_backend: mirror failed for "
                         f"{cand.label}: {e}")
                     accounts.release_lease(cand.label, short_id)

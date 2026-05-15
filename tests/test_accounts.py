@@ -271,6 +271,46 @@ class MirrorHarvestTests(_IsolatedHome):
         # Canonical untouched.
         self.assertIn("2026", path.read_text())
 
+    def test_mirror_clears_stale_when_keychain_write_fails(self):
+        # Stale isolated entry (older expiry) + write failure → we delete
+        # the stale entry so Claude Code falls through to the file we
+        # just wrote. mirror returns True; no exception.
+        self._write_canonical(4, "lean-fro", "2027-01-01T00:00:00Z")
+        config_dir = self.tmp / "claude-config" / "abcd1234"
+        service = accounts.claude_keychain_service(config_dir)
+        self._kc[service] = _make_creds(
+            "qim", "2026-01-01T00:00:00Z")  # wrong account, older
+        # Override write to fail; delete uses the fake_kc dict so
+        # patching it is enough to simulate "delete works".
+        self._kc_write.stop()
+        with mock.patch.object(accounts, "_keychain_write", return_value=False), \
+             mock.patch.object(accounts, "_keychain_delete",
+                                side_effect=lambda s: self._kc.pop(s, None)):
+            wrote = accounts.mirror_canonical_to_isolated(
+                "lean-fro", 4, config_dir)
+        self.assertTrue(wrote)
+        self.assertNotIn(service, self._kc)
+        # File fallback exists with the right account.
+        self.assertIn("lean-fro",
+                      (config_dir / ".credentials.json").read_text())
+
+    def test_mirror_raises_when_stale_entry_persists(self):
+        # Write fails AND delete is a no-op → stale entry persists →
+        # raise so the caller releases the lease and tries another
+        # candidate instead of launching the agent under qim's token
+        # while believing it's lean-fro.
+        self._write_canonical(4, "lean-fro", "2027-01-01T00:00:00Z")
+        config_dir = self.tmp / "claude-config" / "abcd1234"
+        service = accounts.claude_keychain_service(config_dir)
+        self._kc[service] = _make_creds("qim", "2026-01-01T00:00:00Z")
+        self._kc_write.stop()
+        with mock.patch.object(accounts, "_keychain_write", return_value=False), \
+             mock.patch.object(accounts, "_keychain_delete",
+                                side_effect=lambda s: None):
+            with self.assertRaises(accounts.CredentialMirrorError):
+                accounts.mirror_canonical_to_isolated(
+                    "lean-fro", 4, config_dir)
+
 
 # --- probe_account / probe_codex --------------------------------------------
 
