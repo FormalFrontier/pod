@@ -7354,17 +7354,18 @@ def _tui_main(stdscr, config: dict):
                 activity = agent.last_text or agent.status
             else:
                 activity = agent.status
-            # Prefix with which Claude account holds the lease (if any),
-            # so operators can see at a glance which account each agent
-            # is burning quota on.
-            if agent.account_label:
-                activity = f"[{agent.account_label}] {activity}"
             # Thinking detection: if JSONL is stale but process is alive
             if (agent.last_activity > 0 and
                     time.time() - agent.last_activity > 10 and
                     agent.status == "running"):
                 stale = int(time.time() - agent.last_activity)
                 activity = f"thinking {human_duration(stale)}"
+            # Prefix with which Claude account holds the lease (if any),
+            # so operators can see at a glance which account each agent
+            # is burning quota on. Applied last so it survives the
+            # thinking-detection overwrite above.
+            if agent.account_label:
+                activity = f"[{agent.account_label}] {activity}"
 
             # Sanitize: collapse newlines/tabs to spaces
             activity = " ".join(activity.split())
