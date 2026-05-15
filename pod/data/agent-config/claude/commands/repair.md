@@ -41,9 +41,10 @@ Repair has exactly two terminal states:
    This closes the PR, removes `has-pr` from the linked issue, and adds
    `replan` so the planner will produce a fresh approach.
 
-**Do not escalate to `human-oversight`.** The fix-or-abandon rule is
-non-negotiable: complex conflicts become re-implementations via `replan`,
-not human tickets.
+**Do not escalate by inventing a `directive`.** The `directive` label
+flows top-down from the project owner; agents do not author directives.
+The fix-or-abandon rule is non-negotiable: complex conflicts become
+re-implementations via `replan`, not human tickets.
 
 See the `pr-repair-flow` skill for retry budget, verification rules, and
 examples.

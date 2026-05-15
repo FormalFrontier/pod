@@ -121,7 +121,7 @@ exposes `enforce_interaction_limits`, `minimum_interaction_limit`, and
 forward-only. They block who can post *new* issues and comments, but
 they don't reach back through history. An issue body authored before
 the limit was enabled, or comments left on an issue *before* a
-collaborator applied the `agent-plan` / `human-oversight` label, are
+collaborator applied the `agent-plan` / `directive` label, are
 still ingested verbatim by the interaction-limit check alone. The
 per-message provenance gate below covers that residual gap.
 

@@ -70,7 +70,7 @@ class FilteredIssuesTests(unittest.TestCase):
 class ReplanIssuesTests(unittest.TestCase):
     """`_replan_issues` goes through `_filter_trusted_issues` with the
     `agent-plan + replan` label pair, applies `_REPLAN_EXCLUDE`, and
-    never asks for `human-oversight`."""
+    never asks for `directive`."""
 
     def _ctx(self, include_untrusted: bool = False):
         c = mock.MagicMock()
@@ -96,7 +96,7 @@ class ReplanIssuesTests(unittest.TestCase):
                         if a == "--label"]
         self.assertIn("agent-plan", label_values)
         self.assertIn("replan", label_values)
-        self.assertNotIn("human-oversight", label_values)
+        self.assertNotIn("directive", label_values)
         # Explicit limit (not the gh default).
         self.assertIn("--limit", args)
         self.assertEqual(args[args.index("--limit") + 1], "500")

@@ -1947,9 +1947,9 @@ query TuiRefresh($owner: String!, $name: String!) {
         labels(first: 20) { nodes { name } }
       }
     }
-    openHumanOversight: issues(first: 100, states: OPEN,
-                                 labels: ["human-oversight"],
-                                 orderBy: {field: CREATED_AT, direction: DESC}) {
+    openDirective: issues(first: 100, states: OPEN,
+                           labels: ["directive"],
+                           orderBy: {field: CREATED_AT, direction: DESC}) {
       nodes {
         number title createdAt updatedAt
         labels(first: 20) { nodes { name } }
@@ -1963,9 +1963,9 @@ query TuiRefresh($owner: String!, $name: String!) {
         labels(first: 20) { nodes { name } }
       }
     }
-    closedHumanOversight: issues(first: 30, states: CLOSED,
-                                   labels: ["human-oversight"],
-                                   orderBy: {field: UPDATED_AT, direction: DESC}) {
+    closedDirective: issues(first: 30, states: CLOSED,
+                              labels: ["directive"],
+                              orderBy: {field: UPDATED_AT, direction: DESC}) {
       nodes {
         number title createdAt updatedAt closedAt
         labels(first: 20) { nodes { name } }
@@ -2014,7 +2014,10 @@ _TUI_REFRESH_LOCK = threading.Lock()
 # to `fetch_issue_states`); added `orderBy: CREATED_AT DESC` to
 # `openAgentPlan`/`openHumanOversight` and `orderBy: UPDATED_AT DESC` to
 # `blocked`/`hasPrIssues`; bumped `openAgentPlan` cap to 200.
-_TUI_CACHE_SCHEMA = 2
+# Schema 3 (2026-05-15): renamed GraphQL aliases `openHumanOversight` /
+# `closedHumanOversight` to `openDirective` / `closedDirective` to match
+# the renamed `directive` label (was `human-oversight`).
+_TUI_CACHE_SCHEMA = 3
 # One-shot flag: try the disk fallback exactly once per process, on the
 # first refresh tick after start-up. After that we either have live data
 # or we're already serving the in-memory copy.
@@ -2080,8 +2083,8 @@ def _load_tui_cache(slug: str) -> tuple[float, dict] | None:
         return None
     # Reject snapshots whose top-level keys don't match the current query
     # shape (defence in depth on top of the schema-version check).
-    required = ("openAgentPlan", "openHumanOversight",
-                "closedAgentPlan", "closedHumanOversight",
+    required = ("openAgentPlan", "openDirective",
+                "closedAgentPlan", "closedDirective",
                 "blocked", "hasPrIssues", "pullRequests")
     if not all(k in body for k in required):
         return None
@@ -2164,15 +2167,15 @@ def _gql_rollup_to_ci(commits_node: dict) -> str:
 
 
 def fetch_issues_and_prs() -> list[GHItem]:
-    """Fetch issues (agent-plan or human-oversight label, all states)
-    and recent PRs from GitHub. Powered by the batched TUI GraphQL
-    query so it costs one round-trip (or a 304) per refresh tick."""
+    """Fetch issues (agent-plan or directive label, all states) and
+    recent PRs from GitHub. Powered by the batched TUI GraphQL query
+    so it costs one round-trip (or a 304) per refresh tick."""
     repo_node = _tui_refresh_batch()
     if repo_node is None:
         return []
     items: list[GHItem] = []
     seen_open: set[int] = set()
-    for key in ("openAgentPlan", "openHumanOversight"):
+    for key in ("openAgentPlan", "openDirective"):
         nodes = ((repo_node.get(key) or {}).get("nodes")) or []
         for iss in nodes:
             num = iss.get("number")
@@ -2187,7 +2190,7 @@ def fetch_issues_and_prs() -> list[GHItem]:
                 labels=labels, ci_status="", state="open", timestamp=ts,
             ))
     seen_closed: set[int] = set()
-    for key in ("closedAgentPlan", "closedHumanOversight"):
+    for key in ("closedAgentPlan", "closedDirective"):
         nodes = ((repo_node.get(key) or {}).get("nodes")) or []
         for iss in nodes:
             num = iss.get("number")

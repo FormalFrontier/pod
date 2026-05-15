@@ -171,10 +171,10 @@ class TuiRefreshQueryShapeTests(unittest.TestCase):
             r"\s*direction:\s*DESC\}",
         )
 
-    def test_open_human_oversight_orders_newest_first(self):
+    def test_open_directive_orders_newest_first(self):
         self.assertRegex(
             cli._TUI_REFRESH_QUERY,
-            r"openHumanOversight: issues\([^)]*orderBy:\s*\{field:\s*CREATED_AT,"
+            r"openDirective: issues\([^)]*orderBy:\s*\{field:\s*CREATED_AT,"
             r"\s*direction:\s*DESC\}",
         )
 
@@ -206,8 +206,8 @@ class TuiRefreshQueryShapeTests(unittest.TestCase):
     def test_open_issue_numbers_removed(self):
         self.assertNotIn("openIssueNumbers", cli._TUI_REFRESH_QUERY)
 
-    def test_cache_schema_is_2(self):
-        self.assertEqual(cli._TUI_CACHE_SCHEMA, 2)
+    def test_cache_schema_is_3(self):
+        self.assertEqual(cli._TUI_CACHE_SCHEMA, 3)
 
 
 if __name__ == "__main__":

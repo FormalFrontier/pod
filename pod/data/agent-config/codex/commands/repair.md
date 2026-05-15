@@ -28,7 +28,8 @@ each), exit — a fresh dispatch will handle the work later.
 ## Retry Budget
 
 You get at most 3 fix → verify cycles. Do not keep trying variations past
-that limit. Do not escalate to `human-oversight`. If verification keeps
+that limit. Do not author a `directive` to escalate (directives are
+owner-issued only). If verification keeps
 failing, abandon: `coordination close-pr-unsalvageable <pr-number> "<reason>"`.
 That closes the PR and marks the linked issue `replan`, so the planner will
 produce a fresh approach.
