@@ -229,6 +229,26 @@ def _keychain_write(service: str, blob: str) -> bool:
         return False
 
 
+def _keychain_delete(service: str) -> None:
+    """Best-effort delete of a keychain entry. Doesn't raise.
+
+    Caller must verify deletion via ``_keychain_read`` if it matters —
+    ``security delete-generic-password`` returns non-zero both when the
+    entry is missing (already gone) and when deletion was refused, and
+    we don't try to disambiguate.
+    """
+    if sys.platform != "darwin":
+        return
+    try:
+        subprocess.run(
+            ["security", "delete-generic-password",
+             "-s", service, "-a", os.getenv("USER", "")],
+            capture_output=True, timeout=5,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        pass
+
+
 def resolve_claude_credential(claude_config_dir: Path | None) -> dict:
     """Resolve the credential Claude Code will actually use at launch time.
 
@@ -316,6 +336,18 @@ class Lease:
 
 class LeaseError(Exception):
     pass
+
+
+class CredentialMirrorError(Exception):
+    """Raised when ``mirror_canonical_to_isolated`` cannot guarantee the
+    isolated keychain entry has been updated or removed.
+
+    Claude Code reads the per-config-dir keychain entry before falling
+    back to ``.credentials.json``. If we can't overwrite a stale entry
+    *and* can't delete it, the agent would silently launch under the
+    wrong account. The caller (``acquire_backend``) treats this as a
+    hard failure: release the lease, try the next candidate.
+    """
 
 
 def _read_lease(path: Path) -> Lease | None:
@@ -468,6 +500,11 @@ def mirror_canonical_to_isolated(label: str, account_num: int,
     to call concurrently with ``harvest_isolated_to_canonical`` for
     other agents on the same account because the lock is exclusive
     per-account.
+
+    Raises ``CredentialMirrorError`` if the keychain write fails *and*
+    a stale entry persists that we can't delete: Claude Code reads the
+    keychain before the file fallback, so a stale entry would silently
+    launch the agent under the wrong account.
     """
     with credential_lock(label):
         canonical = _read_credential_blob(_credentials_path(account_num))
@@ -493,6 +530,18 @@ def mirror_canonical_to_isolated(label: str, account_num: int,
         tmp.rename(cred_file)
         if wrote_kc:
             _log(f"accounts: mirrored canonical {label} → keychain {service}")
+            return True
+        # Keychain write failed. The file fallback we just wrote is only
+        # consulted if the keychain entry is absent; force-clear any
+        # stale entry and verify it's gone before reporting success.
+        _keychain_delete(service)
+        if _keychain_read(service) is not None:
+            raise CredentialMirrorError(
+                f"keychain write to {service} failed for account {label} "
+                f"and stale entry persists; Claude Code would load a "
+                f"different credential than {cred_file}")
+        _log(f"accounts: keychain write to {service} failed; cleared "
+             f"stale entry — Claude Code will use {cred_file.name} fallback")
         return True
 
 
