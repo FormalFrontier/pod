@@ -449,6 +449,9 @@ def _replan_issues(ctx: CoordinationContext) -> list[dict]:
     author gate. `directive` issues are intentionally excluded — their
     satisfaction is judgment-laden, so the worker who completes the
     deliverables closes them; they are not bounced through replan triage.
+    They are also never given the `replan` label in the first place (see
+    `_mark_replan_unless_directive`), so the `agent-plan` requirement here
+    is belt-and-braces rather than the sole guard.
     """
     include = ["--include-untrusted"] if ctx.include_untrusted else []
     args = ["--label", "agent-plan", "--label", "replan",
@@ -471,6 +474,49 @@ def _safe_json(s: str, default=None):
         return _json.loads(s)
     except ValueError:
         return default
+
+
+def _issue_has_label(client, repo: str, issue_num, label: str) -> bool:
+    """True if issue #issue_num currently carries `label`.
+
+    A lookup failure is treated as "label absent" (False)."""
+    r = client.gh_cli(
+        "issue", "view", str(issue_num), "--repo", repo,
+        "--json", "labels", "--jq", "[.labels[].name] | join(\",\")",
+        timeout=15,
+    )
+    if r.returncode != 0:
+        return False
+    return re.search(rf"\b{re.escape(label)}\b", r.stdout or "") is not None
+
+
+def _mark_replan_unless_directive(client, repo: str, issue_num, *,
+                                   remove_labels: list[str],
+                                   replan_comment: str | None,
+                                   directive_comment: str | None) -> bool:
+    """Add the `replan` label to issue #issue_num and strip `remove_labels`.
+
+    Exception: a `directive` issue is never given the `replan` label.
+    `replan` would strand it — `list-replan` only returns issues that also
+    carry `agent-plan`, and `list-unclaimed` excludes anything labelled
+    `replan`, so a `directive`+`replan` issue is invisible to every
+    dispatch path. For a directive we only strip `remove_labels`, leaving
+    it claimable by a fresh worker.
+
+    Returns True iff the issue was a directive (no `replan` applied)."""
+    issue_num = str(issue_num)
+    is_directive = _issue_has_label(client, repo, issue_num, "directive")
+    if not is_directive:
+        client.gh_cli("issue", "edit", issue_num, "--repo", repo,
+                       "--add-label", "replan", timeout=15)
+    for lbl in remove_labels:
+        client.gh_cli("issue", "edit", issue_num, "--repo", repo,
+                       "--remove-label", lbl, timeout=15)
+    comment = directive_comment if is_directive else replan_comment
+    if comment:
+        client.gh_cli("issue", "comment", issue_num, "--repo", repo,
+                       "--body", comment, timeout=30)
+    return is_directive
 
 
 # ---------------------------------------------------------------------------
@@ -779,11 +825,21 @@ def cmd_create_pr(ctx: CoordinationContext, argv: list[str]) -> int:
             print("warning: auto-merge not available "
                   "(branch protection may not be set up)")
         if partial:
-            client.gh_cli("issue", "edit", issue_num, "--repo", ctx.repo,
-                           "--add-label", "replan", timeout=15)
-            client.gh_cli("issue", "edit", issue_num, "--repo", ctx.repo,
-                           "--remove-label", "claimed", timeout=15)
-            print(f"Issue #{issue_num} marked replan (partial completion)")
+            is_directive = _mark_replan_unless_directive(
+                client, ctx.repo, issue_num,
+                remove_labels=["claimed"],
+                replan_comment=None,
+                directive_comment=(
+                    f"PR #{existing_pr} created with partial completion. "
+                    "Directive left claimable for a fresh worker to "
+                    "continue (directives are not bounced through replan "
+                    "triage)."),
+            )
+            if is_directive:
+                print(f"Issue #{issue_num} left claimable "
+                      "(directive, partial completion — no replan label)")
+            else:
+                print(f"Issue #{issue_num} marked replan (partial completion)")
         else:
             client.gh_cli("issue", "edit", issue_num, "--repo", ctx.repo,
                            "--add-label", "has-pr", timeout=15)
@@ -825,11 +881,20 @@ def cmd_create_pr(ctx: CoordinationContext, argv: list[str]) -> int:
                   "(branch protection may not be set up)")
 
     if partial:
-        client.gh_cli("issue", "edit", issue_num, "--repo", ctx.repo,
-                       "--add-label", "replan", timeout=15)
-        client.gh_cli("issue", "edit", issue_num, "--repo", ctx.repo,
-                       "--remove-label", "claimed", timeout=15)
-        print(f"Issue #{issue_num} marked replan (partial completion)")
+        is_directive = _mark_replan_unless_directive(
+            client, ctx.repo, issue_num,
+            remove_labels=["claimed"],
+            replan_comment=None,
+            directive_comment=(
+                f"PR #{pr_num} created with partial completion. "
+                "Directive left claimable for a fresh worker to continue "
+                "(directives are not bounced through replan triage)."),
+        )
+        if is_directive:
+            print(f"Issue #{issue_num} left claimable "
+                  "(directive, partial completion — no replan label)")
+        else:
+            print(f"Issue #{issue_num} marked replan (partial completion)")
     else:
         client.gh_cli("issue", "edit", issue_num, "--repo", ctx.repo,
                        "--add-label", "has-pr", timeout=15)
@@ -1224,19 +1289,19 @@ def cmd_close_pr_unsalvageable(ctx: CoordinationContext,
     if linked:
         updated = []
         for inum in linked:
-            client.gh_cli("issue", "edit", str(inum), "--repo", ctx.repo,
-                           "--add-label", "replan", timeout=15)
-            client.gh_cli("issue", "edit", str(inum), "--repo", ctx.repo,
-                           "--remove-label", "has-pr", timeout=15)
-            client.gh_cli(
-                "issue", "comment", str(inum), "--repo", ctx.repo,
-                "--body",
-                f"PR #{pr_num} closed as unsalvageable: {reason}. "
-                "Marked replan so a new plan can be produced.",
-                timeout=30,
+            _mark_replan_unless_directive(
+                client, ctx.repo, inum,
+                remove_labels=["has-pr"],
+                replan_comment=(
+                    f"PR #{pr_num} closed as unsalvageable: {reason}. "
+                    "Marked replan so a new plan can be produced."),
+                directive_comment=(
+                    f"PR #{pr_num} closed as unsalvageable: {reason}. "
+                    "Directive left claimable for a fresh worker "
+                    "(directives are not bounced through replan triage)."),
             )
             updated.append(f"#{inum}")
-        print(f"PR #{pr_num} closed; linked issue(s) marked replan: "
+        print(f"PR #{pr_num} closed; linked issue(s) re-triaged: "
               + " ".join(updated))
     else:
         br = client.gh_cli(
@@ -1249,19 +1314,20 @@ def cmd_close_pr_unsalvageable(ctx: CoordinationContext,
             body, re.IGNORECASE)))
         if fallback:
             for inum in fallback:
-                client.gh_cli("issue", "edit", str(inum), "--repo", ctx.repo,
-                               "--add-label", "replan", timeout=15)
-                client.gh_cli("issue", "edit", str(inum), "--repo", ctx.repo,
-                               "--remove-label", "has-pr", timeout=15)
-                client.gh_cli(
-                    "issue", "comment", str(inum), "--repo", ctx.repo,
-                    "--body",
-                    f"PR #{pr_num} closed as unsalvageable: {reason}. "
-                    "Marked replan so a new plan can be produced.",
-                    timeout=30,
+                _mark_replan_unless_directive(
+                    client, ctx.repo, inum,
+                    remove_labels=["has-pr"],
+                    replan_comment=(
+                        f"PR #{pr_num} closed as unsalvageable: {reason}. "
+                        "Marked replan so a new plan can be produced."),
+                    directive_comment=(
+                        f"PR #{pr_num} closed as unsalvageable: {reason}. "
+                        "Directive left claimable for a fresh worker "
+                        "(directives are not bounced through replan "
+                        "triage)."),
                 )
-            print(f"PR #{pr_num} closed; fallback-resolved issue(s) marked "
-                  f"replan: {' '.join(str(n) for n in fallback)}")
+            print(f"PR #{pr_num} closed; fallback-resolved issue(s) "
+                  f"re-triaged: {' '.join(str(n) for n in fallback)}")
         else:
             print(f"PR #{pr_num} closed; no linked issue found "
                   "(closingIssuesReferences empty, body grep empty).")
@@ -1478,17 +1544,21 @@ def cmd_skip(ctx: CoordinationContext, argv: list[str]) -> int:
         die('usage: coordination skip N "reason"')
     issue_num, reason = argv[0], argv[1]
     client = gh.get_client()
-    client.gh_cli(
-        "issue", "edit", issue_num, "--repo", ctx.repo,
-        "--remove-label", "claimed", "--add-label", "replan", timeout=15,
+    is_directive = _mark_replan_unless_directive(
+        client, ctx.repo, issue_num,
+        remove_labels=["claimed"],
+        replan_comment=(
+            f"Skipped by session `{ctx.session_id}` (needs replan): {reason}"),
+        directive_comment=(
+            f"Skipped by session `{ctx.session_id}`: {reason}. "
+            "Directive left claimable for a fresh worker (directives are "
+            "not bounced through replan triage)."),
     )
-    client.gh_cli(
-        "issue", "comment", issue_num, "--repo", ctx.repo,
-        "--body",
-        f"Skipped by session `{ctx.session_id}` (needs replan): {reason}",
-        timeout=30,
-    )
-    print(f"Skipped issue #{issue_num} (marked replan): {reason}")
+    if is_directive:
+        print(f"Skipped issue #{issue_num} "
+              f"(directive, left claimable): {reason}")
+    else:
+        print(f"Skipped issue #{issue_num} (marked replan): {reason}")
     return 0
 
 

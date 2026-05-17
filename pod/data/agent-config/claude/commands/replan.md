@@ -26,11 +26,14 @@ coordination list-replan
 
 Output is one issue per line: `#<number> <title>`. The list goes
 through the same trusted-author gate as `list-unclaimed`. Issues with
-`claimed`, `blocked`, or `has-pr` are filtered out, as are `directive`
-issues — their satisfaction is judgment-laden, so they are closed by
-the worker who completes the deliverables (not by replan triage). If
-a directive's worker chain has stalled, the next planner reading the
-issue retriages manually.
+`claimed`, `blocked`, or `has-pr` are filtered out. `directive` issues
+never appear here: the skip / partial-PR / unsalvageable-close paths
+deliberately do not apply the `replan` label to a directive (that
+label would strand it — invisible to both this list and
+`list-unclaimed`). A stalled directive instead stays claimable via
+`list-unclaimed` so a fresh worker picks it up again; its satisfaction
+is judgment-laden and is decided by the worker who completes the
+deliverables, not by replan triage.
 
 If the list is empty, exit cleanly — pod will release the planner lock.
 
