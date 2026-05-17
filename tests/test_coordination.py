@@ -388,6 +388,71 @@ class SkipTests(unittest.TestCase):
         self.assertIn(("issue", "edit"), verbs)
         self.assertIn(("issue", "comment"), verbs)
 
+    def test_skip_directive_does_not_mark_replan(self):
+        """A `directive` issue must never receive the `replan` label —
+        that would strand it (invisible to both list-replan and
+        list-unclaimed). Skip only strips `claimed`, leaving it
+        claimable."""
+        calls: list[tuple] = []
+
+        def handler(*argv):
+            calls.append(argv)
+            if argv[:2] == ("issue", "view"):
+                return _gh_result(stdout="directive,claimed")
+            return _gh_result()
+
+        with _capture_stdout() as buf, patch_client(gh_cli_handler=handler):
+            rc = coordination.cmd_skip(_make_ctx(), ["42", "needs human"])
+        self.assertEqual(rc, 0)
+        self.assertIn("directive, left claimable", buf.getvalue())
+        add_label_calls = [a for a in calls
+                           if a[:2] == ("issue", "edit")
+                           and "--add-label" in a]
+        self.assertEqual(add_label_calls, [])
+        self.assertTrue(any(a[:2] == ("issue", "edit")
+                            and "--remove-label" in a and "claimed" in a
+                            for a in calls))
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: close-pr-unsalvageable
+# ---------------------------------------------------------------------------
+
+class ClosePrUnsalvageableTests(unittest.TestCase):
+    def _run(self, issue_labels: str):
+        calls: list[tuple] = []
+
+        def handler(*argv):
+            calls.append(argv)
+            if argv[:2] == ("pr", "view"):
+                return _gh_result(stdout="77\n")
+            if argv[:2] == ("issue", "view"):
+                return _gh_result(stdout=issue_labels)
+            return _gh_result()
+
+        with _capture_stdout() as buf, patch_client(gh_cli_handler=handler):
+            rc = coordination.cmd_close_pr_unsalvageable(
+                _make_ctx(), ["55", "broken approach"])
+        return rc, calls
+
+    def test_directive_linked_issue_not_marked_replan(self):
+        rc, calls = self._run("directive,has-pr")
+        self.assertEqual(rc, 0)
+        add_label_calls = [a for a in calls
+                           if a[:2] == ("issue", "edit")
+                           and "--add-label" in a]
+        self.assertEqual(add_label_calls, [])
+        self.assertTrue(any(a[:2] == ("issue", "edit")
+                            and "--remove-label" in a and "has-pr" in a
+                            for a in calls))
+
+    def test_non_directive_linked_issue_marked_replan(self):
+        rc, calls = self._run("agent-plan,has-pr")
+        self.assertEqual(rc, 0)
+        self.assertTrue(any(a[:2] == ("issue", "edit")
+                            and "--add-label" in a and "replan" in a
+                            for a in calls))
+
 
 # ---------------------------------------------------------------------------
 # Subcommand: queue-depth
