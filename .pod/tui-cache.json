@@ -1,0 +1,1 @@
+{"schema": 3, "repo": "o/r", "fetched_at": 1780137759.2808828, "body": {"openAgentPlan": {"nodes": []}, "openDirective": {"nodes": []}, "closedAgentPlan": {"nodes": []}, "closedDirective": {"nodes": []}, "blocked": {"nodes": []}, "hasPrIssues": {"nodes": []}, "pullRequests": {"nodes": []}}}

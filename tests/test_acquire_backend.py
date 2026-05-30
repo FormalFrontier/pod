@@ -468,5 +468,43 @@ class ReleaseTests(_Harness):
         self.assertEqual(state.account_label, "")
 
 
+# --- Auth preflight: don't hand out a logged-out / expired account --------
+
+
+class AuthPreflightTests(_Harness):
+    def test_expired_credential_account_is_skipped(self):
+        # Quota reads fine, but the OAuth token expired in the past:
+        # the account is effectively logged out and every session on it
+        # would fail auth at startup. acquire_backend must not lease it.
+        cfg = _config("claude", accepted_models=["opus"])
+        self._set_cfg(cfg)
+        self._write_credentials(4, "lean-fro", expires="2000-01-01T00:00:00Z")
+        state = self._make_state()
+        config_dir = accounts.agent_claude_config_dir(cli.POD_DIR, state.short_id)
+        accounts.ensure_agent_claude_config_dir(cli.POD_DIR, state.short_id)
+        with mock.patch.object(accounts, "probe_account", return_value="opus"):
+            sel = cli.acquire_backend(
+                cfg, state=state, claude_config_dir=config_dir)
+        self.assertIsNone(sel)
+        self.assertEqual(accounts.list_leases(), [])
+        self.assertEqual(state.account_label, "")
+
+    def test_healthy_account_chosen_over_expired_one(self):
+        # An expired account is skipped and the next, valid account wins.
+        cfg = _config("claude", accepted_models=["opus"])
+        self._set_cfg(cfg)
+        self._write_credentials(4, "expired-acct", expires="2000-01-01T00:00:00Z")
+        self._write_credentials(5, "good-acct", expires="2030-01-01T00:00:00Z")
+        state = self._make_state()
+        config_dir = accounts.agent_claude_config_dir(cli.POD_DIR, state.short_id)
+        accounts.ensure_agent_claude_config_dir(cli.POD_DIR, state.short_id)
+        with mock.patch.object(accounts, "probe_account", return_value="opus"):
+            sel = cli.acquire_backend(
+                cfg, state=state, claude_config_dir=config_dir)
+        self.assertIsNotNone(sel)
+        self.assertEqual(sel.label, "good-acct")
+        self.assertEqual([l.label for l in accounts.list_leases()], ["good-acct"])
+
+
 if __name__ == "__main__":
     unittest.main()

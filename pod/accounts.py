@@ -488,6 +488,24 @@ def _expires_at(blob: str | None) -> float:
     return 0.0
 
 
+def account_credential_expiry(account_num: int) -> float | None:
+    """Expiry of the canonical ``credentials<N>.json`` OAuth token as a
+    unix timestamp.
+
+    Returns ``None`` when the credential file is absent (the account is
+    not logged in), ``0.0`` when the file exists but carries no parseable
+    ``expiresAt``, and the expiry timestamp otherwise. An auth preflight
+    treats ``None`` and a past timestamp as "do not dispatch"; an unknown
+    (``0.0``) expiry is left to proceed so a healthy account whose blob
+    happens to omit the field is not falsely quarantined.
+    """
+    try:
+        blob = _credentials_path(account_num).read_text()
+    except OSError:
+        return None
+    return _expires_at(blob)
+
+
 def mirror_canonical_to_isolated(label: str, account_num: int,
                                    claude_config_dir: Path) -> bool:
     """Mirror ``~/.claude/credentials<N>.json`` into the agent's keychain
