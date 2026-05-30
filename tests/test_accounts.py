@@ -311,6 +311,46 @@ class MirrorHarvestTests(_IsolatedHome):
                 accounts.mirror_canonical_to_isolated(
                     "lean-fro", 4, config_dir)
 
+    # --- preflight_and_mirror: validate + mirror as one locked op ----------
+
+    def test_preflight_ok_mirrors_valid_account(self):
+        self._write_canonical(4, "lean-fro", "2030-12-31T00:00:00Z")
+        config_dir = self.tmp / "claude-config" / "abcd1234"
+        status = accounts.preflight_and_mirror(
+            "lean-fro", 4, config_dir, now=0.0, skew=60)
+        self.assertEqual(status, "ok")
+        self.assertTrue((config_dir / ".credentials.json").exists())
+
+    def test_preflight_missing_credential_is_not_mirrored(self):
+        # No credentials4.json on disk → account logged out.
+        config_dir = self.tmp / "claude-config" / "abcd1234"
+        status = accounts.preflight_and_mirror(
+            "lean-fro", 4, config_dir, now=0.0, skew=60)
+        self.assertEqual(status, "missing")
+        self.assertFalse((config_dir / ".credentials.json").exists())
+
+    def test_preflight_expired_token_is_not_mirrored(self):
+        self._write_canonical(4, "lean-fro", "2000-01-01T00:00:00Z")
+        config_dir = self.tmp / "claude-config" / "abcd1234"
+        status = accounts.preflight_and_mirror(
+            "lean-fro", 4, config_dir, now=2.0e9, skew=60)  # now ≫ 2000 expiry
+        self.assertEqual(status, "expired")
+        self.assertFalse((config_dir / ".credentials.json").exists())
+
+    def test_preflight_unknown_expiry_proceeds(self):
+        # Credential present but no parseable expiresAt → not falsely
+        # quarantined; treated as ok and mirrored.
+        (self.tmp / "credentials4.json").write_text(json.dumps({
+            "accountLabel": "lean-fro",
+            "claudeAiOauth": {
+                "accessToken": "sk-ant-test-AAAAAAAAAAAAAAAAAAAA"},
+        }))
+        config_dir = self.tmp / "claude-config" / "abcd1234"
+        status = accounts.preflight_and_mirror(
+            "lean-fro", 4, config_dir, now=2.0e9, skew=60)
+        self.assertEqual(status, "ok")
+        self.assertTrue((config_dir / ".credentials.json").exists())
+
 
 # --- probe_account / probe_codex --------------------------------------------
 

@@ -107,6 +107,7 @@ TARGET_FILE = POD_DIR / "target"  # Target agent count (int, one per line)
 PLANNER_TARGET_FILE = POD_DIR / "planner-target"  # Planner-recommended target agent count
 PLANNER_MIN_QUEUE_FILE = POD_DIR / "planner-min-queue"  # Planner-recommended min_queue
 FORCE_QUOTA_FILE = POD_DIR / "force-quota"  # If exists, skip quota checks globally
+_AUTH_EXPIRY_SKEW = 60  # Seconds: treat a token expiring within this window as already expired for dispatch
 
 # ---------------------------------------------------------------------------
 # Default configuration (written on first run)
@@ -1789,15 +1790,28 @@ def acquire_backend(
                         < accounts.model_tier("claude", cand.model)):
                     accounts.release_lease(cand.label, short_id)
                     continue
-            if claude_config_dir is not None:
-                try:
-                    accounts.mirror_canonical_to_isolated(
-                        cand.label, cand.account_num, claude_config_dir)
-                except (OSError, accounts.CredentialMirrorError) as e:
-                    log(f"acquire_backend: mirror failed for "
-                        f"{cand.label}: {e}")
-                    accounts.release_lease(cand.label, short_id)
-                    continue
+            # Auth preflight + mirror, as one credential-locked op. Quota
+            # can read fine on an account that is logged out — its OAuth
+            # token expired or was cleared — and every session launched on
+            # such an account fails auth at startup (~20s, 0 tokens, exit
+            # 1); without this guard the agent would re-lease and
+            # re-dispatch it indefinitely. Validating and mirroring under
+            # the same per-account credential lock also closes the TOCTOU
+            # window between checking the token and copying it.
+            try:
+                status = accounts.preflight_and_mirror(
+                    cand.label, cand.account_num, claude_config_dir,
+                    now=time.time(), skew=_AUTH_EXPIRY_SKEW)
+            except (OSError, accounts.CredentialMirrorError) as e:
+                log(f"acquire_backend: mirror failed for {cand.label}: {e}")
+                accounts.release_lease(cand.label, short_id)
+                continue
+            if status != "ok":
+                reason = ("no credential (logged out)" if status == "missing"
+                          else "token expired")
+                log(f"acquire_backend: skipping {cand.label} — {reason}")
+                accounts.release_lease(cand.label, short_id)
+                continue
             chosen = cand
             break
 
@@ -6826,8 +6840,14 @@ def agent_process_main(config: dict, agent_id: str | None = None,
                 # reconcile_untracked_github_claims can clean it up later.
                 log(f"Agent {short_id}: keeping claim #{state.claimed_issue} in history (skip failed, will retry via housekeeping)")
 
-        # --- Circuit breaker: sessions that exit too quickly are broken ---
-        if elapsed < 15 and state.tokens_in == 0 and state.tokens_out == 0:
+        # --- Circuit breaker: sessions that never reached the model ---
+        # A zero-token session that either exited fast (<15s) or exited
+        # non-zero is a startup failure (auth/login, missing config,
+        # crash), not real work. The non-zero arm matters because an auth
+        # failure on a logged-out account takes ~20s to fail — longer than
+        # a bare `elapsed < 15` bound — so without it the agent would
+        # re-dispatch onto the broken account indefinitely.
+        if _session_is_broken(exit_code, state.tokens_in, state.tokens_out, elapsed):
             rapid_failures = getattr(state, '_rapid_failures', 0) + 1
             state._rapid_failures = rapid_failures
             backoff = min(60 * rapid_failures, 300)
@@ -6896,6 +6916,22 @@ def agent_process_main(config: dict, agent_id: str | None = None,
     # Leave state file briefly so TUI can see "stopped", then remove
     time.sleep(2)
     state.remove_file()
+
+
+def _session_is_broken(exit_code: int, tokens_in: int, tokens_out: int,
+                       elapsed: float) -> bool:
+    """True when a session never reached the model and should trip the
+    circuit breaker.
+
+    A session that produced zero tokens and either exited fast (<15s) or
+    exited non-zero is a startup failure — auth/login, missing config, or
+    a crash. The non-zero-exit arm is what catches a logged-out / expired
+    account, whose auth failure takes ~20s and so slips past a bare
+    ``elapsed < 15`` bound.
+    """
+    if tokens_in or tokens_out:
+        return False
+    return exit_code != 0 or elapsed < 15
 
 
 def _git_rev(wt_dir: str) -> str:
