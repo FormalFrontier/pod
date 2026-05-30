@@ -6736,23 +6736,12 @@ def agent_process_main(config: dict, agent_id: str | None = None,
         # Must run BEFORE claim cleanup: coordination skip marks issues as
         # "replan", but quota exhaustion is temporary — the issue is fine,
         # only the quota is depleted.  Release the claim without replan.
-        _is_quota_exhausted = False
-        if exit_code != 0:
-            try:
-                _stdout_path = (PROJECT_DIR
-                    / cfg_get(config, "project", "session_dir", default="sessions")
-                    / f"{session_uuid}.stdout")
-                with open(_stdout_path, "rb") as f:
-                    f.seek(0, 2)  # end
-                    tail_start = max(0, f.tell() - 4096)
-                    f.seek(tail_start)
-                    tail = f.read().decode(errors="replace").lower()
-                if ("hit your limit" in tail
-                        or "rate limit" in tail
-                        or "quota exceeded" in tail):
-                    _is_quota_exhausted = True
-            except OSError:
-                pass
+        # Read the session stdout tail once and reuse it to classify the
+        # failure: quota exhaustion here, auth failure in the circuit
+        # breaker below.
+        stdout_tail = (_read_session_stdout_tail(session_uuid, config)
+                       if exit_code != 0 else "")
+        _is_quota_exhausted = any(m in stdout_tail for m in _QUOTA_MARKERS)
 
         if _is_quota_exhausted:
             log(f"Agent {short_id}: session stdout indicates quota exhaustion, "
@@ -6851,8 +6840,16 @@ def agent_process_main(config: dict, agent_id: str | None = None,
             rapid_failures = getattr(state, '_rapid_failures', 0) + 1
             state._rapid_failures = rapid_failures
             backoff = min(60 * rapid_failures, 300)
-            log(f"Agent {short_id}: session exited in {elapsed:.0f}s with 0 tokens "
-                f"(rapid failure #{rapid_failures}), backing off {backoff}s")
+            if exit_code != 0 and _looks_like_auth_failure(stdout_tail):
+                log(f"Agent {short_id}: authentication failed on account "
+                    f"'{state.account_label or '<none>'}' (exit {exit_code}, "
+                    f"0 tokens) — the account is likely logged out; re-login "
+                    f"or check `pod accounts`. Backing off {backoff}s "
+                    f"(failure #{rapid_failures})")
+            else:
+                log(f"Agent {short_id}: session exited in {elapsed:.0f}s with "
+                    f"0 tokens (rapid failure #{rapid_failures}), backing off "
+                    f"{backoff}s")
             cleanup_worktree(wt_dir, branch)
             state.worktree = ""
             state.branch = ""
@@ -6932,6 +6929,53 @@ def _session_is_broken(exit_code: int, tokens_in: int, tokens_out: int,
     if tokens_in or tokens_out:
         return False
     return exit_code != 0 or elapsed < 15
+
+
+# Substrings in a failed session's stdout tail that mean "quota depleted"
+# (temporary; the account is fine) rather than a broken account.
+_QUOTA_MARKERS = ("hit your limit", "rate limit", "quota exceeded")
+
+# Substrings that mean the failure was authentication — a logged-out /
+# expired / cleared OAuth token or bad API key — rather than quota or a
+# code crash. Matched case-insensitively against the lowercased tail.
+_AUTH_FAILURE_MARKERS = (
+    "invalid api key",
+    "please run /login",
+    "oauth token has expired",
+    "token has expired",
+    "token expired",
+    "authentication failed",
+    "authentication error",
+    "unauthorized",
+    "not logged in",
+    "login required",
+    "invalid bearer token",
+    "401",
+)
+
+
+def _read_session_stdout_tail(session_uuid: str, config: dict,
+                              nbytes: int = 4096) -> str:
+    """Return the last ``nbytes`` of a session's stdout, lowercased.
+
+    Empty string on any read error. Used to classify why a failed session
+    exited (quota exhaustion vs authentication failure).
+    """
+    try:
+        path = (PROJECT_DIR
+                / cfg_get(config, "project", "session_dir", default="sessions")
+                / f"{session_uuid}.stdout")
+        with open(path, "rb") as f:
+            f.seek(0, 2)  # end
+            f.seek(max(0, f.tell() - nbytes))
+            return f.read().decode(errors="replace").lower()
+    except OSError:
+        return ""
+
+
+def _looks_like_auth_failure(stdout_tail: str) -> bool:
+    """True if the lowercased stdout tail contains an auth-failure marker."""
+    return any(m in stdout_tail for m in _AUTH_FAILURE_MARKERS)
 
 
 def _git_rev(wt_dir: str) -> str:

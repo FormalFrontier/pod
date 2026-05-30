@@ -1,1 +1,1 @@
-{"schema": 3, "repo": "o/r", "fetched_at": 1780138513.460603, "body": {"openAgentPlan": {"nodes": []}, "openDirective": {"nodes": []}, "closedAgentPlan": {"nodes": []}, "closedDirective": {"nodes": []}, "blocked": {"nodes": []}, "hasPrIssues": {"nodes": []}, "pullRequests": {"nodes": []}}}
+{"schema": 3, "repo": "o/r", "fetched_at": 1780139250.893441, "body": {"openAgentPlan": {"nodes": []}, "openDirective": {"nodes": []}, "closedAgentPlan": {"nodes": []}, "closedDirective": {"nodes": []}, "blocked": {"nodes": []}, "hasPrIssues": {"nodes": []}, "pullRequests": {"nodes": []}}}
