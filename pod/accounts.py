@@ -488,22 +488,50 @@ def _expires_at(blob: str | None) -> float:
     return 0.0
 
 
-def account_credential_expiry(account_num: int) -> float | None:
-    """Expiry of the canonical ``credentials<N>.json`` OAuth token as a
-    unix timestamp.
+def _mirror_blob_to_isolated_locked(label: str, canonical: str,
+                                     claude_config_dir: Path) -> bool:
+    """Mirror an already-read canonical blob into the agent's keychain
+    entry and ``<config_dir>/.credentials.json``. Returns True iff we
+    wrote.
 
-    Returns ``None`` when the credential file is absent (the account is
-    not logged in), ``0.0`` when the file exists but carries no parseable
-    ``expiresAt``, and the expiry timestamp otherwise. An auth preflight
-    treats ``None`` and a past timestamp as "do not dispatch"; an unknown
-    (``0.0``) expiry is left to proceed so a healthy account whose blob
-    happens to omit the field is not falsely quarantined.
+    The caller must already hold ``credential_lock(label)`` and must have
+    read ``canonical`` under that same lock, so the token validated is
+    exactly the token mirrored. Raises ``CredentialMirrorError`` as
+    documented on ``mirror_canonical_to_isolated``.
     """
+    service = claude_keychain_service(claude_config_dir)
+    isolated = _keychain_read(service)
+    if isolated and _expires_at(isolated) >= _expires_at(canonical):
+        # Isolated already has a token at least as fresh; don't clobber.
+        return False
+    wrote_kc = _keychain_write(service, canonical)
+    # Always write the file fallback so non-Darwin platforms work
+    # and so a session that bypasses the keychain still loads the
+    # right account.
+    claude_config_dir.mkdir(parents=True, exist_ok=True)
+    cred_file = claude_config_dir / ".credentials.json"
+    tmp = cred_file.with_suffix(".tmp")
+    tmp.write_text(canonical + ("\n" if not canonical.endswith("\n") else ""))
     try:
-        blob = _credentials_path(account_num).read_text()
+        os.chmod(tmp, 0o600)
     except OSError:
-        return None
-    return _expires_at(blob)
+        pass
+    tmp.rename(cred_file)
+    if wrote_kc:
+        _log(f"accounts: mirrored canonical {label} → keychain {service}")
+        return True
+    # Keychain write failed. The file fallback we just wrote is only
+    # consulted if the keychain entry is absent; force-clear any
+    # stale entry and verify it's gone before reporting success.
+    _keychain_delete(service)
+    if _keychain_read(service) is not None:
+        raise CredentialMirrorError(
+            f"keychain write to {service} failed for account {label} "
+            f"and stale entry persists; Claude Code would load a "
+            f"different credential than {cred_file}")
+    _log(f"accounts: keychain write to {service} failed; cleared "
+         f"stale entry — Claude Code will use {cred_file.name} fallback")
+    return True
 
 
 def mirror_canonical_to_isolated(label: str, account_num: int,
@@ -528,39 +556,46 @@ def mirror_canonical_to_isolated(label: str, account_num: int,
         canonical = _read_credential_blob(_credentials_path(account_num))
         if not canonical:
             return False
-        service = claude_keychain_service(claude_config_dir)
-        isolated = _keychain_read(service)
-        if isolated and _expires_at(isolated) >= _expires_at(canonical):
-            # Isolated already has a token at least as fresh; don't clobber.
-            return False
-        wrote_kc = _keychain_write(service, canonical)
-        # Always write the file fallback so non-Darwin platforms work
-        # and so a session that bypasses the keychain still loads the
-        # right account.
-        claude_config_dir.mkdir(parents=True, exist_ok=True)
-        cred_file = claude_config_dir / ".credentials.json"
-        tmp = cred_file.with_suffix(".tmp")
-        tmp.write_text(canonical + ("\n" if not canonical.endswith("\n") else ""))
-        try:
-            os.chmod(tmp, 0o600)
-        except OSError:
-            pass
-        tmp.rename(cred_file)
-        if wrote_kc:
-            _log(f"accounts: mirrored canonical {label} → keychain {service}")
-            return True
-        # Keychain write failed. The file fallback we just wrote is only
-        # consulted if the keychain entry is absent; force-clear any
-        # stale entry and verify it's gone before reporting success.
-        _keychain_delete(service)
-        if _keychain_read(service) is not None:
-            raise CredentialMirrorError(
-                f"keychain write to {service} failed for account {label} "
-                f"and stale entry persists; Claude Code would load a "
-                f"different credential than {cred_file}")
-        _log(f"accounts: keychain write to {service} failed; cleared "
-             f"stale entry — Claude Code will use {cred_file.name} fallback")
-        return True
+        return _mirror_blob_to_isolated_locked(label, canonical,
+                                               claude_config_dir)
+
+
+def preflight_and_mirror(label: str, account_num: int,
+                         claude_config_dir: Path | None, *,
+                         now: float, skew: float = 0.0) -> str:
+    """Validate the canonical OAuth token and, if good, mirror it — as one
+    per-account-credential-locked critical section.
+
+    Holding ``credential_lock(label)`` across the read, the expiry check,
+    and the mirror means the token that is validated is exactly the token
+    mirrored: no other agent's harvest/refresh and no external
+    ``swap-account`` can replace or remove the canonical credential
+    between the check and the write (the TOCTOU the separate read+mirror
+    would have).
+
+    Returns one of:
+
+    - ``"missing"`` — no canonical credential; the account is logged out.
+    - ``"expired"`` — the token has expired or expires within ``skew``
+      seconds of ``now``.
+    - ``"ok"`` — authenticated; mirrored when ``claude_config_dir`` is set.
+
+    An unparseable / absent ``expiresAt`` (``_expires_at`` returns ``0.0``)
+    is treated as ``"ok"`` so a healthy account whose blob omits the field
+    is not falsely quarantined. Raises ``CredentialMirrorError`` only via
+    the mirror path, exactly as ``mirror_canonical_to_isolated``.
+    """
+    with credential_lock(label):
+        canonical = _read_credential_blob(_credentials_path(account_num))
+        if not canonical:
+            return "missing"
+        exp = _expires_at(canonical)
+        if exp > 0 and exp <= now + skew:
+            return "expired"
+        if claude_config_dir is not None:
+            _mirror_blob_to_isolated_locked(label, canonical,
+                                            claude_config_dir)
+        return "ok"
 
 
 def harvest_isolated_to_canonical(label: str, account_num: int,

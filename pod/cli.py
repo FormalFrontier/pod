@@ -1790,28 +1790,28 @@ def acquire_backend(
                         < accounts.model_tier("claude", cand.model)):
                     accounts.release_lease(cand.label, short_id)
                     continue
-            # Auth preflight: quota can read fine on an account that is
-            # logged out — its OAuth token expired or was cleared. Every
-            # session launched on such an account fails auth at startup
-            # (~20s, 0 tokens, exit 1); without this guard the agent would
-            # re-lease and re-dispatch it indefinitely. Skip + release
-            # rather than hand out a logged-out account.
-            exp = accounts.account_credential_expiry(cand.account_num)
-            if exp is None or (exp > 0 and exp <= time.time() + _AUTH_EXPIRY_SKEW):
-                reason = ("no credential (logged out)" if exp is None
+            # Auth preflight + mirror, as one credential-locked op. Quota
+            # can read fine on an account that is logged out — its OAuth
+            # token expired or was cleared — and every session launched on
+            # such an account fails auth at startup (~20s, 0 tokens, exit
+            # 1); without this guard the agent would re-lease and
+            # re-dispatch it indefinitely. Validating and mirroring under
+            # the same per-account credential lock also closes the TOCTOU
+            # window between checking the token and copying it.
+            try:
+                status = accounts.preflight_and_mirror(
+                    cand.label, cand.account_num, claude_config_dir,
+                    now=time.time(), skew=_AUTH_EXPIRY_SKEW)
+            except (OSError, accounts.CredentialMirrorError) as e:
+                log(f"acquire_backend: mirror failed for {cand.label}: {e}")
+                accounts.release_lease(cand.label, short_id)
+                continue
+            if status != "ok":
+                reason = ("no credential (logged out)" if status == "missing"
                           else "token expired")
                 log(f"acquire_backend: skipping {cand.label} — {reason}")
                 accounts.release_lease(cand.label, short_id)
                 continue
-            if claude_config_dir is not None:
-                try:
-                    accounts.mirror_canonical_to_isolated(
-                        cand.label, cand.account_num, claude_config_dir)
-                except (OSError, accounts.CredentialMirrorError) as e:
-                    log(f"acquire_backend: mirror failed for "
-                        f"{cand.label}: {e}")
-                    accounts.release_lease(cand.label, short_id)
-                    continue
             chosen = cand
             break
 
