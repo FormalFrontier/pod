@@ -73,6 +73,53 @@ class ListClaudeAccountsTests(_IsolatedHome):
     def test_empty_directory_returns_empty_list(self):
         self.assertEqual(accounts.list_claude_accounts(), [])
 
+    def test_list_claude_accounts_ignores_current_account_marker(self):
+        # The raw enumeration must NOT be filtered by .current-account —
+        # lease release/harvest and `pod accounts list` rely on the full map.
+        (self.tmp / "credentials2.json").write_text(_make_creds("alpha", "2026-12-31T00:00:00Z"))
+        (self.tmp / "credentials4.json").write_text(_make_creds("gamma", "2026-12-31T00:00:00Z"))
+        (self.tmp / ".current-account").write_text("4\n")
+
+        accts = accounts.list_claude_accounts()
+        self.assertEqual([(a.number, a.label) for a in accts], [(2, "alpha"), (4, "gamma")])
+
+
+# --- current_account / select_for_dispatch ----------------------------------
+
+
+class CurrentAccountSelectionTests(_IsolatedHome):
+    def _accts(self):
+        (self.tmp / "credentials2.json").write_text(_make_creds("alpha", "2026-12-31T00:00:00Z"))
+        (self.tmp / "credentials3.json").write_text(_make_creds("beta", "2026-12-31T00:00:00Z"))
+        (self.tmp / "credentials4.json").write_text(_make_creds("gamma", "2026-12-31T00:00:00Z"))
+        return accounts.list_claude_accounts()
+
+    def test_current_account_parsing(self):
+        self.assertIsNone(accounts.current_account())
+        (self.tmp / ".current-account").write_text("4\n")
+        self.assertEqual(accounts.current_account(), 4)
+        (self.tmp / ".current-account").write_text("not-a-number")
+        self.assertIsNone(accounts.current_account())
+
+    def test_select_for_dispatch_pins_to_marked_account(self):
+        accts = self._accts()
+        (self.tmp / ".current-account").write_text("4\n")
+        picked = accounts.select_for_dispatch(accts)
+        self.assertEqual([(a.number, a.label) for a in picked], [(4, "gamma")])
+
+    def test_select_for_dispatch_no_marker_returns_all(self):
+        accts = self._accts()
+        picked = accounts.select_for_dispatch(accts)
+        self.assertEqual([a.number for a in picked], [2, 3, 4])
+
+    def test_select_for_dispatch_unresolvable_marker_returns_all(self):
+        # Marker names an account not in the (probed/loadable) list → keep the
+        # full pool rather than collapsing to nothing.
+        accts = self._accts()
+        (self.tmp / ".current-account").write_text("9\n")
+        picked = accounts.select_for_dispatch(accts)
+        self.assertEqual([a.number for a in picked], [2, 3, 4])
+
 
 # --- Keychain service name --------------------------------------------------
 
