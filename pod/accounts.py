@@ -290,15 +290,19 @@ class Account:
     path: Path  # ~/.claude/credentials<N>.json
 
 
-def _read_current_account() -> int | None:
+def current_account() -> int | None:
     """Account number an external manager marked active in
     ``~/.claude/.current-account``.
 
     A ``swap-account``-style script may own account selection (picking the
-    best account by quota and writing its number here, plus mirroring its
-    credentials into ``.credentials.json``). When that marker is present,
-    pod must defer to it rather than choosing its own account. Returns
-    ``None`` if the file is absent or unparseable.
+    best account by remaining quota, writing its number here, and mirroring
+    its credentials into ``.credentials.json``). When this marker is present
+    pod must select that account for new dispatches rather than choosing its
+    own from the pool. Returns ``None`` if the file is absent or unparseable.
+
+    This is *selection* policy only — it must not filter the raw account
+    enumeration (``list_claude_accounts``), which lease release/harvest and
+    ``pod accounts list`` rely on to see *all* accounts.
     """
     try:
         txt = (CLAUDE_DIR / ".current-account").read_text().strip()
@@ -310,19 +314,30 @@ def _read_current_account() -> int | None:
         return None
 
 
+def select_for_dispatch(accts: list[Account]) -> list[Account]:
+    """Narrow a raw account list to those pod may pick for a new dispatch.
+
+    If ``current_account()`` names one of ``accts``, return only it (defer to
+    the external account manager's choice). Otherwise return ``accts``
+    unchanged, so setups where pod manages multiple accounts itself — and
+    cases where the marker points at an account pod can't see — keep the full
+    pool to choose from.
+    """
+    current = current_account()
+    if current is not None:
+        pinned = [a for a in accts if a.number == current]
+        if pinned:
+            return pinned
+    return accts
+
+
 def list_claude_accounts() -> list[Account]:
-    """Return the (label, number, path) Claude accounts pod may use.
+    """Return all (label, number, path) accounts from ~/.claude/credentialsN.json.
 
     Sorted by account number. Files that fail to parse or lack an
-    ``accountLabel`` are skipped (logged once).
-
-    If ``~/.claude/.current-account`` names a present, loadable account,
-    **only that account is returned**: an external account manager (e.g. a
-    ``swap-account`` script that picks the best account by remaining quota)
-    owns selection, and pod must use its choice instead of enumerating the
-    ``credentials*.json`` pool and ordering by its own preference. Without
-    that marker pod falls back to the full enumeration, so setups that let
-    pod manage multiple accounts are unaffected.
+    ``accountLabel`` are skipped (logged once). This is the full enumeration
+    used by lease release/harvest and ``pod accounts list``; dispatch
+    selection narrows it via ``select_for_dispatch``.
     """
     out: list[Account] = []
     try:
@@ -344,14 +359,6 @@ def list_claude_accounts() -> list[Account]:
         if not label or label == "?":
             continue
         out.append(Account(label=label, number=num, path=path))
-    # Defer to an external account manager's active-account marker. Only
-    # pin when the marker resolves to an account we actually loaded;
-    # otherwise fall back to the full list rather than returning nothing.
-    current = _read_current_account()
-    if current is not None:
-        pinned = [a for a in out if a.number == current]
-        if pinned:
-            return pinned
     return out
 
 

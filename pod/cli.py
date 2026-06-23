@@ -1727,8 +1727,15 @@ def acquire_backend(
         _release_account_lease(state, claude_config_dir)
 
     # Step 2: bulk-probe all accounts + codex once per pass.
+    # Narrow to the account an external manager (e.g. a `swap-account` script,
+    # via ~/.claude/.current-account) marked active — pod must use its choice
+    # for new dispatches instead of ordering the whole pool by its own
+    # preference. No-op when the marker is absent. Selection only: the raw
+    # `list_claude_accounts()` enumeration is left intact for lease
+    # release/harvest and `pod accounts list`.
     claude_accts = (
-        accounts.list_claude_accounts() if "claude" in backends_allowed else [])
+        accounts.select_for_dispatch(accounts.list_claude_accounts())
+        if "claude" in backends_allowed else [])
     available_by_label: dict[str, str | None] = {}
     if "claude" in backends_allowed and not force:
         for a in claude_accts:
