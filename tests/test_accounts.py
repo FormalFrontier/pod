@@ -73,6 +73,35 @@ class ListClaudeAccountsTests(_IsolatedHome):
     def test_empty_directory_returns_empty_list(self):
         self.assertEqual(accounts.list_claude_accounts(), [])
 
+    def test_current_account_marker_pins_single_account(self):
+        # An external swap-account script marks account 4 active; pod must
+        # defer to it and ignore the rest of the pool (the bug: pod used to
+        # enumerate all and pick by its own order, overriding the choice).
+        (self.tmp / "credentials2.json").write_text(_make_creds("alpha", "2026-12-31T00:00:00Z"))
+        (self.tmp / "credentials3.json").write_text(_make_creds("beta", "2026-12-31T00:00:00Z"))
+        (self.tmp / "credentials4.json").write_text(_make_creds("gamma", "2026-12-31T00:00:00Z"))
+        (self.tmp / ".current-account").write_text("4\n")
+
+        accts = accounts.list_claude_accounts()
+        self.assertEqual([(a.number, a.label) for a in accts], [(4, "gamma")])
+
+    def test_current_account_marker_unresolvable_falls_back_to_full_list(self):
+        # Marker points at an account that isn't loadable → don't return
+        # nothing; fall back to the full enumeration.
+        (self.tmp / "credentials2.json").write_text(_make_creds("alpha", "2026-12-31T00:00:00Z"))
+        (self.tmp / "credentials4.json").write_text(_make_creds("gamma", "2026-12-31T00:00:00Z"))
+        (self.tmp / ".current-account").write_text("9\n")
+
+        accts = accounts.list_claude_accounts()
+        self.assertEqual([(a.number, a.label) for a in accts], [(2, "alpha"), (4, "gamma")])
+
+    def test_current_account_marker_unparseable_falls_back(self):
+        (self.tmp / "credentials2.json").write_text(_make_creds("alpha", "2026-12-31T00:00:00Z"))
+        (self.tmp / ".current-account").write_text("not-a-number")
+
+        accts = accounts.list_claude_accounts()
+        self.assertEqual([(a.number, a.label) for a in accts], [(2, "alpha")])
+
 
 # --- Keychain service name --------------------------------------------------
 

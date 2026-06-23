@@ -290,11 +290,39 @@ class Account:
     path: Path  # ~/.claude/credentials<N>.json
 
 
+def _read_current_account() -> int | None:
+    """Account number an external manager marked active in
+    ``~/.claude/.current-account``.
+
+    A ``swap-account``-style script may own account selection (picking the
+    best account by quota and writing its number here, plus mirroring its
+    credentials into ``.credentials.json``). When that marker is present,
+    pod must defer to it rather than choosing its own account. Returns
+    ``None`` if the file is absent or unparseable.
+    """
+    try:
+        txt = (CLAUDE_DIR / ".current-account").read_text().strip()
+    except OSError:
+        return None
+    try:
+        return int(txt)
+    except ValueError:
+        return None
+
+
 def list_claude_accounts() -> list[Account]:
-    """Return all (label, number, path) accounts from ~/.claude/credentialsN.json.
+    """Return the (label, number, path) Claude accounts pod may use.
 
     Sorted by account number. Files that fail to parse or lack an
     ``accountLabel`` are skipped (logged once).
+
+    If ``~/.claude/.current-account`` names a present, loadable account,
+    **only that account is returned**: an external account manager (e.g. a
+    ``swap-account`` script that picks the best account by remaining quota)
+    owns selection, and pod must use its choice instead of enumerating the
+    ``credentials*.json`` pool and ordering by its own preference. Without
+    that marker pod falls back to the full enumeration, so setups that let
+    pod manage multiple accounts are unaffected.
     """
     out: list[Account] = []
     try:
@@ -316,6 +344,14 @@ def list_claude_accounts() -> list[Account]:
         if not label or label == "?":
             continue
         out.append(Account(label=label, number=num, path=path))
+    # Defer to an external account manager's active-account marker. Only
+    # pin when the marker resolves to an account we actually loaded;
+    # otherwise fall back to the full list rather than returning nothing.
+    current = _read_current_account()
+    if current is not None:
+        pinned = [a for a in out if a.number == current]
+        if pinned:
+            return pinned
     return out
 
 
