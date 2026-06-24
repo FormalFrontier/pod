@@ -1628,6 +1628,12 @@ def _release_account_lease(state: AgentState,
     label = state.account_label
     if not label:
         return
+    # Shared-credential mode (external account manager owns selection): no
+    # lease was taken and the credential is a symlink to the canonical file,
+    # so there is nothing to harvest or release.
+    if state.lease_acquired_at == 0.0:
+        state.account_label = ""
+        return
     if claude_config_dir is not None:
         for a in accounts.list_claude_accounts():
             if a.label == label:
@@ -1779,45 +1785,60 @@ def acquire_backend(
             l.label for l in accounts.list_leases()
             if l.short_id != short_id
         }
+        # When an external account manager owns selection
+        # (~/.claude/.current-account present), pod defers fully: no
+        # exclusive lease and no keychain. Every agent shares the live
+        # canonical ~/.claude/.credentials.json via a symlink, so any number
+        # run concurrently and a swap of the canonical is picked up by the
+        # next launch. Otherwise keep pod's own per-agent account leasing.
+        shared = accounts.current_account() is not None
         for cand in candidates:
             if cand.backend == "codex":
                 chosen = cand
                 break
-            if cand.label in held_by_others:
-                continue
-            if not accounts.try_acquire_lease(
-                    cand.label, short_id,
-                    project_dir=str(PROJECT_DIR)):
-                continue
+            if not shared:
+                if cand.label in held_by_others:
+                    continue
+                if not accounts.try_acquire_lease(
+                        cand.label, short_id,
+                        project_dir=str(PROJECT_DIR)):
+                    continue
             if not force:
                 fresh = accounts.probe_account(
                     claude_quota_cmd, cand.label, force=True)
                 if (not fresh
                         or accounts.model_tier("claude", fresh)
                         < accounts.model_tier("claude", cand.model)):
+                    if not shared:
+                        accounts.release_lease(cand.label, short_id)
+                    continue
+            # Place the credential the agent will use. Shared mode symlinks
+            # the live canonical (no stale copy, no keychain); otherwise
+            # validate + mirror the leased account as one credential-locked
+            # op. Quota can read fine on a logged-out account — its OAuth
+            # token expired or was cleared — and every session launched on
+            # such an account fails auth at startup (~20s, exit 1); the
+            # status check below guards against re-dispatching it forever.
+            if shared:
+                status = accounts.place_shared_credential(
+                    claude_config_dir, now=time.time(),
+                    skew=_AUTH_EXPIRY_SKEW)
+            else:
+                try:
+                    status = accounts.preflight_and_mirror(
+                        cand.label, cand.account_num, claude_config_dir,
+                        now=time.time(), skew=_AUTH_EXPIRY_SKEW)
+                except (OSError, accounts.CredentialMirrorError) as e:
+                    log(f"acquire_backend: mirror failed for "
+                        f"{cand.label}: {e}")
                     accounts.release_lease(cand.label, short_id)
                     continue
-            # Auth preflight + mirror, as one credential-locked op. Quota
-            # can read fine on an account that is logged out — its OAuth
-            # token expired or was cleared — and every session launched on
-            # such an account fails auth at startup (~20s, 0 tokens, exit
-            # 1); without this guard the agent would re-lease and
-            # re-dispatch it indefinitely. Validating and mirroring under
-            # the same per-account credential lock also closes the TOCTOU
-            # window between checking the token and copying it.
-            try:
-                status = accounts.preflight_and_mirror(
-                    cand.label, cand.account_num, claude_config_dir,
-                    now=time.time(), skew=_AUTH_EXPIRY_SKEW)
-            except (OSError, accounts.CredentialMirrorError) as e:
-                log(f"acquire_backend: mirror failed for {cand.label}: {e}")
-                accounts.release_lease(cand.label, short_id)
-                continue
             if status != "ok":
                 reason = ("no credential (logged out)" if status == "missing"
                           else "token expired")
                 log(f"acquire_backend: skipping {cand.label} — {reason}")
-                accounts.release_lease(cand.label, short_id)
+                if not shared:
+                    accounts.release_lease(cand.label, short_id)
                 continue
             chosen = cand
             break
@@ -1826,7 +1847,9 @@ def acquire_backend(
         return None
     if chosen.backend == "claude":
         state.account_label = chosen.label
-        state.lease_acquired_at = time.time()
+        # Shared mode took no lease; lease_acquired_at == 0.0 marks that so
+        # cleanup skips harvest/release (there is nothing to release).
+        state.lease_acquired_at = 0.0 if shared else time.time()
     else:
         # Picked codex; release any outstanding claude lease.
         if state.account_label:

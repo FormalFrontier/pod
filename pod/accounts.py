@@ -641,6 +641,43 @@ def preflight_and_mirror(label: str, account_num: int,
         return "ok"
 
 
+def place_shared_credential(claude_config_dir: Path | None, *,
+                            now: float, skew: float = 0.0) -> str:
+    """Point the agent's isolated config dir at the live canonical
+    ``~/.claude/.credentials.json`` via a symlink — no copy, no keychain,
+    no lease.
+
+    This is the credential path when an external account manager owns
+    selection (``~/.claude/.current-account`` present) and keeps the active
+    account mirrored in ``~/.claude/.credentials.json``. pod does not pick,
+    lease, or mirror accounts here: every agent reads whatever the manager
+    has made canonical, and because it is a symlink (not a copy) a later
+    swap of the canonical is picked up by the next launch rather than going
+    stale. Token refreshes land in the agent's per-dir keychain entry, not
+    back through the link, so they cannot clobber the canonical.
+
+    Returns ``"missing"`` / ``"expired"`` / ``"ok"`` like
+    ``preflight_and_mirror``.
+    """
+    canonical = CLAUDE_DIR / ".credentials.json"
+    blob = _read_credential_blob(canonical)
+    if not blob:
+        return "missing"
+    exp = _expires_at(blob)
+    if exp > 0 and exp <= now + skew:
+        return "expired"
+    if claude_config_dir is not None:
+        claude_config_dir.mkdir(parents=True, exist_ok=True)
+        link = claude_config_dir / ".credentials.json"
+        try:
+            if link.is_symlink() or link.exists():
+                link.unlink()
+        except OSError:
+            pass
+        link.symlink_to(canonical)
+    return "ok"
+
+
 def harvest_isolated_to_canonical(label: str, account_num: int,
                                     claude_config_dir: Path) -> bool:
     """If the isolated keychain entry's token is fresher than the
