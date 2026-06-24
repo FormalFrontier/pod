@@ -669,12 +669,14 @@ def place_shared_credential(claude_config_dir: Path | None, *,
     if claude_config_dir is not None:
         claude_config_dir.mkdir(parents=True, exist_ok=True)
         link = claude_config_dir / ".credentials.json"
+        tmp = claude_config_dir / ".credentials.json.tmp"
         try:
-            if link.is_symlink() or link.exists():
-                link.unlink()
+            if tmp.is_symlink() or tmp.exists():
+                tmp.unlink()
         except OSError:
             pass
-        link.symlink_to(canonical)
+        tmp.symlink_to(canonical)
+        os.replace(tmp, link)  # atomic swap, even if `link` already exists
     return "ok"
 
 

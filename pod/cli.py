@@ -1706,10 +1706,13 @@ def acquire_backend(
     if prefer not in ("claude", "codex"):
         prefer = "codex"
 
-    # Step 1: existing lease still good?
+    # Step 1: existing lease still good? Skipped in shared mode (external
+    # manager owns selection): there is no lease, and we must re-link the
+    # live canonical and re-check the marker every dispatch.
     if (state.account_label
             and not force
             and "claude" in backends_allowed
+            and accounts.current_account() is None
             and (pin_label is None or pin_label == state.account_label)):
         fresh = accounts.probe_account(
             claude_quota_cmd, state.account_label, force=False)
@@ -1791,7 +1794,12 @@ def acquire_backend(
         # canonical ~/.claude/.credentials.json via a symlink, so any number
         # run concurrently and a swap of the canonical is picked up by the
         # next launch. Otherwise keep pod's own per-agent account leasing.
-        shared = accounts.current_account() is not None
+        # Only enter shared mode when the marker resolves to exactly the
+        # account select_for_dispatch pinned; an unresolvable marker falls
+        # back to the full pool, where leasing must still apply.
+        _cur = accounts.current_account()
+        shared = (_cur is not None and len(claude_accts) == 1
+                  and claude_accts[0].number == _cur)
         for cand in candidates:
             if cand.backend == "codex":
                 chosen = cand
@@ -1820,9 +1828,13 @@ def acquire_backend(
             # such an account fails auth at startup (~20s, exit 1); the
             # status check below guards against re-dispatching it forever.
             if shared:
-                status = accounts.place_shared_credential(
-                    claude_config_dir, now=time.time(),
-                    skew=_AUTH_EXPIRY_SKEW)
+                try:
+                    status = accounts.place_shared_credential(
+                        claude_config_dir, now=time.time(),
+                        skew=_AUTH_EXPIRY_SKEW)
+                except OSError as e:
+                    log(f"acquire_backend: shared credential link failed: {e}")
+                    continue
             else:
                 try:
                     status = accounts.preflight_and_mirror(
