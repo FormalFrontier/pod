@@ -880,6 +880,16 @@ class AgentState:
     # doesn't park on `select_available_backend`.
     target_issue: int = 0
     target_type: str = ""
+    # Quota pause/resume. When an agent hits a usage limit, instead of aborting
+    # (releasing the claim and deleting the worktree) it pauses — keeping its
+    # claim, worktree and session — waits for quota to return (swap-account
+    # rotates the canonical to a fresh account, or the 5h window resets), then
+    # `--resume`s and continues on whatever account is now available.
+    # `resuming_after_pause` makes the next loop iteration take the resume path
+    # (skip dispatch/reset, reuse the worktree, `--resume`). `quota_paused_at`
+    # is the wall-clock of the first pause in a run; it bounds the total pause.
+    resuming_after_pause: bool = False
+    quota_paused_at: float = 0.0
 
     def cost(self, config: dict) -> float:
         """Calculate cost in dollars using backend/model-aware pricing."""
@@ -6242,6 +6252,69 @@ def _sigusr1_handler(signum, frame):
         log(f"Agent {_agent_state.short_id} marked as finishing")
 
 
+def _resume_jitter(config: dict) -> float:
+    """Random jitter (seconds) added when a paused agent waits for its resume
+    slot, so agents that wake together scatter rather than stampede."""
+    return float(cfg_get(config, "quota", "resume_jitter_secs", default=10))
+
+
+def _resume_slot_wait(config: dict) -> float:
+    """Global rate-limiter for quota-resume launches across all agents.
+
+    Returns ``0.0`` and reserves the next slot if the caller may resume now;
+    otherwise returns the seconds until the next slot frees (caller should
+    sleep, then retry — which also re-checks quota). Serializes resumes to one
+    per ``resume_gap_secs`` so a freshly-rotated account is not stampeded by
+    every paused agent at once (in shared mode there are no per-agent leases to
+    space them out).
+
+    A *separate* lock file guards a plain-timestamp data file. We must not flock
+    the data file itself and then rewrite it: ``_flock`` locks the inode, and a
+    rewrite/rename would swap the inode out from under other waiters.
+    """
+    gap = float(cfg_get(config, "quota", "resume_gap_secs", default=30))
+    lockpath = POD_DIR / "quota-resume.lock"
+    nextpath = POD_DIR / "quota-resume-next"
+    with accounts._flock(lockpath, exclusive=True, blocking=True):
+        now = time.time()
+        try:
+            nxt = float(nextpath.read_text().strip())
+        except (OSError, ValueError):
+            nxt = 0.0
+        if now >= nxt:
+            nextpath.write_text(str(now + gap))
+            return 0.0
+        return nxt - now
+
+
+def _release_paused_session(state: "AgentState", config: dict,
+                            claude_config_dir: Path | None, *,
+                            reason: str) -> None:
+    """Give up on a paused/resuming agent and release everything it was holding:
+    its GitHub claim, its preserved worktree, and the account lease; then clear
+    the pause flags. Used when a resume cannot proceed (pause cap exceeded,
+    resume launch failed, graceful finish mid-pause). Mirrors the quota
+    fall-through cleanup so a held claim/worktree is never leaked."""
+    if (state.claimed_issue > 0 and state.pr_number == 0
+            and state.worker_type not in ("repair", "replan")):
+        try:
+            if _release_claim(str(state.claimed_issue), state.uuid, 0,
+                              reason=f"Claim released — {reason}."):
+                clear_claim(state.claimed_issue, session_uuid=state.uuid)
+        except _GraphQLRateLimited:
+            pass
+    if state.worktree:
+        try:
+            cleanup_worktree(state.worktree, state.branch)
+        except Exception:
+            pass
+        state.worktree = ""
+        state.branch = ""
+    _release_account_lease(state, claude_config_dir)
+    state.resuming_after_pause = False
+    state.quota_paused_at = 0.0
+
+
 def agent_process_main(config: dict, agent_id: str | None = None,
                         resume_uuid: str | None = None,
                         target_issue: int = 0,
@@ -6317,8 +6390,15 @@ def agent_process_main(config: dict, agent_id: str | None = None,
         # they originally ran on: only Claude has a real `--resume`,
         # and a refreshed token on the wrong account would silently
         # fork the conversation or fail.
+        # Pin the backend (only Claude has a real `--resume`) for both kinds of
+        # resume. Pin the *account* only for a spawn-time resume; a quota-pause
+        # resume deliberately leaves the account unpinned (account_label was
+        # cleared on pause) so it follows swap-account to a fresh, in-quota
+        # account — verified that `claude --resume` continues across accounts.
         resume_pin_backend = (
-            state.backend if state.resume_session_uuid and state.backend
+            state.backend
+            if (state.resume_session_uuid or state.resuming_after_pause)
+            and state.backend
             else None)
         resume_pin_label = (
             state.account_label
@@ -6337,6 +6417,20 @@ def agent_process_main(config: dict, agent_id: str | None = None,
                 pin_label=resume_pin_label,
             )
             if selection is not None:
+                # Stagger quota-resume launches: only one agent resumes per
+                # `resume_gap_secs`, so a freshly-rotated account is not
+                # stampeded by every paused agent at once. If our slot is not
+                # ready, sleep and re-loop (which re-checks quota too) rather
+                # than launching onto a soon-to-be-re-exhausted account.
+                if state.resuming_after_pause and not state.finishing:
+                    _gap = _resume_slot_wait(config)
+                    if _gap > 0.0:
+                        _wait = min(_gap, 60.0) + random.uniform(
+                            0.0, _resume_jitter(config))
+                        log(f"Agent {short_id}: staggering resume — waiting "
+                            f"{_wait:.0f}s for global resume slot")
+                        time.sleep(_wait)
+                        continue
                 break
             if state.finishing:
                 break
@@ -6365,12 +6459,32 @@ def agent_process_main(config: dict, agent_id: str | None = None,
                         backend=resume_pin_backend or "claude",
                         label="", model="opus", account_num=0)
                 break
+            # Enforce the max-pause cap WHILE waiting: if a resuming agent can
+            # find no in-quota account (e.g. every account weekly-exhausted),
+            # this loop would otherwise sleep forever and hold the claim. Give
+            # up past the cap and release everything.
+            if state.resuming_after_pause and state.quota_paused_at:
+                _cap = float(cfg_get(config, "quota", "max_pause_secs",
+                                     default=5400))
+                if (time.time() - state.quota_paused_at) > _cap:
+                    log(f"Agent {short_id}: quota pause exceeded {_cap:.0f}s "
+                        f"while waiting on #{state.claimed_issue}; giving up")
+                    _release_paused_session(state, config, claude_config_dir,
+                                            reason="quota pause cap exceeded")
+                    _abort_one_shot_iteration(state, "quota pause cap exceeded")
+                    break
             target = resume_pin_backend or "any backend"
             if resume_pin_label:
                 target += f"/{resume_pin_label}"
             log(f"Agent {short_id}: no quota for {target}, sleeping {quota_retry}s")
             time.sleep(quota_retry)
         if state.finishing or selection is None:
+            # If we're stopping mid-pause (graceful finish / SIGUSR1, or the cap
+            # give-up above), release the preserved claim + worktree so they
+            # aren't leaked until housekeeping reaps them.
+            if state.resuming_after_pause:
+                _release_paused_session(state, config, claude_config_dir,
+                                        reason="agent finishing during quota pause")
             break
 
         chosen_backend = selection.backend
@@ -6458,7 +6572,24 @@ def agent_process_main(config: dict, agent_id: str | None = None,
         # --- Dispatch (sets state.lock_held atomically if lock acquired) ---
         # If this agent was spawned to resume a specific session, skip dispatch.
         _resume_uuid = state.resume_session_uuid
-        if state.target_issue:
+        if state.resuming_after_pause:
+            # Resuming a session paused for a usage limit: reuse the SAME
+            # session, worktree and GitHub claim, and take precedence over
+            # one-shot dispatch. Continue the existing conversation via
+            # `--resume`; no new claim, no new worktree.
+            _resume_uuid = state.uuid
+            chosen_type = state.worker_type or "work"
+            prompt = ("You were interrupted by a usage limit and have been "
+                      "resumed (possibly on a different account). Review your "
+                      "conversation history and continue exactly where you "
+                      "left off.")
+            lock_name = ""
+            wt_config = {}
+            state.status = "dispatching"
+            state.write()
+            log(f"Agent {short_id}: resuming after quota pause — session "
+                f"{_resume_uuid} on [{chosen_account_label}]")
+        elif state.target_issue:
             # One-shot mode (set by `pod once`). Skip dispatch, pin the
             # work type the caller chose, and append a directive to the
             # prompt so the agent claims #N specifically instead of
@@ -6520,73 +6651,110 @@ def agent_process_main(config: dict, agent_id: str | None = None,
             log(f"Agent {short_id}: dispatched as {chosen_type}")
 
         # --- Session setup ---
-        session_uuid = _resume_uuid if _resume_uuid else str(uuid.uuid4())
-        state.uuid = session_uuid
-        state.session_start = time.time()
-        state.claimed_issue = 0
-        state.pr_number = 0
-        state.tokens_in = 0
-        state.tokens_out = 0
-        state.cache_read = 0
-        state.cache_create = 0
-        state.last_text = ""
-        state.last_activity = 0.0
+        if state.resuming_after_pause:
+            # Resume after a quota pause: keep the SAME session, claim, worktree
+            # and cumulative counters. (The JSONL monitor keeps tokens/activity
+            # current; resetting claimed_issue here would drop the held claim.)
+            session_uuid = state.uuid
+        else:
+            session_uuid = _resume_uuid if _resume_uuid else str(uuid.uuid4())
+            state.uuid = session_uuid
+            state.session_start = time.time()
+            state.claimed_issue = 0
+            state.pr_number = 0
+            state.tokens_in = 0
+            state.tokens_out = 0
+            state.cache_read = 0
+            state.cache_create = 0
+            state.last_text = ""
+            state.last_activity = 0.0
 
-        # Use session UUID prefix for worktree/branch to avoid branch reuse
-        # across sessions.  When the same agent process iterates, a persistent
-        # short_id would reuse the same branch name, hitting an existing remote
-        # PR from the *previous* issue.  A per-session prefix gives each
-        # session its own branch (agent/<session-prefix>), preventing the
-        # create-pr "PR already exists" shortcut from silently linking the
-        # wrong issue.
-        session_short = session_uuid[:8]
+        if state.resuming_after_pause:
+            # Reuse the preserved worktree/branch. setup_worktree() scrubs
+            # leftover state before recreating, which would delete the
+            # in-progress work we paused to keep.
+            wt_dir = state.worktree
+            branch = state.branch
+            if not wt_dir or not os.path.isdir(wt_dir):
+                log(f"Agent {short_id}: resume-after-pause but worktree "
+                    f"{wt_dir!r} is gone; releasing claim and aborting")
+                if (state.claimed_issue > 0 and state.pr_number == 0
+                        and state.worker_type not in ("repair", "replan")):
+                    try:
+                        if _release_claim(
+                                str(state.claimed_issue), state.uuid, 0,
+                                reason="Claim released — paused session's "
+                                       "worktree vanished; cannot resume."):
+                            clear_claim(state.claimed_issue,
+                                        session_uuid=state.uuid)
+                    except _GraphQLRateLimited:
+                        pass
+                state.resuming_after_pause = False
+                state.quota_paused_at = 0.0
+                state.worktree = ""
+                state.branch = ""
+                _abort_one_shot_iteration(state, "resume worktree missing")
+                state.write()
+                if state.finishing:
+                    break
+                continue
+            state.git_start = _git_rev(wt_dir)
+        else:
+            # Use session UUID prefix for worktree/branch to avoid branch reuse
+            # across sessions.  When the same agent process iterates, a persistent
+            # short_id would reuse the same branch name, hitting an existing remote
+            # PR from the *previous* issue.  A per-session prefix gives each
+            # session its own branch (agent/<session-prefix>), preventing the
+            # create-pr "PR already exists" shortcut from silently linking the
+            # wrong issue.
+            session_short = session_uuid[:8]
 
-        # Pre-register worktree in state BEFORE creation so that
-        # cleanup_stale_worktrees() won't delete it during setup.
-        base = PROJECT_DIR / cfg_get(config, "project", "worktree_base", default="worktrees")
-        wt_dir_expected = str(base / session_short)
-        branch_expected = f"agent/{session_short}"
-        state.worktree = wt_dir_expected
-        state.branch = branch_expected
-        state.write()
-
-        try:
-            wt_dir, branch = setup_worktree(config, session_short, own_agent_id=short_id)
-        except subprocess.CalledProcessError as e:
-            stderr_text = (e.stderr or b"").decode(errors="replace").strip()
-            log(f"Agent {short_id}: worktree setup failed: {e}"
-                + (f" — stderr: {stderr_text}" if stderr_text else ""))
-            state.worktree = ""
-            state.branch = ""
-            if lock_name:
-                coordination(config, f"unlock-{lock_name}")
-                state.lock_held = ""
-            state.status = "error"
-            _abort_one_shot_iteration(state, "worktree setup failed")
+            # Pre-register worktree in state BEFORE creation so that
+            # cleanup_stale_worktrees() won't delete it during setup.
+            base = PROJECT_DIR / cfg_get(config, "project", "worktree_base", default="worktrees")
+            wt_dir_expected = str(base / session_short)
+            branch_expected = f"agent/{session_short}"
+            state.worktree = wt_dir_expected
+            state.branch = branch_expected
             state.write()
-            if state.finishing:
-                break
-            time.sleep(10)
-            continue
 
-        if not os.path.isdir(wt_dir):
-            log(f"Agent {short_id}: worktree dir missing after setup_worktree returned: {wt_dir}")
-            state.worktree = ""
-            state.branch = ""
-            if lock_name:
-                coordination(config, f"unlock-{lock_name}")
-                state.lock_held = ""
-            state.status = "error"
-            _abort_one_shot_iteration(state, "worktree dir missing")
-            state.write()
-            if state.finishing:
-                break
-            time.sleep(10)
-            continue
+            try:
+                wt_dir, branch = setup_worktree(config, session_short, own_agent_id=short_id)
+            except subprocess.CalledProcessError as e:
+                stderr_text = (e.stderr or b"").decode(errors="replace").strip()
+                log(f"Agent {short_id}: worktree setup failed: {e}"
+                    + (f" — stderr: {stderr_text}" if stderr_text else ""))
+                state.worktree = ""
+                state.branch = ""
+                if lock_name:
+                    coordination(config, f"unlock-{lock_name}")
+                    state.lock_held = ""
+                state.status = "error"
+                _abort_one_shot_iteration(state, "worktree setup failed")
+                state.write()
+                if state.finishing:
+                    break
+                time.sleep(10)
+                continue
 
-        state.worktree = wt_dir
-        state.branch = branch
-        state.git_start = _git_rev(wt_dir)
+            if not os.path.isdir(wt_dir):
+                log(f"Agent {short_id}: worktree dir missing after setup_worktree returned: {wt_dir}")
+                state.worktree = ""
+                state.branch = ""
+                if lock_name:
+                    coordination(config, f"unlock-{lock_name}")
+                    state.lock_held = ""
+                state.status = "error"
+                _abort_one_shot_iteration(state, "worktree dir missing")
+                state.write()
+                if state.finishing:
+                    break
+                time.sleep(10)
+                continue
+
+            state.worktree = wt_dir
+            state.branch = branch
+            state.git_start = _git_rev(wt_dir)
 
         install_agent_config(wt_dir, backend=chosen_backend)
 
@@ -6638,7 +6806,14 @@ def agent_process_main(config: dict, agent_id: str | None = None,
         except (OSError, FileNotFoundError) as e:
             log(f"Agent {short_id}: failed to launch {chosen_backend}: {e}")
             stop_monitor.set()
-            cleanup_worktree(wt_dir, branch)
+            if state.resuming_after_pause:
+                # A resume launch failed. The generic path would scrub the
+                # preserved worktree and drop the held claim silently; release
+                # the claim explicitly instead.
+                _release_paused_session(state, config, claude_config_dir,
+                                        reason="resume launch failed")
+            else:
+                cleanup_worktree(wt_dir, branch)
             if lock_name:
                 coordination(config, f"unlock-{lock_name}")
                 state.lock_held = ""
@@ -6774,6 +6949,11 @@ def agent_process_main(config: dict, agent_id: str | None = None,
             f"duration={human_duration(elapsed)} {tok} "
             f"git:{state.git_start}..{git_end}")
 
+        # This iteration's resume launch (if any) has now returned; clear the
+        # flag so a clean completion exits instead of looping as a resume. A
+        # fresh usage-limit hit (below) re-arms it.
+        state.resuming_after_pause = False
+
         # --- Quota exhaustion detection from stdout ---
         # Must run BEFORE claim cleanup: coordination skip marks issues as
         # "replan", but quota exhaustion is temporary — the issue is fine,
@@ -6785,7 +6965,54 @@ def agent_process_main(config: dict, agent_id: str | None = None,
                        if exit_code != 0 else "")
         _is_quota_exhausted = any(m in stdout_tail for m in _QUOTA_MARKERS)
 
+        if not _is_quota_exhausted:
+            # Session got past any usage limit — reset the pause budget.
+            state.quota_paused_at = 0.0
+
         if _is_quota_exhausted:
+            # --- Pause-and-resume (preferred over abort) --------------------
+            # Keep the claim, worktree and session; wait for quota to return
+            # (swap-account rotates the canonical to a fresh account, or the 5h
+            # session window resets), then `--resume` and continue. Bounded by
+            # `quota.max_pause_secs` so a claim/worktree is not held for days
+            # when every account is weekly-exhausted.
+            # Only Claude has a real `--resume`; and bubble mode stores the
+            # session JSONL outside the path the launcher checks, so a "resume"
+            # there would silently start a fresh conversation. Restrict to
+            # non-bubble Claude one-shot agents with live, resumable work.
+            _can_resume = (
+                state.target_issue > 0
+                and state.claimed_issue > 0
+                and state.pr_number == 0
+                and state.worker_type not in ("repair", "replan")
+                and chosen_backend == "claude"
+                and not _use_bubble(config)
+                and bool(wt_dir) and os.path.isdir(wt_dir))
+            if _can_resume and state.quota_paused_at == 0.0:
+                state.quota_paused_at = time.time()
+            _pause_cap = float(cfg_get(config, "quota", "max_pause_secs",
+                                       default=5400))
+            _paused_for = (time.time() - state.quota_paused_at
+                           if state.quota_paused_at else 0.0)
+            if _can_resume and _paused_for <= _pause_cap:
+                log(f"Agent {short_id}: usage limit hit — pausing session "
+                    f"{state.uuid} on #{state.claimed_issue} "
+                    f"(paused {_paused_for:.0f}s / cap {_pause_cap:.0f}s); "
+                    f"will resume on a fresh account")
+                # Free the exhausted account: clears account_label, which
+                # un-pins the resume so it follows swap-account to a fresh
+                # account. No-op in shared mode beyond clearing the label.
+                _release_account_lease(state, claude_config_dir)
+                state.resuming_after_pause = True
+                state.force_quota = False   # one-shot starts True; must wait
+                state.status = "waiting_quota"
+                state.write()
+                continue  # → top-of-loop quota wait, then resume
+            if state.quota_paused_at and _paused_for > _pause_cap:
+                log(f"Agent {short_id}: quota pause exceeded {_pause_cap:.0f}s "
+                    f"on #{state.claimed_issue}; giving up (releasing)")
+            state.quota_paused_at = 0.0
+            # --- Fall through: original abort/release path ------------------
             log(f"Agent {short_id}: session stdout indicates quota exhaustion, "
                 f"will re-check quota before next dispatch")
             # Release claim without replan — issue is fine, just quota-gated.
