@@ -6287,6 +6287,34 @@ def _resume_slot_wait(config: dict) -> float:
         return nxt - now
 
 
+def _release_paused_session(state: "AgentState", config: dict,
+                            claude_config_dir: Path | None, *,
+                            reason: str) -> None:
+    """Give up on a paused/resuming agent and release everything it was holding:
+    its GitHub claim, its preserved worktree, and the account lease; then clear
+    the pause flags. Used when a resume cannot proceed (pause cap exceeded,
+    resume launch failed, graceful finish mid-pause). Mirrors the quota
+    fall-through cleanup so a held claim/worktree is never leaked."""
+    if (state.claimed_issue > 0 and state.pr_number == 0
+            and state.worker_type not in ("repair", "replan")):
+        try:
+            if _release_claim(str(state.claimed_issue), state.uuid, 0,
+                              reason=f"Claim released — {reason}."):
+                clear_claim(state.claimed_issue, session_uuid=state.uuid)
+        except _GraphQLRateLimited:
+            pass
+    if state.worktree:
+        try:
+            cleanup_worktree(state.worktree, state.branch)
+        except Exception:
+            pass
+        state.worktree = ""
+        state.branch = ""
+    _release_account_lease(state, claude_config_dir)
+    state.resuming_after_pause = False
+    state.quota_paused_at = 0.0
+
+
 def agent_process_main(config: dict, agent_id: str | None = None,
                         resume_uuid: str | None = None,
                         target_issue: int = 0,
@@ -6431,12 +6459,32 @@ def agent_process_main(config: dict, agent_id: str | None = None,
                         backend=resume_pin_backend or "claude",
                         label="", model="opus", account_num=0)
                 break
+            # Enforce the max-pause cap WHILE waiting: if a resuming agent can
+            # find no in-quota account (e.g. every account weekly-exhausted),
+            # this loop would otherwise sleep forever and hold the claim. Give
+            # up past the cap and release everything.
+            if state.resuming_after_pause and state.quota_paused_at:
+                _cap = float(cfg_get(config, "quota", "max_pause_secs",
+                                     default=5400))
+                if (time.time() - state.quota_paused_at) > _cap:
+                    log(f"Agent {short_id}: quota pause exceeded {_cap:.0f}s "
+                        f"while waiting on #{state.claimed_issue}; giving up")
+                    _release_paused_session(state, config, claude_config_dir,
+                                            reason="quota pause cap exceeded")
+                    _abort_one_shot_iteration(state, "quota pause cap exceeded")
+                    break
             target = resume_pin_backend or "any backend"
             if resume_pin_label:
                 target += f"/{resume_pin_label}"
             log(f"Agent {short_id}: no quota for {target}, sleeping {quota_retry}s")
             time.sleep(quota_retry)
         if state.finishing or selection is None:
+            # If we're stopping mid-pause (graceful finish / SIGUSR1, or the cap
+            # give-up above), release the preserved claim + worktree so they
+            # aren't leaked until housekeeping reaps them.
+            if state.resuming_after_pause:
+                _release_paused_session(state, config, claude_config_dir,
+                                        reason="agent finishing during quota pause")
             break
 
         chosen_backend = selection.backend
@@ -6758,7 +6806,14 @@ def agent_process_main(config: dict, agent_id: str | None = None,
         except (OSError, FileNotFoundError) as e:
             log(f"Agent {short_id}: failed to launch {chosen_backend}: {e}")
             stop_monitor.set()
-            cleanup_worktree(wt_dir, branch)
+            if state.resuming_after_pause:
+                # A resume launch failed. The generic path would scrub the
+                # preserved worktree and drop the held claim silently; release
+                # the claim explicitly instead.
+                _release_paused_session(state, config, claude_config_dir,
+                                        reason="resume launch failed")
+            else:
+                cleanup_worktree(wt_dir, branch)
             if lock_name:
                 coordination(config, f"unlock-{lock_name}")
                 state.lock_held = ""
@@ -6921,11 +6976,17 @@ def agent_process_main(config: dict, agent_id: str | None = None,
             # session window resets), then `--resume` and continue. Bounded by
             # `quota.max_pause_secs` so a claim/worktree is not held for days
             # when every account is weekly-exhausted.
+            # Only Claude has a real `--resume`; and bubble mode stores the
+            # session JSONL outside the path the launcher checks, so a "resume"
+            # there would silently start a fresh conversation. Restrict to
+            # non-bubble Claude one-shot agents with live, resumable work.
             _can_resume = (
                 state.target_issue > 0
                 and state.claimed_issue > 0
                 and state.pr_number == 0
                 and state.worker_type not in ("repair", "replan")
+                and chosen_backend == "claude"
+                and not _use_bubble(config)
                 and bool(wt_dir) and os.path.isdir(wt_dir))
             if _can_resume and state.quota_paused_at == 0.0:
                 state.quota_paused_at = time.time()
