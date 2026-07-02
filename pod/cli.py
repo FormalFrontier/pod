@@ -6964,12 +6964,22 @@ def agent_process_main(config: dict, agent_id: str | None = None,
         stdout_tail = (_read_session_stdout_tail(session_uuid, config)
                        if exit_code != 0 else "")
         _is_quota_exhausted = any(m in stdout_tail for m in _QUOTA_MARKERS)
+        # Transient server-side API errors (e.g. "529 Overloaded", other 5xx)
+        # are not a quota problem — the account is fine, the API just needs a
+        # moment. Pause-and-resume the same way (keep claim/worktree/session),
+        # with a short backoff first so the resume doesn't immediately re-hit
+        # the overload storm.
+        _is_transient_api = (
+            exit_code != 0
+            and not _is_quota_exhausted
+            and any(m in stdout_tail.lower() for m in _TRANSIENT_API_MARKERS))
+        _should_pause = _is_quota_exhausted or _is_transient_api
 
-        if not _is_quota_exhausted:
-            # Session got past any usage limit — reset the pause budget.
+        if not _should_pause:
+            # Session got past any usage limit / transient error — reset budget.
             state.quota_paused_at = 0.0
 
-        if _is_quota_exhausted:
+        if _should_pause:
             # --- Pause-and-resume (preferred over abort) --------------------
             # Keep the claim, worktree and session; wait for quota to return
             # (swap-account rotates the canonical to a fresh account, or the 5h
@@ -6995,13 +7005,30 @@ def agent_process_main(config: dict, agent_id: str | None = None,
             _paused_for = (time.time() - state.quota_paused_at
                            if state.quota_paused_at else 0.0)
             if _can_resume and _paused_for <= _pause_cap:
-                log(f"Agent {short_id}: usage limit hit — pausing session "
-                    f"{state.uuid} on #{state.claimed_issue} "
-                    f"(paused {_paused_for:.0f}s / cap {_pause_cap:.0f}s); "
-                    f"will resume on a fresh account")
-                # Free the exhausted account: clears account_label, which
-                # un-pins the resume so it follows swap-account to a fresh
-                # account. No-op in shared mode beyond clearing the label.
+                if _is_transient_api:
+                    # Clamp the backoff: reject 0/negative (fast-loop or a
+                    # time.sleep ValueError) and cap to the remaining pause
+                    # budget so a transient pause can't overshoot max_pause_secs.
+                    _remaining = max(1.0, _pause_cap - _paused_for)
+                    _backoff = max(1.0, min(_remaining, float(cfg_get(
+                        config, "quota", "transient_backoff_secs",
+                        default=60))))
+                    log(f"Agent {short_id}: transient API error (529/5xx) — "
+                        f"pausing session {state.uuid} on "
+                        f"#{state.claimed_issue} "
+                        f"(paused {_paused_for:.0f}s / cap {_pause_cap:.0f}s); "
+                        f"backing off {_backoff:.0f}s then resuming")
+                    time.sleep(_backoff)
+                else:
+                    log(f"Agent {short_id}: usage limit hit — pausing session "
+                        f"{state.uuid} on #{state.claimed_issue} "
+                        f"(paused {_paused_for:.0f}s / cap {_pause_cap:.0f}s); "
+                        f"will resume on a fresh account")
+                # Release the account lease either way: for quota it frees the
+                # exhausted account; for a transient error it frees the healthy
+                # account so other queued work can use it during our backoff (we
+                # re-acquire the best available account on resume). Clearing
+                # account_label un-pins the resume so it follows swap-account.
                 _release_account_lease(state, claude_config_dir)
                 state.resuming_after_pause = True
                 state.force_quota = False   # one-shot starts True; must wait
@@ -7013,8 +7040,9 @@ def agent_process_main(config: dict, agent_id: str | None = None,
                     f"on #{state.claimed_issue}; giving up (releasing)")
             state.quota_paused_at = 0.0
             # --- Fall through: original abort/release path ------------------
-            log(f"Agent {short_id}: session stdout indicates quota exhaustion, "
-                f"will re-check quota before next dispatch")
+            log(f"Agent {short_id}: session stdout indicates quota exhaustion "
+                f"or transient API errors past the pause cap, will re-check "
+                f"quota before next dispatch")
             # Release claim without replan — issue is fine, just quota-gated.
             # Must call `_release_claim` (not just `clear_claim`) so the GitHub
             # `claimed` label is actually removed: this session UUID is about
@@ -7203,6 +7231,21 @@ def _session_is_broken(exit_code: int, tokens_in: int, tokens_out: int,
 # Substrings in a failed session's stdout tail that mean "quota depleted"
 # (temporary; the account is fine) rather than a broken account.
 _QUOTA_MARKERS = ("hit your limit", "rate limit", "quota exceeded")
+
+# Substrings that mean the failure was a transient server-side API error
+# (HTTP 529 "Overloaded" or other 5xx) rather than quota or a code crash.
+# The account/quota is fine — the API just needs a moment. Handled like a
+# quota pause (keep claim/worktree/session, --resume) but with a short backoff
+# first. Matched case-insensitively against the lowercased stdout tail; kept
+# TIGHT — require the CLI's "API Error: <5xx>" framing or an HTTP/status-
+# qualified 529 — so ordinary agent output (a Lean file mentioning "overloaded"
+# notation, "line 529", a fixture saying "service unavailable") is NOT
+# misclassified as a transient API failure.
+_TRANSIENT_API_MARKERS = (
+    "api error: 5",            # "API Error: 500/502/503/504/529 ..."
+    "529 overloaded",
+    "http 529", "status 529", "error code 529",
+)
 
 # Substrings that mean the failure was authentication — a logged-out /
 # expired / cleared OAuth token or bad API key — rather than quota or a
