@@ -102,6 +102,8 @@ CLAIM_HISTORY_PATH = POD_DIR / "claim-history.json"
 PR_CLAIM_HISTORY_PATH = POD_DIR / "pr-claim-history.json"
 HOUSEKEEPING_LOCK_PATH = POD_DIR / "housekeeping.lock"
 HOUSEKEEPING_STAMP_PATH = POD_DIR / "housekeeping.stamp"
+SHARED_ROTATE_LOCK_PATH = POD_DIR / "shared-account-rotate.lock"
+SHARED_ROTATE_STAMP_PATH = POD_DIR / "shared-account-rotate.stamp"
 ISOLATED_CONFIG_DIR = POD_DIR / "claude-config"
 TARGET_FILE = POD_DIR / "target"  # Target agent count (int, one per line)
 PLANNER_TARGET_FILE = POD_DIR / "planner-target"  # Planner-recommended target agent count
@@ -180,6 +182,21 @@ isolated_config = true             # Use strict pod-managed CODEX_HOME (no ~/.co
 # `[agent.claude] isolated_config` is ignored: transcripts land in
 # ~/.bubble/ai-projects/<bubble-name>/ and are read from there.
 enabled = false
+
+[quota]
+# When an external account manager owns account selection — signalled by
+# ~/.claude/.current-account, which pins pod to one account (see
+# accounts.select_for_dispatch) — pod drives that manager itself rather than
+# relying on its (typically systemd-user-timer) schedule, which can wedge on
+# an unprivileged host across a `nixos-rebuild switch`. On the housekeeping
+# cadence, and before sleeping on `waiting_quota`, pod runs `<cmd> best` to
+# re-pick the best-quota account and refresh tokens, and un-wedges a stuck
+# `systemd --user` rotation timer via `daemon-reexec`. Set to "" to disable;
+# a no-op when ~/.claude/.current-account is absent or the command is missing.
+account_manager_cmd = "~/.claude/swap-account"
+# Max seconds a resuming agent will hold its claim/worktree while waiting for
+# quota to return before giving up and releasing them.
+max_pause_secs = 5400
 
 # Dollars per million tokens.
 # Resolution order when pricing an agent (see `_pricing_for`):
@@ -717,6 +734,150 @@ def _housekeeping_mark_done():
         HOUSEKEEPING_STAMP_PATH.write_text(f"{time.time()}\n")
     except OSError as e:
         log(f"Failed to update housekeeping stamp: {e}")
+
+
+# --- Shared-mode credential rotation ----------------------------------------
+#
+# When pod defers account choice to an external manager (a `swap-account`-style
+# script, signalled by ``~/.claude/.current-account`` — see
+# ``accounts.select_for_dispatch``), that manager is normally driven by a
+# periodic ``systemd --user`` timer. On an unprivileged host that timer is
+# fragile: a ``nixos-rebuild switch`` reexecs the user manager and can wedge
+# its timer clock (next-elapse computed to ``infinity``, no future trigger),
+# and the only durable fix — ``loginctl enable-linger`` — needs root. When that
+# happens the pinned account goes stale: every agent sits in ``waiting_quota``
+# even though a sibling account still has headroom.
+#
+# pod is itself an always-on unprivileged process, so it *drives* the manager
+# instead of depending on the timer: it re-runs ``<manager> best`` (which
+# re-picks the best-quota account and refreshes tokens) on the housekeeping
+# cadence and whenever an agent would otherwise sleep on ``waiting_quota`` —
+# and, since ``systemctl --user daemon-reexec`` needs no privilege, it
+# un-wedges the timer when it detects it stuck. Every path is rate-limited to
+# one run per interval across the whole fleet, and the whole feature is a no-op
+# unless pod is in shared mode with the manager command present.
+
+_USER_ROTATE_TIMERS = (
+    "claude-credential-swap.timer",
+    "claude-keep-alive.timer",
+)
+
+
+@contextlib.contextmanager
+def _shared_rotate_filelock():
+    """Non-blocking lock so only one agent rotates per window (others skip)."""
+    POD_DIR.mkdir(parents=True, exist_ok=True)
+    SHARED_ROTATE_LOCK_PATH.touch()
+    fd = open(SHARED_ROTATE_LOCK_PATH)
+    acquired = False
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
+        except (BlockingIOError, OSError):
+            yield False
+            return
+        yield True
+    finally:
+        if acquired:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        fd.close()
+
+
+def _shared_account_manager_cmd(config: dict) -> str | None:
+    """Path to the external account manager to drive, or None when disabled.
+
+    Enabled only when pod is deferring account choice to an external manager
+    (``~/.claude/.current-account`` present) and the manager command exists on
+    disk. The command defaults to ``~/.claude/swap-account`` and can be
+    overridden — or disabled with ``""`` — via ``[quota] account_manager_cmd``.
+    """
+    if accounts.current_account() is None:
+        return None
+    cmd = cfg_get(config, "quota", "account_manager_cmd",
+                  default="~/.claude/swap-account")
+    if not cmd:
+        return None
+    path = os.path.expanduser(cmd)
+    return path if os.path.exists(path) else None
+
+
+def _user_rotate_timers_wedged() -> bool:
+    """True if a ``systemd --user`` rotation timer is active but has no future
+    trigger — the post-reexec wedge a ``daemon-reexec`` clears. Fail-safe to
+    False on any error or non-systemd host."""
+    for timer in _USER_ROTATE_TIMERS:
+        try:
+            r = subprocess.run(
+                ["systemctl", "--user", "show", timer,
+                 "-p", "ActiveState",
+                 "-p", "NextElapseUSecRealtime",
+                 "-p", "NextElapseUSecMonotonic"],
+                capture_output=True, text=True, timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        if r.returncode != 0:
+            continue
+        props = dict(
+            ln.split("=", 1) for ln in r.stdout.splitlines() if "=" in ln)
+        if props.get("ActiveState") != "active":
+            continue
+        # A healthy active timer has a finite next elapse on at least one clock.
+        real = props.get("NextElapseUSecRealtime", "").strip()
+        mono = props.get("NextElapseUSecMonotonic", "").strip()
+        if not real and mono in ("", "infinity"):
+            return True
+    return False
+
+
+def _heal_wedged_user_timers() -> None:
+    """Un-wedge ``systemd --user`` rotation timers via ``daemon-reexec``.
+
+    No-op unless ``_user_rotate_timers_wedged()``. ``daemon-reexec`` needs no
+    privilege and preserves running units — pod agents are plain subprocesses,
+    not user units, so they are unaffected."""
+    if not _user_rotate_timers_wedged():
+        return
+    log("shared-account: user rotation timer wedged — running "
+        "`systemctl --user daemon-reexec` to re-arm it")
+    for argv in (["systemctl", "--user", "daemon-reexec"],
+                 ["systemctl", "--user", "restart", *_USER_ROTATE_TIMERS]):
+        try:
+            subprocess.run(argv, capture_output=True, timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+
+def _maybe_rotate_shared_account(config: dict, *, min_interval: float) -> None:
+    """Drive the external account manager to re-pick the best-quota account and
+    refresh tokens, at most once per ``min_interval`` seconds across all agents.
+    No-op outside shared mode. See the section comment above."""
+    cmd = _shared_account_manager_cmd(config)
+    if cmd is None:
+        return
+
+    def _recent() -> bool:
+        try:
+            last = float(SHARED_ROTATE_STAMP_PATH.read_text().strip())
+        except (OSError, ValueError):
+            return False
+        return (time.time() - last) < min_interval
+
+    if _recent():
+        return
+    with _shared_rotate_filelock() as owns:
+        if not owns or _recent():
+            return
+        try:
+            subprocess.run([cmd, "best"], capture_output=True, timeout=180)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            log(f"shared-account: `{cmd} best` failed: {e}")
+        else:
+            _heal_wedged_user_timers()
+        try:
+            SHARED_ROTATE_STAMP_PATH.write_text(f"{time.time()}\n")
+        except OSError:
+            pass
 
 
 def load_claim_history() -> dict:
@@ -6476,6 +6637,12 @@ def agent_process_main(config: dict, agent_id: str | None = None,
             target = resume_pin_backend or "any backend"
             if resume_pin_label:
                 target += f"/{resume_pin_label}"
+            # In shared mode a stale external pin (e.g. a wedged swap-account
+            # timer) is the usual reason there's no quota here. Drive the
+            # manager to re-pick before sleeping so we recover within one cycle
+            # instead of waiting on the (possibly dead) timer. Rate-limited and
+            # a no-op outside shared mode.
+            _maybe_rotate_shared_account(config, min_interval=quota_retry)
             log(f"Agent {short_id}: no quota for {target}, sleeping {quota_retry}s")
             time.sleep(quota_retry)
         if state.finishing or selection is None:
@@ -6552,6 +6719,15 @@ def agent_process_main(config: dict, agent_id: str | None = None,
                         live = {a.short_id for a in read_all_agents()}
                         live.add(short_id)
                         accounts.evict_orphan_leases(live)
+                except Exception:
+                    pass
+                # Keep the shared-mode account pin fresh (rotation + token
+                # refresh) even when no agent is currently starved — this is
+                # what replaces the external systemd timer pod must not depend
+                # on. No-op outside shared mode.
+                try:
+                    _maybe_rotate_shared_account(
+                        config, min_interval=HOUSEKEEPING_INTERVAL)
                 except Exception:
                     pass
                 _housekeeping_mark_done()
