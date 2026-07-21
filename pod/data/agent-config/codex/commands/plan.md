@@ -45,8 +45,13 @@ gh pr list --state open \
     (.statusCheckRollup | length > 0) and
     (.statusCheckRollup | all(.conclusion != "FAILURE" and .conclusion != "CANCELLED"))
   ) | .number' \
-| xargs -I{} gh pr merge {} --squash --delete-branch
+| xargs -I{} gh pr merge {} --squash
 ```
+
+Do not pass `--delete-branch`: without `--repo` it makes `gh` check out
+the default branch locally before deleting, which can park a worktree on
+`main` and lock it against another checkout. The repo is configured to
+delete merged head branches automatically (`pod init`).
 
 Never skip this step. Downstream agents are blocked on `main` until merged PRs land.
 

@@ -817,9 +817,14 @@ def cmd_create_pr(ctx: CoordinationContext, argv: list[str]) -> int:
                     f"Either edit the PR body to add 'Closes #{issue_num}', or rerun "
                     f"'coordination create-pr {issue_num} --partial'."
                 )
+        # No --delete-branch: gh cannot delete the branch the caller is
+        # standing on, so it silently checks out the default branch first.
+        # Run inside an agent worktree, that parks the worktree on master
+        # and locks it against the human's main checkout. Rely on the repo's
+        # "automatically delete head branches" setting for remote cleanup.
         m = client.gh_cli(
             "pr", "merge", existing_pr, "--repo", ctx.repo,
-            "--auto", "--squash", "--delete-branch", timeout=30,
+            "--auto", "--squash", timeout=30,
         )
         if m.returncode != 0:
             print("warning: auto-merge not available "
@@ -872,9 +877,10 @@ def cmd_create_pr(ctx: CoordinationContext, argv: list[str]) -> int:
     )
     pr_num = r.stdout.strip() if r.returncode == 0 else ""
     if pr_num:
+        # No --delete-branch — see the note on the existing-PR merge above.
         m = client.gh_cli(
             "pr", "merge", pr_num, "--repo", ctx.repo,
-            "--auto", "--squash", "--delete-branch", timeout=30,
+            "--auto", "--squash", timeout=30,
         )
         if m.returncode != 0:
             print("warning: auto-merge not available "
