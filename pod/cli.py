@@ -8958,16 +8958,26 @@ def _ensure_github_labels():
 
 
 def _ensure_repo_merge_settings():
-    """Enable auto-merge and squash merge on the GitHub repo (best effort)."""
+    """Enable auto-merge, squash merge, and head-branch auto-delete on the repo.
+
+    Auto-delete replaces `gh pr merge --delete-branch`: the flag makes gh
+    check out the default branch locally before deleting, which parks an
+    agent worktree on master and locks it against the human's main checkout.
+    Letting GitHub delete the merged head branch server-side avoids that.
+    """
     try:
         r = _gh_cli("repo", "edit",
                      "--enable-auto-merge", "--enable-squash-merge",
+                     "--delete-branch-on-merge",
                      timeout=15)
         if r.returncode == 0:
-            print("  enabled auto-merge and squash merge on GitHub repo")
+            print("  enabled auto-merge, squash merge, and head-branch "
+                  "auto-delete on GitHub repo")
         else:
-            print("  warning: could not enable auto-merge/squash-merge "
-                  "(may need admin access — enable manually in repo Settings → General)")
+            print("  warning: could not enable auto-merge/squash-merge/"
+                  "head-branch auto-delete (may need admin access — enable "
+                  "manually in repo Settings → General; note that rulesets or "
+                  "branch protection can also block automatic deletion)")
     except (subprocess.TimeoutExpired, FileNotFoundError):
         print("  warning: could not configure repo merge settings (gh CLI not available)")
 
@@ -9222,6 +9232,12 @@ def cmd_update(args):
         print(f"Updated .pod/claude-config/ from installed package.{suffix}")
     else:
         print(f"{backend} backend — agent config is installed per-session, nothing to update.")
+
+    # Migration: installs that predate head-branch auto-delete never had it
+    # enabled (it is only applied at `pod init`). Re-apply the repo merge
+    # settings on update so existing repos stop accumulating stale remote
+    # branches now that the merge paths no longer pass --delete-branch.
+    _ensure_repo_merge_settings()
 
 
 def cmd_coordination(args):
